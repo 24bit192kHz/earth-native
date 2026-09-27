@@ -1,0 +1,18 @@
+[Unit]
+Description=earth-native live Earth and planets desktop background
+Documentation=https://github.com/24bit192kHz/earth-native
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/earth-native serve
+Restart=on-failure
+RestartSec=3
+# A background app: yield CPU to everything interactive.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=graphical-session.target

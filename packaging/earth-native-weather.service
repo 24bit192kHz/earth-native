@@ -1,0 +1,19 @@
+[Unit]
+Description=earth-native live NOAA weather (lightning) and aurora feed
+Documentation=https://github.com/24bit192kHz/earth-native
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/earth-native/venv/bin/python %h/.local/share/earth-native/pipeline/data_pipeline.py watch
+Restart=on-failure
+RestartSec=60
+Nice=15
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+
+[Install]
+# Independent of the display session: it only refreshes data files and
+# notifies the renderer when one is running.
+WantedBy=default.target

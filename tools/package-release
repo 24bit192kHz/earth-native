@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Build the release artifacts into dist/:
+#   earth-native-x86_64-linux.tar.zst   binary + texture pack + installer (ready to run)
+#   earth-native-data-<version>.tar.zst texture pack only (source/AUR installs)
+#   SHA256SUMS
+# usage: tools/package-release DATA_DIR   (a data dir built by pipeline/data_pipeline.py build)
+set -euo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+data="${1:?usage: tools/package-release DATA_DIR}"
+version="$(grep -m1 '^version' "$root/Cargo.toml" | cut -d'"' -f2)"
+textures="$data/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["textures"])' "$data/active.json")"
+cd "$root"
+cargo build --release --locked
+rm -rf dist && mkdir -p dist
+bundle="dist/earth-native-x86_64-linux"
+mkdir -p "$bundle/bin" "$bundle/share/earth-native" "$bundle/pipeline" "$bundle/packaging"
+install -m755 target/release/earth-native "$bundle/bin/"
+cp -r "$textures" "$bundle/share/earth-native/textures"
+echo '{"textures": "textures"}' > "$bundle/share/earth-native/active.json"
+cp pipeline/*.py pipeline/requirements.txt "$bundle/pipeline/"
+cp packaging/*.service packaging/*.desktop "$bundle/packaging/"
+cp install.sh uninstall.sh README.md LICENSE CREDITS.md "$bundle/"
+tar -C dist -cf - earth-native-x86_64-linux | zstd -19 -T0 -q -o dist/earth-native-x86_64-linux.tar.zst
+tar -C "$bundle/share/earth-native" -cf - active.json textures | zstd -19 -T0 -q -o "dist/earth-native-data-$version.tar.zst"
+(cd dist && sha256sum ./*.tar.zst > SHA256SUMS)
+ls -la dist

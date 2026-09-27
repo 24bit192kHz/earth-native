@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain and shader compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc
+          rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --release --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Pipeline unit tests
+        run: |
+          python3 -m pip install --quiet numpy pillow
+          cd pipeline && python3 -m unittest -k block_compression -k polar -k preview -k resize -k atomic -k range test_data_pipeline

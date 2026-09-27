@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Targeted native capture: aim the camera at the feature under change, read
+back the renderer's own Vulkan frame (capture_frame, never a compositor
+screenshot), and crop it 1:1 around that feature.
+
+usage: earth-native-aim TAG UNIX CAM_LAT CAM_LON DIST [TGT_LAT TGT_LON]
+                        [--crop WxH] [--output NAME]
+  UNIX     : UTC to pin (e.g. `date +%s` for now)
+  CAM_*    : geographic point under the camera; DIST: `camera` distance argument
+  TGT_*    : point to crop around (default: the sub-camera point)
+  --output : Wayland output to read back (default: the widest one)
+Writes $EARTH_NATIVE_AIM_DIR/TAG.jpg (default /tmp/earth-native-aim), prints
+the pose/pixel JSON, and restores live camera and time.
+"""
+import json, math, os, shutil, subprocess, sys, time
+
+S = os.environ.get("EARTH_NATIVE_AIM_DIR", "/tmp/earth-native-aim")
+# The installed CLI (or $EARTH_NATIVE_BIN, e.g. target/release/earth-native).
+T = os.environ.get("EARTH_NATIVE_BIN") or shutil.which("earth-native") or "earth-native"
+OUTPUT = None
+
+
+def run(*args):
+    return subprocess.run([T, *map(str, args)], check=True, capture_output=True, text=True).stdout
+
+
+def capture():
+    time.sleep(0.5)
+    out = json.loads(run("capture_frame"))
+    caps = out["captures"]
+    cap = next((c for c in caps if OUTPUT and c["image"].rsplit("-", 1)[-1] == f"{OUTPUT}.jpg"),
+               max(caps, key=lambda c: c["width"]))
+    others = [c["image"] for c in out["captures"] if c is not cap]
+    for p in others:
+        for q in (p, p.rsplit(".", 1)[0] + ".json"):
+            if os.path.exists(q):
+                os.remove(q)
+    return cap
+
+
+def world(lat, lon):
+    # Inverse of the shader's sphere_uv(): u = 0.5 - atan(y, x)/2pi, and
+    # u = (lon + 180)/360, so the world azimuth is -lon.
+    la, lo = math.radians(lat), math.radians(lon)
+    return (math.cos(la) * math.cos(lo), -math.cos(la) * math.sin(lo), math.sin(la))
+
+
+def az_el(v):
+    x, y, z = v
+    r = math.sqrt(x * x + y * y + z * z)
+    return math.degrees(math.atan2(y, x)), math.degrees(math.asin(z / r))
+
+
+def project(u, p):
+    cam, fw, rt, up = (u[k] for k in ("camera_position", "forward", "right", "up"))
+    d = [p[i] * 0.78 - cam[i] for i in range(3)]
+    z = sum(d[i] * fw[i] for i in range(3))
+    x = sum(d[i] * rt[i] for i in range(3)) / z / u["tan_half_fov_x"]
+    y = sum(d[i] * up[i] for i in range(3)) / z / u["tan_half_fov_y"]
+    c = u["canvas"]
+    gx = u["focus_x"] + x * c["width"] / 2   # inverse of the shader's canonical_ndc
+    gy = u["focus_y"] - y * c["height"] / 2
+    return gx, gy
+
+
+def main():
+    global OUTPUT
+    a = sys.argv[1:]
+    if "--output" in a:
+        i = a.index("--output"); OUTPUT = a[i + 1]; del a[i:i + 2]
+    os.makedirs(S, exist_ok=True)
+    crop = "1100x700"
+    if "--crop" in a:
+        i = a.index("--crop"); crop = a[i + 1]; del a[i:i + 2]
+    tag, unix, clat, clon, dist = a[0], a[1], float(a[2]), float(a[3]), a[4]
+    tlat, tlon = (float(a[5]), float(a[6])) if len(a) >= 7 else (clat, clon)
+    run("time", "unix", unix)
+    want_az, want_el = az_el(world(clat, clon))
+    # Calibrate yaw/pitch against the renderer's reported pose (its basis is
+    # mirrored/offset relative to Earth-fixed axes), then solve for the target.
+    run("camera", 180, 0, dist); p0 = az_el(capture()["frame"]["uniforms"]["camera_position"])
+    run("camera", 190, 10, dist); p1 = az_el(capture()["frame"]["uniforms"]["camera_position"])
+    ky = (p1[0] - p0[0]) / 10.0; kp = (p1[1] - p0[1]) / 10.0
+    dz = ((want_az - p0[0] + 180) % 360) - 180
+    yaw, pitch = 180 + dz / ky, (want_el - p0[1]) / kp
+    run("camera", f"{yaw:.4f}", f"{pitch:.4f}", dist)
+    cap = capture()
+    fr = cap["frame"]; u = fr["uniforms"]; vp = fr["viewport"]
+    gx, gy = project(u, world(tlat, tlon))
+    px, py = gx - vp["x"], gy - vp["y"]
+    w, h = map(int, crop.split("x"))
+    x0 = int(min(max(px - w / 2, 0), cap["width"] - w)); y0 = int(min(max(py - h / 2, 0), cap["height"] - h))
+    out = os.path.join(S, f"{tag}.jpg")
+    subprocess.run(["magick", cap["image"], "-crop", f"{w}x{h}+{x0}+{y0}", "+repage", "-quality", "95", out], check=True)
+    for q in (cap["image"], cap["image"].rsplit(".", 1)[0] + ".json"):
+        if os.path.exists(q):
+            os.remove(q)
+    got = az_el(u["camera_position"])
+    print(json.dumps({"out": out, "target_px": [round(px), round(py)], "yaw": round(yaw, 2), "pitch": round(pitch, 2),
+                      "cam_az_el": [round(got[0], 2), round(got[1], 2)], "want_az_el": [round(want_az, 2), round(want_el, 2)],
+                      "alt_km": round(fr["camera_altitude_km"]), "mean": round(cap["mean_channel"], 2)}))
+    run("camera", "live"); run("time", "live")
+
+
+main()

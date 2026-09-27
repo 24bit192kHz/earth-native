@@ -1,0 +1,4 @@
+numpy>=2
+pillow>=11
+eccodes>=2.38
+OpenEXR>=3.3

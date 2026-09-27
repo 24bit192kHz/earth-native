@@ -1,0 +1,40 @@
+# Maintainer: 24bit192kHz
+pkgname=earth-native
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Physically based live Earth and planets desktop background for Wayland and Xorg (Vulkan)"
+arch=('x86_64')
+url="https://github.com/24bit192kHz/earth-native"
+license=('MIT')
+depends=('vulkan-icd-loader' 'glibc' 'gcc-libs')
+optdepends=('libxcb: Xorg backend'
+            'python: live NOAA weather and aurora feed')
+makedepends=('cargo' 'shaderc')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "earth-native-data-$pkgver.tar.zst::$url/releases/download/v$pkgver/earth-native-data-$pkgver.tar.zst")
+noextract=("earth-native-data-$pkgver.tar.zst")
+sha256sums=('SKIP' 'SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --locked
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --release --locked
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/earth-native "$pkgdir/usr/bin/earth-native"
+  install -d "$pkgdir/usr/share/earth-native"
+  bsdtar -xf "$srcdir/earth-native-data-$pkgver.tar.zst" -C "$pkgdir/usr/share/earth-native"
+  install -Dm644 pipeline/*.py pipeline/requirements.txt -t "$pkgdir/usr/share/earth-native/pipeline"
+  sed 's|%h/.local/bin/earth-native|/usr/bin/earth-native|' packaging/earth-native.service \
+    > earth-native.service
+  install -Dm644 earth-native.service "$pkgdir/usr/lib/systemd/user/earth-native.service"
+  install -Dm644 packaging/earth-native.desktop "$pkgdir/etc/xdg/autostart/earth-native.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 CREDITS.md "$pkgdir/usr/share/licenses/$pkgname/CREDITS.md"
+}

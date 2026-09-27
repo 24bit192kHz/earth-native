@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=earth-native
+Comment=Live physically based Earth and planets desktop background
+Exec=earth-native start
+Icon=preferences-desktop-wallpaper
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-phase=2

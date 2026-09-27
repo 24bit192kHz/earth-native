@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Render the README gallery from a running earth-native (native readbacks).
+
+usage: tools/render-previews [OUTPUT_DIR]   (default docs/previews)
+Each shot pins UTC and the camera through tools/earth-native-aim, then the
+live state is restored. Planet cameras are placed from the body's real Sun
+direction so every globe shows a natural phase.
+"""
+import json, math, os, shutil, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+AIM = os.path.join(HERE, "earth-native-aim")
+CLI = os.environ.get("EARTH_NATIVE_BIN") or shutil.which("earth-native") or "earth-native"
+OUT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "docs", "previews"))
+WORK = tempfile.mkdtemp(prefix="earth-native-previews-")
+os.makedirs(OUT, exist_ok=True)
+
+
+def cli(*args):
+    return subprocess.run([CLI, *map(str, args)], check=True, capture_output=True, text=True).stdout
+
+
+def aim(tag, unix, lat, lon, dist, target=None, crop="1600x1440"):
+    args = [AIM, tag, str(unix), str(lat), str(lon), str(dist)]
+    if target:
+        args += [str(target[0]), str(target[1])]
+    args += ["--crop", crop]
+    env = dict(os.environ, EARTH_NATIVE_AIM_DIR=WORK)
+    subprocess.run(args, check=True, env=env, capture_output=True)
+    return os.path.join(WORK, f"{tag}.jpg")
+
+
+def publish(source, name, width):
+    subprocess.run(["magick", source, "-resize", f"{width}x", "-strip", "-quality", "88",
+                    "-sampling-factor", "4:2:0", os.path.join(OUT, name)], check=True)
+
+
+def sun_direction(unix):
+    """World (pre-mirror) Sun direction for the selected body at `unix`."""
+    cli("time", "unix", unix)
+    cli("camera", 180, 0, 8)
+    frame = json.loads(cli("capture_frame"))
+    for capture in frame["captures"]:
+        for path in (capture["image"], capture["image"].rsplit(".", 1)[0] + ".json"):
+            if os.path.exists(path):
+                os.remove(path)
+    return frame["captures"][0]["frame"]["uniforms"]["sun_direction"]
+
+
+def lat_lon(vector):
+    x, y, z = vector
+    r = math.sqrt(x * x + y * y + z * z)
+    return math.degrees(math.asin(z / r)), -math.degrees(math.atan2(y, x))
+
+
+def rotate_z(vector, degrees):
+    a = math.radians(degrees)
+    x, y, z = vector
+    return [x * math.cos(a) - y * math.sin(a), x * math.sin(a) + y * math.cos(a), z]
+
+
+try:
+    cli("body", "earth")
+    publish(aim("earth-day", 1710936000, 5, 15, 8, crop="2400x1440"), "earth-day.jpg", 1920)
+    now = int(__import__("time").time())
+    publish(aim("earth-night", now, 42, 88, 6, crop="1600x1440"), "earth-night.jpg", 1000)
+    # Equinox, camera 90 degrees from the Sun: the terminator runs down the disk.
+    publish(aim("earth-twilight", 1710936000, 15, 75, 8, crop="1600x1440"), "earth-twilight.jpg", 1000)
+    publish(aim("earth-eclipse", 1712600280, 25, -100, 8, crop="1600x1440"), "earth-eclipse.jpg", 1000)
+    # Look down on the northern auroral oval around local midnight.
+    hours = (now % 86400) / 3600
+    midnight = ((-(hours - 12) * 15 + 2.3) + 360) % 360 - 180
+    publish(aim("earth-aurora", now, 58, midnight, 3, (69, midnight), crop="1800x1200"), "earth-aurora.jpg", 1000)
+    publish(aim("earth-glint", 1710936000, 0, -25, 3, (0, -12), crop="1600x1440"), "earth-glint.jpg", 1000)
+    planets = [("moon", now, 40, 8), ("mercury", now, 45, 8), ("venus", now, 40, 8),
+               ("mars", now, 35, 8), ("jupiter", now, 30, 8), ("saturn", 1508025600, 30, 12),
+               ("uranus", now, 30, 8), ("neptune", now, 30, 8)]
+    for name, unix, phase_degrees, distance in planets:
+        cli("body", name)
+        sun = sun_direction(unix)
+        lat, lon = lat_lon(rotate_z(sun, phase_degrees))
+        crop = "2400x1440" if name == "saturn" else "1600x1440"
+        publish(aim(name, unix, lat, lon, distance, crop=crop), f"{name}.jpg", 1000)
+finally:
+    for command in (("body", "earth"), ("camera", "live"), ("time", "live")):
+        try:
+            cli(*command)
+        except subprocess.CalledProcessError:
+            pass
+    shutil.rmtree(WORK, ignore_errors=True)
+print(f"previews written to {OUT}")
