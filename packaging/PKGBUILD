@@ -6,7 +6,7 @@ pkgdesc="Physically based live Earth and planets desktop background for Wayland 
 arch=('x86_64')
 url="https://github.com/24bit192kHz/earth-native"
 license=('MIT')
-depends=('vulkan-icd-loader' 'glibc' 'gcc-libs')
+depends=('vulkan-icd-loader' 'wayland' 'glibc' 'gcc-libs')
 optdepends=('libxcb: Xorg backend'
             'python: live NOAA weather and aurora feed')
 makedepends=('cargo' 'shaderc')

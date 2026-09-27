@@ -11,7 +11,7 @@ jobs:
       - name: Toolchain and shader compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y glslc
+          sudo apt-get install -y glslc libwayland-dev pkg-config
           rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - name: Tests
