@@ -149,6 +149,10 @@ impl PostPipeline {
     }
 }
 
+/// Metering key of a frame without the Earth: the exposure of an ISS night
+/// series (EV ~17), so a starfield shows its stars.
+const STARFIELD_LOG2_LUMINANCE: f32 = -21.4;
+
 /// Scene-referred luminance statistics from one completed frame.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MeterReading {
@@ -486,6 +490,13 @@ impl HdrTarget {
     /// (area-weighted, mildly centre-weighted), so a half-lit globe or a
     /// terminator view is exposed for daylight and the night side falls to
     /// black, while an all-night view opens up for moonlight and lights.
+    /// Sunlit sky elements hold the exposure down only when they are a real
+    /// part of the frame (over 3 %, like the sunrise band from the ISS): a
+    /// thin lit limb around a night globe (~1 %), the Sun or the Moon
+    /// saturate like city lights, and the bloom compresses them (post.frag),
+    /// as the adapted eye sees the night side and the stars past them. The
+    /// 99th percentile used before kept a daylight exposure for that thin
+    /// rim. A frame without the Earth is a starfield.
     pub fn read_meter(&self) -> Option<MeterReading> {
         let preexposure = self.meter_preexposure?;
         let (width, height) = (self.meter_extent.width as usize, self.meter_extent.height as usize);
@@ -517,18 +528,16 @@ impl HdrTarget {
             samples.push((luminance.clamp(1.0e-12, 4.0), a * centre));
         }
         let coverage = (coverage / (width * height) as f64) as f32;
-        // Sunlit sky elements (the limb, the Sun or Moon in frame) cap the
-        // exposure as they would a camera's highlight-weighted meter. City
-        // lights never do: night photographers let them saturate.
         whole_frame.sort_by(|a, b| a.total_cmp(b));
-        let p99 = whole_frame
-            .get(((whole_frame.len() as f32 * 0.99) as usize).min(whole_frame.len().saturating_sub(1)))
+        let p97 = whole_frame
+            .get(((whole_frame.len() as f32 * 0.97) as usize).min(whole_frame.len().saturating_sub(1)))
             .copied()
             .unwrap_or(0.0);
-        let highlight = if p99 > 2.0e-3 { p99 / 8.0 } else { 0.0 };
+        let highlight = if p97 > 2.0e-3 { p97 / 8.0 } else { 0.0 };
         let total: f32 = samples.iter().map(|(_, w)| w).sum();
         if total < 0.02 * (width * height) as f32 {
-            return (highlight > 1.0e-3).then(|| MeterReading { log2_luminance: highlight.log2(), coverage });
+            let log2_luminance = if highlight > 1.0e-3 { highlight.log2() } else { STARFIELD_LOG2_LUMINANCE };
+            return Some(MeterReading { log2_luminance, coverage });
         }
         samples.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut accumulated = 0.0;
@@ -541,7 +550,7 @@ impl HdrTarget {
             }
         }
         if std::env::var_os("EARTH_NATIVE_METER_DEBUG").is_some() {
-            eprintln!("meter: pre={preexposure:.3e} key={key:.3e} p99={p99:.3e} highlight={highlight:.3e} earth_weight={total:.1} texels={}", width * height);
+            eprintln!("meter: pre={preexposure:.3e} key={key:.3e} p97={p97:.3e} highlight={highlight:.3e} earth_weight={total:.1} texels={}", width * height);
         }
         Some(MeterReading { log2_luminance: key.max(highlight).log2(), coverage })
     }

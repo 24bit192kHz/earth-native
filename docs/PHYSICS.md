@@ -150,23 +150,30 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   level local-horizontal attitude), 78° horizontal lens, pitched so the
   horizon sits ~20 % from the top, 30 fps while riding.
 - **Auto exposure:** metered on a 64 px mip: the 85th-percentile Earth
-  luminance, or a highlight rule when a bright source dominates. Daylight
-  keeps a "sunny 16" exposure; at night the camera opens up for moonlight,
-  city lights and aurora and holds 1.6 stops under the meter for a night
-  look. The Sun's lens glare is added after metering, so it is metered
-  separately over the whole frame: the exposure keeps the mean glare under
-  8 % and 92 % of the frame under half white, and an open Sun in frame caps
-  it at daylight. Cuts snap the exposure.
-- **The Moon in the sky:** Lunar-Lambert photometry (bright to the limb at
-  full Moon), the SVS map (stretched to a mean albedo of ~0.5) scaled to the
-  real normal albedo of 0.12, and local adaptation: a single night exposure
-  would clip the Moon ~13 stops over into a flat white disc, so the disc is
-  compressed as the eye or an HDR merge sees it, with the maria readable, and
-  its glare is scaled to match. This is the one presentation choice that
-  departs from a single photographic exposure.
-- **Optics:** bloom from the mip pyramid, an analytic veiling-glare point
-  spread and an 18-ray diffraction starburst for the Sun and the Moon (with a
-  lens-acceptance cut-off off-frame), ghosts, and 60 %-corrected vignetting.
+  luminance, or a highlight rule when bright sunlit sky covers more than 3 %
+  of the frame (the sunrise band seen from the ISS). Daylight keeps a "sunny
+  16" exposure; at night the camera opens up for moonlight, city lights,
+  aurora and stars and holds 1.6 stops under the meter for a night look. A
+  thin lit limb around a night globe, the Sun and the Moon do not hold the
+  exposure down: they saturate like city lights. A frame without the Earth
+  is exposed as a starfield. Cuts snap the exposure.
+- **The Sun and the Moon in the sky:** both are shown as the adapted eye (or
+  an HDR merge) sees them, not as one photographic exposure would. The Moon
+  gets Lunar-Lambert photometry (bright to the limb at full Moon) and the SVS
+  map (stretched to a mean albedo of ~0.5) scaled to the real normal albedo
+  of 0.12; a single night exposure would clip it ~13 stops over into a flat
+  white disc, so the disc is compressed with the maria readable and its
+  glare scaled to match. The Sun's disc saturates and its glare carries a
+  fixed display-relative energy (3 % of its daylight-exposure glare at
+  most), so it keeps a small starburst instead of a veil over the whole
+  screen, and the night side and the stars stay visible next to it. These
+  are the presentation choices that depart from a single exposure.
+- **Optics:** bloom from the mip pyramid, each level softly compressed above
+  16× white (local adaptation: a lit limb 2^10 over a night exposure stays a
+  sharp line with a small glow instead of a white fog), an analytic
+  veiling-glare point spread and an 18-ray diffraction starburst for the Sun
+  and the Moon (with a lens-acceptance cut-off off-frame), ghosts, and
+  60 %-corrected vignetting.
 - **Development:** log-space contrast around mid-grey, a ×1.3 saturation
   (the "vivid" picture style of processed Earth-observation frames), a filmic
   curve with a long shoulder, gain-dependent sensor grain and dithered 8-bit

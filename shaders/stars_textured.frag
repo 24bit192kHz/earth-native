@@ -197,10 +197,12 @@ void main() {
         float mu_disc = sqrt(max(1.0 - radial_sun * radial_sun, 0.0));
         float limb = (1.0 - 0.6 * (1.0 - mu_disc)) / 0.8;
         float disc = celestial_disc(sun_cosine, sun_angular_radius, sun_angular_radius * 0.04);
-        // Stored at most 3000: the lens model (post.frag) carries the rest
-        // of the Sun's energy analytically; this keeps the disc saturated
-        // without the box pyramid spreading 46000x radiance into a halo.
-        colour += vec3(disc * limb * min(mean_radiance * exposure, 3000.0));
+        // Local adaptation, as for the Moon: the disc is stored at most 40
+        // (well past white after the camera curve, so it stays a saturated
+        // disc at any exposure). The lens glare (post.frag) is likewise
+        // display-relative (vulkan.rs SUN_GLARE); 3000 here spread through
+        // the bloom pyramid into a halo that greyed out the night sky.
+        colour += vec3(disc * limb * min(mean_radiance * exposure, 40.0));
     }
     float sun_outer_corona = exp(-max(sun_angle - sun_angular_radius, 0.0) / (sun_angular_radius * 8.0));
     float sun_aureole = exp(-max(sun_angle, 0.0) / (sun_angular_radius * 12.0));

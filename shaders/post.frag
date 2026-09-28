@@ -174,13 +174,20 @@ void main() {
         return;
     }
 
-    // Near-field glare: a power-law mixture of blurred pyramid levels.
+    // Near-field glare: a power-law mixture of blurred pyramid levels, each
+    // softly compressed above BLOOM_KNEE (local adaptation). A night exposure
+    // puts a thin sunlit limb ~2^10 over white; uncompressed, its bloom was
+    // a white fog, which is why the meter used to hold a daylight exposure
+    // for it and the night side and stars went black.
+    const float BLOOM_KNEE = 16.0;
     vec3 blur = vec3(0.0);
     float weight_sum = 0.0;
     float weight = 1.0;
     int top = min(textureQueryLevels(scene) - 1, 9);
     for (int level = 1; level <= top; ++level) {
-        blur += smooth_level(float(level), uv) * weight;
+        vec3 level_colour = smooth_level(float(level), uv);
+        level_colour /= 1.0 + max(level_colour.r, max(level_colour.g, level_colour.b)) / BLOOM_KNEE;
+        blur += level_colour * weight;
         weight_sum += weight;
         weight *= 0.78;
     }
