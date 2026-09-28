@@ -88,7 +88,11 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   the observed fraction. Edges are sharp at ISS scale, one pixel's footprint
   wide at most (antialiased), and how far the field rises above the cut
   stands in for optical depth: thin fringes are grey (albedo 0.5), cores
-  white (0.92). The shell is at 5.5 km with Sun-traced shadows. Without the
+  white (0.92). Once a pixel spans more than ~1.5-8 km (the globe view, the
+  horizon), the mips have averaged the field toward its mean and the cut
+  would switch at 50 % cover, so the observed cover is shown as the
+  fraction it is instead, textured by the low-passed field, thin cover
+  greyer. The shell is at 5.5 km with Sun-traced shadows. Without the
   feed, the NASA composite is shown as it is.
 - **Night:** VIIRS Black Marble 2016 lights at 500 m (stored 32768×16384),
   coloured from intensity (sodium to white), city glow under low cloud,

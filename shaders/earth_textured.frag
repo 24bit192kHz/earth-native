@@ -597,7 +597,18 @@ vec2 live_cloud(vec2 map_uv, vec3 n) {
     float band = max(0.012, 0.5 * fwidth(morphology));
     float opacity = smoothstep(threshold - band - 0.015, threshold + band + 0.015, morphology);
     float depth = smoothstep(0.0, 0.22, morphology - threshold);
-    return vec2(opacity, mix(0.5, 0.92, depth));
+    vec2 near = vec2(opacity, mix(0.5, 0.92, depth));
+    // From afar the mips average the morphology toward its mean, so the
+    // quantile cut above collapses into an on/off switch at 50 % cover:
+    // flat white cut-outs tracing the 10 km grid on the globe. Once a pixel
+    // spans several km, show the observed cover as the fraction it is, with
+    // the (low-passed) morphology left as texture, and thin cover greyer.
+    float km_x = length(vec2(dx.x * 40075.0 * sqrt(max(1.0 - n.z * n.z, 0.0)), dx.y * 20037.5));
+    float km_y = length(vec2(dy.x * 40075.0 * sqrt(max(1.0 - n.z * n.z, 0.0)), dy.y * 20037.5));
+    float far = smoothstep(1.5, 8.0, max(km_x, km_y));
+    vec2 wide = vec2(clamp(cover + (morphology - mean) * 1.2 * (1.0 - abs(2.0 * cover - 1.0)), 0.0, 1.0),
+        mix(0.55, 0.9, smoothstep(0.3, 0.95, cover)));
+    return mix(near, wide, far);
 }
 
 float live_cloud_opacity(vec2 map_uv, vec3 n) {
