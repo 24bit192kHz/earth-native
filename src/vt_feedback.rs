@@ -95,23 +95,17 @@ impl Feedback {
                 for sample_x in 0..grid_x {
                     let x = (sample_x as f32 + 0.5) / grid_x as f32;
                     let y = (sample_y as f32 + 0.5) / grid_y as f32;
-                    let Some(uv) = surface_uv(uniforms, output.viewport, x, y) else {
+                    let Some((uv, uv_dx, uv_dy)) = surface_uv_differentials(
+                        uniforms,
+                        output.viewport.x + x * output.viewport.width,
+                        output.viewport.y + y * output.viewport.height,
+                        pixel_dx,
+                        pixel_dy,
+                    ) else {
                         continue;
                     };
-                    let uv_dx = surface_uv_at_global(
-                        uniforms,
-                        output.viewport,
-                        output.viewport.x + x * output.viewport.width + pixel_dx,
-                        output.viewport.y + y * output.viewport.height,
-                    );
-                    let uv_dy = surface_uv_at_global(
-                        uniforms,
-                        output.viewport,
-                        output.viewport.x + x * output.viewport.width,
-                        output.viewport.y + y * output.viewport.height + pixel_dy,
-                    );
                     for &layer in layers {
-                        let mip = estimate_mip(layer, uv, uv_dx, uv_dy, self.config.mip_bias);
+                        let mip = estimate_mip_from_differentials(layer, uv_dx, uv_dy, self.config.mip_bias);
                         let Some((mip_tiles_x, mip_tiles_y)) = layer.tile_grid(mip) else {
                             continue;
                         };
@@ -184,15 +178,7 @@ fn grid_dimensions(output: OutputDescriptor, max_rays: usize) -> (usize, usize) 
     (grid_x, grid_y)
 }
 
-fn surface_uv(uniforms: FrameUniforms, viewport: LogicalRect, x: f32, y: f32) -> Option<[f32; 2]> {
-    surface_uv_at_global(
-        uniforms,
-        viewport,
-        viewport.x + x * viewport.width,
-        viewport.y + y * viewport.height,
-    )
-}
-
+#[cfg(test)]
 fn surface_uv_at_global(
     uniforms: FrameUniforms,
     _viewport: LogicalRect,
@@ -221,6 +207,77 @@ fn surface_uv_at_global(
     ])
 }
 
+/// Surface uv at a canvas point and its change per physical pixel in x and
+/// y, from ray differentials: one ray cast and one atan2/asin instead of the
+/// three casts of 1-pixel finite differences (the feedback's largest cost).
+/// For a hit point p = o + t r on the sphere with normal n, a change dr of
+/// the unit ray moves it by dp = t (dr - r (dr . n) / (r . n)).
+fn surface_uv_differentials(
+    uniforms: FrameUniforms,
+    x: f32,
+    y: f32,
+    pixel_dx: f32,
+    pixel_dy: f32,
+) -> Option<([f32; 2], [f32; 2], [f32; 2])> {
+    let canonical_x = 2.0 * (x - uniforms.focus_x) / uniforms.canvas.width;
+    let canonical_y = 2.0 * (uniforms.focus_y - y) / uniforms.canvas.height;
+    let unnormalized = add(
+        uniforms.forward,
+        add(
+            scale(uniforms.right, canonical_x * uniforms.tan_half_fov_x),
+            scale(uniforms.up, canonical_y * uniforms.tan_half_fov_y),
+        ),
+    );
+    let length = dot(unnormalized, unnormalized).sqrt();
+    if !length.is_finite() || length <= f32::EPSILON {
+        return None;
+    }
+    let ray = scale(unnormalized, length.recip());
+    let distance = sphere_intersection(uniforms.camera_position, ray, SURFACE_RADIUS);
+    if distance <= 0.0 {
+        return None;
+    }
+    let point = add(uniforms.camera_position, scale(ray, distance));
+    let normal = normalize(point)?;
+    let facing = dot(ray, normal);
+    let (nx, ny, nz) = (normal[0], normal[1], normal[2]);
+    let equatorial = (nx * nx + ny * ny).max(1.0e-12);
+    let polar = (1.0 - nz * nz).max(1.0e-12).sqrt();
+    let differential = |step: [f32; 3]| -> [f32; 2] {
+        // Change of the unit ray, then of the hit point, then of the uv.
+        let ray_step = scale(add(step, scale(ray, -dot(ray, step))), length.recip());
+        let point_step = if facing.abs() > 1.0e-6 {
+            scale(add(ray_step, scale(ray, -dot(ray_step, normal) / facing)), distance)
+        } else {
+            [f32::INFINITY; 3]
+        };
+        let normal_step = scale(point_step, SURFACE_RADIUS.recip());
+        [
+            -(nx * normal_step[1] - ny * normal_step[0]) / equatorial / TWO_PI,
+            -normal_step[2] / (PI * polar),
+        ]
+    };
+    let step_x = scale(uniforms.right, uniforms.tan_half_fov_x * 2.0 * pixel_dx / uniforms.canvas.width);
+    let step_y = scale(uniforms.up, -uniforms.tan_half_fov_y * 2.0 * pixel_dy / uniforms.canvas.height);
+    let longitude = ny.atan2(nx);
+    let uv = [fract(0.5 - longitude / TWO_PI), 0.5 - nz.clamp(-1.0, 1.0).asin() / PI];
+    Some((uv, differential(step_x), differential(step_y)))
+}
+
+/// `estimate_mip` from per-pixel uv differentials.
+fn estimate_mip_from_differentials(layer: LayerDescriptor, dx: [f32; 2], dy: [f32; 2], bias: f32) -> u16 {
+    let Some((base_width, base_height)) = layer.mip_dimensions(0) else {
+        return 0;
+    };
+    let footprint = [dx, dy]
+        .into_iter()
+        .map(|d| (d[0] * base_width as f32).hypot(d[1] * base_height as f32))
+        .filter(|texels| texels.is_finite())
+        .fold(1.0_f32, f32::max);
+    let mip = (footprint.log2() + bias).floor().max(0.0) as u16;
+    mip.min(layer.mip_count.saturating_sub(1))
+}
+
 fn sphere_intersection(origin: [f32; 3], direction: [f32; 3], radius: f32) -> f32 {
     let b = dot(origin, direction);
     let c = dot(origin, origin) - radius * radius;
@@ -237,6 +294,7 @@ fn sphere_intersection(origin: [f32; 3], direction: [f32; 3], radius: f32) -> f3
     }
 }
 
+#[cfg(test)]
 fn estimate_mip(
     layer: LayerDescriptor,
     center: [f32; 2],
@@ -276,6 +334,7 @@ fn tile_coordinate_clamped(uv: f32, tiles: u32) -> u32 {
     (uv.clamp(0.0, 1.0 - f32::EPSILON) * tiles as f32).floor() as u32
 }
 
+#[cfg(test)]
 fn wrapped_distance(left: f32, right: f32) -> f32 {
     let distance = (left - right).abs();
     distance.min(1.0 - distance)
@@ -332,6 +391,55 @@ mod tests {
             },
             physical_extent: [width, height],
         }
+    }
+
+    /// The ray differentials request the same mips as the 1-pixel finite
+    /// differences they replace, from the ISS window to the globe.
+    #[test]
+    fn differentials_match_finite_difference_mips() {
+        let layer = layer(1, 65_536, 32_768, 17);
+        let canvas = LogicalRect { x: 0.0, y: 0.0, width: 3440.0, height: 1440.0 };
+        let poses: [([f32; 3], [f32; 3], [f32; 3], [f32; 3], f32); 3] = [
+            // ISS at 420 km looking at the horizon (pitched ~25 degrees down).
+            ([0.78 * (1.0 + 420.0 / 6378.137), 0.0, 0.0], [-0.42, 0.9075, 0.0], [0.0, 0.0, 1.0], [0.9075, 0.42, 0.0], 0.8098),
+            // Globe from 12 Earth radii, 50 degree lens.
+            ([0.0, -9.36, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.4631),
+            // Oblique globe view near a pole.
+            ([2.0, -3.0, 4.5], [-0.3714, 0.5571, -0.7428], [0.8321, 0.5547, 0.0], [-0.4120, 0.6180, 0.6695], 0.6),
+        ];
+        let (mut total, mut equal) = (0, 0);
+        for (camera, forward, right, up, tan_x) in poses {
+            let uniforms = FrameUniforms {
+                camera_position: camera, forward, right, up,
+                tan_half_fov_x: tan_x, tan_half_fov_y: tan_x * 1440.0 / 3440.0,
+                focus_x: 1720.0, focus_y: 720.0, canvas,
+                ..FrameUniforms::default()
+            };
+            for sy in 0..60 {
+                for sx in 0..140 {
+                    let (x, y) = ((sx as f32 + 0.5) * 3440.0 / 140.0, (sy as f32 + 0.5) * 1440.0 / 60.0);
+                    let Some((uv, dx, dy)) = surface_uv_differentials(uniforms, x, y, 1.0, 1.0) else { continue };
+                    let Some(reference) = surface_uv_at_global(uniforms, canvas, x, y) else { continue };
+                    assert!((uv[0] - reference[0]).abs() < 1.0e-5 && (uv[1] - reference[1]).abs() < 1.0e-5);
+                    // On the limb a neighbour ray misses and the finite
+                    // difference falls back to one texel (mip 0) where the
+                    // differentials see the true, huge footprint; compare
+                    // where the old method was valid.
+                    let (Some(right), Some(down)) = (
+                        surface_uv_at_global(uniforms, canvas, x + 1.0, y),
+                        surface_uv_at_global(uniforms, canvas, x, y + 1.0),
+                    ) else { continue };
+                    let expected = estimate_mip(layer, reference, Some(right), Some(down), 0.0);
+                    let got = estimate_mip_from_differentials(layer, dx, dy, 0.0);
+                    assert!(expected.abs_diff(got) <= 1, "mip {got} vs {expected} at {x},{y}");
+                    total += 1;
+                    equal += usize::from(expected == got);
+                }
+            }
+        }
+        assert!(total > 3_000, "{total} samples");
+        eprintln!("differentials: {equal}/{total} mips equal to the finite difference");
+        assert!(equal as f64 >= 0.995 * total as f64, "{equal}/{total} mips equal");
     }
 
     #[test]

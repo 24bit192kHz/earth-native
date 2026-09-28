@@ -710,7 +710,9 @@ impl NativeApp {
             star_aberration: celestial.earth_velocity_over_c,
         };
         let render_started = Instant::now();
-        let still_dirty = self.renderer.render(uniforms)?;
+        // EARTH_NATIVE_CONTINUOUS=1 disables the motion gate, so a pinned
+        // scene keeps rendering: a steady GPU benchmark for A/B work.
+        let still_dirty = self.renderer.render(uniforms)? || continuous_rendering();
         self.dirty = still_dirty;
         self.renderer_clean = !still_dirty;
         // The frame on screen now matches the current vectors: rebase the
@@ -2133,4 +2135,9 @@ mod tests {
         assert_eq!(orbit_delta_from_surface_motion(12.5, -8.0), (12.5, 8.0));
         assert_eq!(orbit_delta_from_surface_motion(-3.0, 6.0), (-3.0, -6.0));
     }
+}
+
+fn continuous_rendering() -> bool {
+    static CONTINUOUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CONTINUOUS.get_or_init(|| std::env::var_os("EARTH_NATIVE_CONTINUOUS").is_some_and(|value| value == "1"))
 }
