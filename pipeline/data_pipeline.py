@@ -28,6 +28,23 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 import warnings
 
+
+def _watch_in_children():
+    """`watch`: run each update in a fresh child process, before numpy and
+    the GRIB/HDF5 readers are imported here, so the ~250 MB an update needs
+    goes back to the system for the 30 minutes in between (the resident
+    loop kept it all)."""
+    while True:
+        result = subprocess.run([sys.executable, os.path.abspath(__file__), "weather"])
+        if result.returncode != 0:
+            print(f"Weather update failed (exit {result.returncode}); retaining last good data",
+                  file=sys.stderr, flush=True)
+        time.sleep(1800)
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["watch"]:
+    _watch_in_children()
+
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -837,7 +854,11 @@ def weather():
             snapshots = sorted(path for path in existing_path.parent.iterdir()
                                if path.is_dir() and re.fullmatch(r"\d{8}T\d{2}-\d{10}", path.name))
             owned = {"fields.bgra", "fields.bgra.json", "clouds.bgra", "clouds.bgra.json"}
-            for obsolete in snapshots[:-8]:
+            # The renderer reads only the current generation; one more
+            # covers a reload in progress (36 MB each; 8 were kept).
+            previews = [path for path in existing_path.parent.iterdir()
+                        if path.is_dir() and re.fullmatch(r"preview-kp[\d.]+-\d{10}", path.name)]
+            for obsolete in snapshots[:-2] + previews:
                 names = {path.name for path in obsolete.iterdir()}
                 if {"fields.bgra", "fields.bgra.json"} <= names <= owned:
                     for name in names:
