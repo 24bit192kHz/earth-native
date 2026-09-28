@@ -46,16 +46,16 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 
 | | | |
 |:-:|:-:|:-:|
-| ![Night side over Asia with aurora](docs/previews/earth-night.jpg) | ![Half-lit Earth at the equinox](docs/previews/earth-twilight.jpg) | ![2024-04-08 total solar eclipse](docs/previews/earth-eclipse.jpg) |
-| Night side, city lights and aurora | Half-lit Earth at the equinox | The 8 April 2024 eclipse shadow |
-| ![Aurora over the night side](docs/previews/earth-aurora.jpg) | ![Sunglint over the Atlantic](docs/previews/earth-glint.jpg) | ![The Moon](docs/previews/moon.jpg) |
-| Aurora over the night side | Sunglint | The Moon |
-| ![Mercury](docs/previews/mercury.jpg) | ![Venus](docs/previews/venus.jpg) | ![Mars](docs/previews/mars.jpg) |
-| Mercury | Venus | Mars |
-| ![Jupiter](docs/previews/jupiter.jpg) | ![Saturn](docs/previews/saturn.jpg) | ![Uranus](docs/previews/uranus.jpg) |
-| Jupiter | Saturn (rings as in October 2017) | Uranus |
-| ![Neptune](docs/previews/neptune.jpg) | | |
-| Neptune | | |
+| ![From the ISS window: day](docs/previews/iss-day.jpg) | ![From the ISS window: city lights at night](docs/previews/iss-night.jpg) | ![From the ISS window: sunglint](docs/previews/iss-glint.jpg) |
+| ISS window: clouds and limb | ISS window: night, city lights over Asia | ISS window: sunglint on the ocean |
+| ![Half-lit Earth at the equinox](docs/previews/earth-twilight.jpg) | ![2024-04-08 total solar eclipse](docs/previews/earth-eclipse.jpg) | ![Aurora over the night side](docs/previews/earth-aurora.jpg) |
+| Half-lit Earth at the equinox | The 8 April 2024 eclipse shadow | Aurora over the night side |
+| ![Sunglint over the Atlantic](docs/previews/earth-glint.jpg) | ![The Moon](docs/previews/moon.jpg) | ![Mercury](docs/previews/mercury.jpg) |
+| Sunglint from the globe view | The Moon | Mercury |
+| ![Venus](docs/previews/venus.jpg) | ![Mars](docs/previews/mars.jpg) | ![Jupiter](docs/previews/jupiter.jpg) |
+| Venus | Mars | Jupiter |
+| ![Saturn](docs/previews/saturn.jpg) | ![Uranus](docs/previews/uranus.jpg) | ![Neptune](docs/previews/neptune.jpg) |
+| Saturn (rings as in October 2017) | Uranus | Neptune |
 
 Every image is a direct Vulkan readback from the renderer (`earth-native capture_frame`), not a screenshot.
 

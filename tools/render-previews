@@ -30,6 +30,13 @@ def aim(tag, unix, lat, lon, dist, target=None, crop="1600x1440"):
     return os.path.join(WORK, f"{tag}.jpg")
 
 
+def pov(tag, unix, lat, lon, alt_km, heading):
+    env = dict(os.environ, EARTH_NATIVE_AIM_DIR=WORK)
+    subprocess.run([AIM, tag, str(unix), "--pov", str(lat), str(lon), str(alt_km), str(heading), "auto", "78"],
+                   check=True, env=env, capture_output=True)
+    return os.path.join(WORK, f"{tag}.jpg")
+
+
 def publish(source, name, width):
     subprocess.run(["magick", source, "-resize", f"{width}x", "-strip", "-quality", "88",
                     "-sampling-factor", "4:2:0", os.path.join(OUT, name)], check=True)
@@ -63,7 +70,11 @@ try:
     cli("body", "earth")
     publish(aim("earth-day", 1710936000, 5, 15, 8, crop="2400x1440"), "earth-day.jpg", 1920)
     now = int(__import__("time").time())
-    publish(aim("earth-night", now, 42, 88, 6, crop="1600x1440"), "earth-night.jpg", 1000)
+    # The view from the ISS window (pinned UTC, 78 degree lens).
+    day = now // 86400 * 86400
+    publish(pov("iss-day", 1710936000, 5, 15, 420, 90), "iss-day.jpg", 1000)
+    publish(pov("iss-night", day + 18 * 3600, 35, 88, 420, 0), "iss-night.jpg", 1000)
+    publish(pov("iss-glint", 1710936000, 0, -30, 420, 90), "iss-glint.jpg", 1000)
     # Equinox, camera 90 degrees from the Sun: the terminator runs down the disk.
     publish(aim("earth-twilight", 1710936000, 15, 75, 8, crop="1600x1440"), "earth-twilight.jpg", 1000)
     publish(aim("earth-eclipse", 1712600280, 25, -100, 8, crop="1600x1440"), "earth-eclipse.jpg", 1000)

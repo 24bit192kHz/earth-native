@@ -215,7 +215,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
-    Err("usage: earth-native {start [--debug]|stop|restart [--debug]|control [MONITOR]|body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune}|status|capture_frame|camera {YAW PITCH DISTANCE|live}|validate-bundle MANIFEST.json|celestial {show|freeze|sun YAW PITCH|moon YAW PITCH|live}|time {show|unix SECONDS|live}|serve [--debug]}".into())
+    Err("usage: earth-native {start [--debug]|stop|restart [--debug]|control [MONITOR]|body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune}|status|capture_frame|camera {live|globe|next|aurora|reset|zoom {in|out}|iss HEADING PITCH FOV|pov LAT LON ALT_KM HEADING PITCH|YAW PITCH DISTANCE}|validate-bundle MANIFEST.json|celestial {show|freeze|sun YAW PITCH|moon YAW PITCH|live}|time {show|unix SECONDS|live}|serve [--debug]}".into())
 }
 
 fn parse_debug_flag(
