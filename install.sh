@@ -68,10 +68,10 @@ if (( weather )); then
         say "setting up the NOAA weather/aurora feed (Python venv)"
         if python3 -m venv "$data_dir/venv" \
             && "$data_dir/venv/bin/pip" install --quiet --upgrade pip \
-            && "$data_dir/venv/bin/pip" install --quiet numpy pillow eccodes; then
+            && "$data_dir/venv/bin/pip" install --quiet numpy pillow eccodes h5py; then
             :
         else
-            warn "weather feed dependencies failed to install; aurora and lightning stay off (rerun later)"
+            warn "weather feed dependencies failed to install; live clouds, aerosol, sea ice, aurora and lightning stay off (rerun later)"
             weather=0
         fi
     else

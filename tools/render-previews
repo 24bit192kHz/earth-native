@@ -4,9 +4,11 @@
 usage: tools/render-previews [OUTPUT_DIR]   (default docs/previews)
 Each shot pins UTC and the camera through tools/earth-native-aim, then the
 live state is restored. Planet cameras are placed from the body's real Sun
-direction so every globe shows a natural phase.
+direction so every globe shows a natural phase. The aurora shot uses tonight's
+oval (`camera aurora`); for a storm, run `data_pipeline.py aurora-preview --kp 7`
+first and `data_pipeline.py weather` after.
 """
-import json, math, os, shutil, subprocess, sys, tempfile
+import json, math, os, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 AIM = os.path.join(HERE, "earth-native-aim")
@@ -35,6 +37,22 @@ def pov(tag, unix, lat, lon, alt_km, heading):
     subprocess.run([AIM, tag, str(unix), "--pov", str(lat), str(lon), str(alt_km), str(heading), "auto", "78"],
                    check=True, env=env, capture_output=True)
     return os.path.join(WORK, f"{tag}.jpg")
+
+
+def aurora(tag):
+    """`camera aurora`: live UTC, near tonight's strongest aurora, facing it."""
+    cli("time", "live")
+    cli("camera", "aurora")
+    time.sleep(6.0)  # exposure and virtual-texture pages settle
+    frame = json.loads(cli("capture_frame"))
+    widest = max(frame["captures"], key=lambda capture: capture["width"])
+    out = os.path.join(WORK, f"{tag}.jpg")
+    shutil.copy(widest["image"], out)
+    for capture in frame["captures"]:
+        for path in (capture["image"], capture["image"].rsplit(".", 1)[0] + ".json"):
+            if os.path.exists(path):
+                os.remove(path)
+    return out
 
 
 def publish(source, name, width):
@@ -69,19 +87,16 @@ def rotate_z(vector, degrees):
 try:
     cli("body", "earth")
     publish(aim("earth-day", 1710936000, 5, 15, 8, crop="2400x1440"), "earth-day.jpg", 1920)
-    now = int(__import__("time").time())
+    now = int(time.time())
     # The view from the ISS window (pinned UTC, 78 degree lens).
-    day = now // 86400 * 86400
-    publish(pov("iss-day", 1710936000, 5, 15, 420, 90), "iss-day.jpg", 1000)
-    publish(pov("iss-night", day + 18 * 3600, 35, 88, 420, 0), "iss-night.jpg", 1000)
-    publish(pov("iss-glint", 1710936000, 0, -30, 420, 90), "iss-glint.jpg", 1000)
+    publish(pov("iss-day", 1710936000, 24, 36, 420, 330), "iss-day.jpg", 1000)
+    publish(pov("iss-himalaya", 1710925200, 24, 84, 420, 330), "iss-himalaya.jpg", 1000)
+    publish(pov("iss-night", 1710975600, 24, 32, 420, 350), "iss-night.jpg", 1000)
+    publish(aurora("iss-aurora"), "iss-aurora.jpg", 1000)
     # Equinox, camera 90 degrees from the Sun: the terminator runs down the disk.
     publish(aim("earth-twilight", 1710936000, 15, 75, 8, crop="1600x1440"), "earth-twilight.jpg", 1000)
-    publish(aim("earth-eclipse", 1712600280, 25, -100, 8, crop="1600x1440"), "earth-eclipse.jpg", 1000)
-    # Look down on the northern auroral oval around local midnight.
-    hours = (now % 86400) / 3600
-    midnight = ((-(hours - 12) * 15 + 2.3) + 360) % 360 - 180
-    publish(aim("earth-aurora", now, 58, midnight, 3, (69, midnight), crop="1800x1200"), "earth-aurora.jpg", 1000)
+    # Totality over Durango: close enough that the penumbra reads across Mexico and Texas.
+    publish(aim("earth-eclipse", 1712600280, 25, -100, 4, (24, -100), crop="1600x1440"), "earth-eclipse.jpg", 1000)
     publish(aim("earth-glint", 1710936000, 0, -25, 3, (0, -12), crop="1600x1440"), "earth-glint.jpg", 1000)
     planets = [("moon", now, 40, 8), ("mercury", now, 45, 8), ("venus", now, 40, 8),
                ("mars", now, 35, 8), ("jupiter", now, 30, 8), ("saturn", 1508025600, 30, 12),

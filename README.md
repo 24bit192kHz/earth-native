@@ -19,9 +19,11 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 - **The sky, right now.** Sun, Moon and planets come from Astronomy Engine and
   match JPL Horizons to the arc-minute; day and night, the terminator, lunar
   phase, and even **solar eclipse shadows** are where they really are.
-- **NASA imagery at 500 m.** Blue Marble Next Generation for the current
-  month, streamed as a 65536×32768 virtual texture, Black Marble city lights,
-  GEBCO 2026 relief, LRO Moon, and Hipparcos stars drawn one by one.
+- **NASA imagery down to 500 m.** Blue Marble Next Generation, Black Marble
+  city lights, GEBCO relief, the LRO Moon, and 41 394 Hipparcos stars drawn
+  one by one. The release pack is 8K (~5 km); the optional 500 m set streams
+  the current month's Blue Marble as a 65536×32768 virtual texture
+  ([baked locally](docs/DATA.md#high-resolution-earth-500-m), ~3 GB per month).
 - **Real atmosphere.** Multiple scattering with published Rayleigh, ozone and
   aerosol constants in true sRGB colour bands: a blue limb, cyan haze, orange
   twilight, Cox–Munk sunglint, moonlit clouds and night-side airglow.
@@ -36,28 +38,45 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
   Uranus and Neptune plus the Moon — each with its IAU axis and rotation,
   real flattening and its own limb-darkening law.
 - **Built to sit in the background.** Block-compressed maps and a streamed
-  virtual texture, a few ms of GPU time per frame, motion-gated redraws
-  (30 fps while riding the ISS), idle CPU priority.
+  virtual texture, motion-gated redraws (30 fps while riding the ISS, 15 on
+  the globe), idle CPU priority. On an RTX 3080 Ti driving 3440×1440 and
+  2560×1080 monitors with the 500 m set: ~9 ms of GPU time per frame from
+  the ISS, ~12 ms on the globe, ~2 GB of VRAM.
 - **Native everywhere.** Wayland via wlr-layer-shell (Hyprland, Sway, KDE
   Plasma, niri, river, labwc, Wayfire…) and Xorg via an EWMH desktop window on
   every monitor. Multi-monitor desktops share one continuous camera.
 
 ## Gallery
 
+**From the ISS window**
+
+| | |
+|:-:|:-:|
+| ![From the ISS window: the Nile, Sinai and the eastern Mediterranean by day](docs/previews/iss-day.jpg) | ![From the ISS window: the Himalaya and the Tibetan Plateau](docs/previews/iss-himalaya.jpg) |
+| The Nile, Sinai and the Levant | The Himalaya and the Tibetan Plateau |
+| ![From the ISS window: the Nile and Cairo at night](docs/previews/iss-night.jpg) | ![From the ISS window: aurora australis on the horizon](docs/previews/iss-aurora.jpg) |
+| The same coast at night, under the green airglow layer | Aurora australis in a Kp 7 storm (synthetic oval, `aurora-preview`) |
+
+**The globe**
+
 | | | |
 |:-:|:-:|:-:|
-| ![From the ISS window: day](docs/previews/iss-day.jpg) | ![From the ISS window: city lights at night](docs/previews/iss-night.jpg) | ![From the ISS window: sunglint](docs/previews/iss-glint.jpg) |
-| ISS window: clouds and limb | ISS window: night, city lights over Asia | ISS window: sunglint on the ocean |
-| ![Half-lit Earth at the equinox](docs/previews/earth-twilight.jpg) | ![2024-04-08 total solar eclipse](docs/previews/earth-eclipse.jpg) | ![Aurora over the night side](docs/previews/earth-aurora.jpg) |
-| Half-lit Earth at the equinox | The 8 April 2024 eclipse shadow | Aurora over the night side |
-| ![Sunglint over the Atlantic](docs/previews/earth-glint.jpg) | ![The Moon](docs/previews/moon.jpg) | ![Mercury](docs/previews/mercury.jpg) |
-| Sunglint from the globe view | The Moon | Mercury |
-| ![Venus](docs/previews/venus.jpg) | ![Mars](docs/previews/mars.jpg) | ![Jupiter](docs/previews/jupiter.jpg) |
-| Venus | Mars | Jupiter |
-| ![Saturn](docs/previews/saturn.jpg) | ![Uranus](docs/previews/uranus.jpg) | ![Neptune](docs/previews/neptune.jpg) |
-| Saturn (rings as in October 2017) | Uranus | Neptune |
+| ![Half-lit Earth at the equinox](docs/previews/earth-twilight.jpg) | ![2024-04-08 total solar eclipse](docs/previews/earth-eclipse.jpg) | ![Sunglint over the Atlantic](docs/previews/earth-glint.jpg) |
+| Half-lit Earth at the equinox | The 8 April 2024 eclipse shadow over Mexico | Sunglint over the Atlantic |
 
-Every image is a direct Vulkan readback from the renderer (`earth-native capture_frame`), not a screenshot.
+**The Moon and the planets**
+
+| | | | |
+|:-:|:-:|:-:|:-:|
+| ![The Moon](docs/previews/moon.jpg) | ![Mercury](docs/previews/mercury.jpg) | ![Venus](docs/previews/venus.jpg) | ![Mars](docs/previews/mars.jpg) |
+| The Moon | Mercury | Venus | Mars |
+| ![Jupiter](docs/previews/jupiter.jpg) | ![Saturn](docs/previews/saturn.jpg) | ![Uranus](docs/previews/uranus.jpg) | ![Neptune](docs/previews/neptune.jpg) |
+| Jupiter | Saturn (rings as in October 2017) | Uranus | Neptune |
+
+Every image is a direct Vulkan readback from the renderer (`earth-native
+capture_frame`), not a screenshot, made by `tools/render-previews` with the
+500 m data set. Clouds, aerosol and sea ice are the live feed of the day the
+gallery was rendered.
 
 ## Install
 
@@ -73,8 +92,9 @@ tar -xf earth-native-x86_64-linux.tar.zst
 cd earth-native-x86_64-linux && ./install.sh
 ```
 
-This installs the binary to `~/.local/bin`, the texture pack to
-`~/.local/share/earth-native`, and a systemd user service that starts with
+This installs the binary to `~/.local/bin`, the 8K texture pack to
+`~/.local/share/earth-native` (add the 500 m set later: see
+[docs/DATA.md](docs/DATA.md#high-resolution-earth-500-m)), and a systemd user service that starts with
 your graphical session (plus an XDG autostart entry as a fallback). The live
 weather/aurora feed runs in its own small Python environment; skip it with
 `./install.sh --no-weather`.

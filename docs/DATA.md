@@ -23,8 +23,9 @@ live weather manifest written by the feed.
 | `provenance.json` | — | every source URL, SHA-256, download time and credit |
 
 All maps are block-compressed offline with precomputed linear-light mip
-chains (`pipeline/bcn.py`), so the GPU uploads blocks directly: the whole
-Earth view needs about 270 MiB of VRAM. Equirectangular rows are low-passed
+chains (`pipeline/bcn.py`), so the GPU uploads blocks directly: with the
+8K pack the renderer needs about 350 MiB of VRAM (the 500 m set
+below takes ~2 GB). Equirectangular rows are low-passed
 along longitude by 1/cos(latitude) (`polar_resample`) so the poles do not
 pinwheel.
 
@@ -49,8 +50,18 @@ earth-bake gray-bc4 --tiles A1,B1,C1,D1,A2,B2,C2,D2 --grid 4x2 --width 32768 \
 earth-bake relief-bc5 --gebco DIR --width 32768 --out relief.bc5
 ```
 
-The renderer loads the current month's virtual texture, else the nearest
-baked month.
+Sources: the Blue Marble NG "world" tiles
+(`world.2004MM.3x21600x21600.{A1..D2}.png`, NASA Visible Earth, one record
+per month), the Black Marble 2016 gray tiles
+(`BlackMarble_2016_{A1..D2}_geo_gray.tif`, Earth Observatory record 144897)
+and the GEBCO 2026 grid. None of this is in the release packs: a month is
+~1.5-2 GB of PNG in and ~3 GB out.
+
+Put the virtual textures in `<data dir>/vt/` (or the texture set itself) and
+the `.bc4`/`.bc5` files, with their `.json` sidecars, in the active texture
+set, next to the 8K maps they replace. The renderer loads the current
+month's virtual texture, else the nearest baked month; `earth-native status`
+reports its page cache as `vt_vram_mb`.
 
 ## Rebuilding the pack
 
