@@ -536,24 +536,72 @@ float cloud_morphology(vec2 map_uv, vec3 n) {
     return mix(cloud_detail(n), composite, 0.45);
 }
 
-// The observed cover (a real ~10 km cloud image) sets the opacity; the
-// fractal erodes it into ragged edges, holes and cells (strongest at
-// partial cover), then thin haze drops out and decks go opaque.
-float live_cloud_opacity(vec2 map_uv, vec3 n) {
+// Cubic B-spline upsampling of the ~10 km cover in four bilinear taps.
+// Bilinear alone has kinks on the texel grid, which a sharp cloud edge
+// traces as straight, rectangular outlines.
+float live_cloud_cover(vec2 map_uv, vec2 dx, vec2 dy) {
+    vec2 size = vec2(textureSize(cloud_terrain_height, 0));
+    vec2 p = map_uv * size - 0.5;
+    vec2 i = floor(p);
+    vec2 f = p - i;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    vec2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    vec2 w3 = f3 / 6.0;
+    vec2 g0 = w0 + w1;
+    vec2 g1 = w2 + w3;
+    vec2 uv0 = (i + 0.5 - 1.0 + w1 / g0) / size;
+    vec2 uv1 = (i + 0.5 + 1.0 + w3 / g1) / size;
+    return g0.y * (g0.x * textureGrad(cloud_terrain_height, vec2(uv0.x, uv0.y), dx, dy).r
+                 + g1.x * textureGrad(cloud_terrain_height, vec2(uv1.x, uv0.y), dx, dy).r)
+         + g1.y * (g0.x * textureGrad(cloud_terrain_height, vec2(uv0.x, uv1.y), dx, dy).r
+                 + g1.x * textureGrad(cloud_terrain_height, vec2(uv1.x, uv1.y), dx, dy).r);
+}
+
+// Quantile of the morphology field (0.55 fractal + 0.45 NASA composite)
+// relative to its mean, measured over the textures (cos-latitude weighted,
+// sd 0.117, skewed bright): q = 0, 0.1, 0.5, 0.9, 1 (the ends just past
+// the 1st/99th percentiles).
+float morphology_quantile_offset(float q) {
+    if (q < 0.1) return mix(-0.22, -0.135, q / 0.1);
+    if (q < 0.5) return mix(-0.135, -0.023, (q - 0.1) / 0.4);
+    if (q < 0.9) return mix(-0.023, 0.172, (q - 0.5) / 0.4);
+    return mix(0.172, 0.33, (q - 0.9) / 0.1);
+}
+
+// The observed cover (a real ~10 km cloud image) is the cloud fraction; the
+// morphology decides where inside that area the cloud is. The field is cut
+// at its (1 - cover) quantile, so the cloudy area keeps the observed
+// fraction while edges, holes and cells come from the fractal and the NASA
+// composite. Cumulus and deck edges are sharp at ISS scale (~100 m): the cut
+// is a narrow band that widens to one pixel's footprint when that is larger
+// (antialiased, and area-averaging to the same cover from afar), with a
+// thin translucent fringe. A fixed 0.08-0.92 ramp spread every edge over
+// 5-10 km and left wide 30-60 % translucent areas that read as grey smears
+// over sunglint.
+// x: opacity, y: cloud-top albedo. How far the field rises above the cut
+// stands in for optical depth, and reflectance grows with it (two-stream
+// R ~ (1-g)tau / (2 + (1-g)tau)): thin fringes stay grey, cores go white,
+// so a deck keeps its lumpy texture instead of a flat cut-out fill.
+vec2 live_cloud(vec2 map_uv, vec3 n) {
     vec2 dx = dFdx(map_uv);
     vec2 dy = dFdy(map_uv);
     dx.x -= round(dx.x);
     dy.x -= round(dy.x);
-    float cover = textureGrad(cloud_terrain_height, map_uv, dx, dy).r;
-    float detail = cloud_morphology(map_uv, n) - 0.42;
-    float partial = 1.0 - abs(2.0 * cover - 1.0);
-    return smoothstep(0.08, 0.92, 1.1 * cover + detail * (0.9 + 0.8 * partial));
+    float cover = clamp(live_cloud_cover(map_uv, dx, dy), 0.0, 1.0);
+    float morphology = cloud_morphology(map_uv, n);
+    float mean = 0.55 * textureLod(tiling_noise, vec2(0.5), 16.0).r + 0.45 * 0.244;
+    float threshold = mean + morphology_quantile_offset(1.0 - cover);
+    float band = max(0.012, 0.5 * fwidth(morphology));
+    float opacity = smoothstep(threshold - band - 0.015, threshold + band + 0.015, morphology);
+    float depth = smoothstep(0.0, 0.22, morphology - threshold);
+    return vec2(opacity, mix(0.5, 0.92, depth));
 }
 
-float cloud_top_albedo(vec2 map_uv, vec3 n) {
-    if (!live_clouds()) return nasa_cloud_albedo(map_uv);
-    float cover = texture(cloud_terrain_height, map_uv).r;
-    return mix(0.62, 0.9, smoothstep(0.3, 0.9, cover)) * (0.8 + 0.4 * cloud_morphology(map_uv, n));
+float live_cloud_opacity(vec2 map_uv, vec3 n) {
+    return live_cloud(map_uv, n).x;
 }
 
 float sample_cloud_density(vec2 mesh_uv0, vec3 cloud_normal) {
@@ -959,11 +1007,13 @@ void main() {
         if (through_cloud) {
             vec3 cloud_normal = normalize(camera + ray * (t_cloud / KM_PER_UNIT));
             vec2 cloud_uv = sphere_uv(cloud_normal);
-            float cloud_opacity = sample_cloud_density(cloud_uv, cloud_normal);
+            vec2 cloud_sample = live_clouds() ? live_cloud(cloud_uv, cloud_normal)
+                : vec2(nasa_cloud_opacity(cloud_uv), nasa_cloud_albedo(cloud_uv));
+            float cloud_opacity = cloud_sample.x;
             float r_cloud = R_GROUND + 5.5;
             float cloud_mu = dot(cloud_normal, sun);
             float cloud_moon_mu = dot(cloud_normal, moon);
-            float cloud_albedo = cloud_top_albedo(cloud_uv, cloud_normal);
+            float cloud_albedo = cloud_sample.y;
             // Thick cloud tops scatter strongly back toward the Sun and stay
             // bright at grazing light (not Lambertian): a small forward/back
             // term keeps sunset tops lit, as ISS photos show.

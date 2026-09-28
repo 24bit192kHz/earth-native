@@ -79,11 +79,17 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   10.7 µm infrared by night, ~10 km). Each is compared with a decaying
   clear-sky composite of the same place, so deserts, snow and sea ice are
   not mistaken for cloud. GFS low cloud fills in warm low cloud at night, and
-  GFS covers the poles beyond the mosaic. Sub-grid structure comes from a
-  fractal projected triplanar from the sphere (isotropic, no lat/lon shear),
-  mixed with the 1 km texture of the NASA cloud composite. The shell is at
-  5.5 km with Sun-traced shadows. Without the feed, the NASA composite is
-  shown as it is.
+  GFS covers the poles beyond the mosaic. The observed cover (B-spline
+  upsampled, so the 10 km grid leaves no straight edges) is read as a cloud
+  fraction. Where inside it the cloud sits comes from a fractal projected
+  triplanar from the sphere (isotropic, no lat/lon shear) mixed with the 1 km
+  texture of the NASA cloud composite: that field is cut at its
+  (1 − cover) quantile, measured over the textures, so the cloudy area keeps
+  the observed fraction. Edges are sharp at ISS scale, one pixel's footprint
+  wide at most (antialiased), and how far the field rises above the cut
+  stands in for optical depth: thin fringes are grey (albedo 0.5), cores
+  white (0.92). The shell is at 5.5 km with Sun-traced shadows. Without the
+  feed, the NASA composite is shown as it is.
 - **Night:** VIIRS Black Marble 2016 lights at 500 m (stored 32768×16384),
   coloured from intensity (sodium to white), city glow under low cloud,
   moonlight from Allen's lunar phase law and distance, and O(¹S) airglow
