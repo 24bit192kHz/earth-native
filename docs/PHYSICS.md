@@ -163,7 +163,9 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   a 3 × 3 morphological opening and the result blurred; its colour is not
   used (BC1's 565 endpoints turn dark regions green and magenta), the glow
   is tinted from bluish in the faint arms to warm in the bright band. The
-  band's 99.5th percentile is normalised to a fixed display level.
+  sky's median glow is its black point (only the band shows, empty sky
+  stays black) and the band's 99.5th percentile sits at 0.05 linear through
+  a contrast curve (power 1.6): a subtle glow behind the Earth, not a fog.
 - **Auto exposure:** metered on a 64 px mip: the 85th-percentile Earth
   luminance, or a highlight rule when bright sunlit sky covers more than 3 %
   of the frame (the sunrise band seen from the ISS). Daylight keeps a "sunny

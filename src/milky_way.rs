@@ -9,14 +9,21 @@
 //! used: BC1's 565 endpoints quantise green finer than red and blue, which
 //! turned dark regions green and magenta. The integrated starlight is tinted
 //! instead: bluish in the faint arms, warm (G/K giants) in the bright band.
-//! The brightness is normalised from the data: the band's 99.5th percentile
-//! (area-weighted) lands at `BAND_DISPLAY`. The output is display-referred
-//! sRGB, equirectangular like the panorama (same UVs).
+//! The brightness is normalised from the data (area-weighted percentiles):
+//! the sky's median glow is the black point, so only the band shows, and
+//! its 99.5th percentile lands at `BAND_DISPLAY` through a gentle contrast
+//! curve. Without the black point and at 0.32 the broad galactic glow
+//! turned the whole background into grey fog. The output is display-
+//! referred sRGB, equirectangular like the panorama (same UVs).
 
 use crate::star_panorama::StarPanoramaMip;
 
 /// Linear display value of the bright band (99.5th percentile).
-const BAND_DISPLAY: f32 = 0.32;
+const BAND_DISPLAY: f32 = 0.05;
+/// Percentile of the sky's glow taken as black.
+const BLACK_PERCENTILE: f32 = 0.5;
+/// Contrast of the band above the black point.
+const CONTRAST: f32 = 1.6;
 /// Tints of the faint arms and the bright band (unit luminance).
 const FAINT_TINT: [f32; 3] = [0.90, 0.99, 1.16];
 const BRIGHT_TINT: [f32; 3] = [1.10, 0.98, 0.84];
@@ -184,27 +191,32 @@ pub fn bake(bytes: &[u8], mips: &[StarPanoramaMip], full: (u32, u32), bc1: bool)
     let opened = morph(&morph(&lum, w, h, 1, false), w, h, 1, true);
     let glow = blur(&blur(&blur(&opened, w, h), w, h), w, h);
 
-    // Area-weighted 99.5th percentile of the glow sets the display scale.
+    // Area-weighted percentiles of the glow set the black point and scale.
     let mut weighted: Vec<(f32, f32)> = glow.iter().enumerate()
         .map(|(i, &v)| (v, ((0.5 - ((i / w) as f32 + 0.5) / h as f32) * std::f32::consts::PI).cos()))
         .collect();
     weighted.sort_by(|a, b| a.0.total_cmp(&b.0));
     let total: f32 = weighted.iter().map(|(_, wt)| wt).sum();
-    let mut accumulated = 0.0;
-    let mut band = weighted.last().map_or(1.0, |v| v.0);
-    for (value, wt) in &weighted {
-        accumulated += wt;
-        if accumulated >= 0.995 * total {
-            band = *value;
-            break;
+    let percentile = |q: f32| {
+        let mut accumulated = 0.0;
+        for (value, wt) in &weighted {
+            accumulated += wt;
+            if accumulated >= q * total {
+                return *value;
+            }
         }
-    }
-    let scale = BAND_DISPLAY / band.max(1.0e-6);
+        weighted.last().map_or(0.0, |v| v.0)
+    };
+    let black = percentile(BLACK_PERCENTILE);
+    let band = percentile(0.995);
+    drop(weighted);
+    let range = (band - black).max(1.0e-6);
 
     let mut out = Vec::with_capacity(w * h * 4);
     for &glow in &glow {
-        let value = glow * scale;
-        let t = (value / BAND_DISPLAY).clamp(0.0, 1.0);
+        let n = ((glow - black) / range).max(0.0);
+        let value = BAND_DISPLAY * n.powf(CONTRAST);
+        let t = n.min(1.0);
         let t = t * t * (3.0 - 2.0 * t);
         let colour = [0, 1, 2].map(|i| value * (FAINT_TINT[i] + (BRIGHT_TINT[i] - FAINT_TINT[i]) * t));
         out.extend_from_slice(&[linear_to_srgb(colour[2]), linear_to_srgb(colour[1]), linear_to_srgb(colour[0]), 255]);
