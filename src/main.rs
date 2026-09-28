@@ -9,6 +9,8 @@ mod debug_capture;
 mod debug_scenes;
 mod earthvt;
 mod ipc;
+mod look;
+mod milky_way;
 mod orbit;
 mod sgp4;
 mod sky;
@@ -184,6 +186,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", ipc::request(request)?);
             Ok(())
         }
+        "look" => {
+            let name = args.next().ok_or("usage: earth-native look {realistic|cinematic}")?;
+            if args.next().is_some() {
+                return usage();
+            }
+            let look = look::Look::parse(&name).ok_or("look must be realistic or cinematic")?;
+            println!("{}", ipc::request(Request::Look { look: look.name().to_owned() })?);
+            Ok(())
+        }
         "time" => {
             let subcommand = args
                 .next()
@@ -215,7 +226,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn usage() -> Result<(), Box<dyn std::error::Error>> {
-    Err("usage: earth-native {start [--debug]|stop|restart [--debug]|control [MONITOR]|body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune}|status|capture_frame|camera {live|globe|next|aurora|reset|zoom {in|out}|iss HEADING PITCH FOV|pov LAT LON ALT_KM HEADING PITCH|YAW PITCH DISTANCE}|validate-bundle MANIFEST.json|celestial {show|freeze|sun YAW PITCH|moon YAW PITCH|live}|time {show|unix SECONDS|live}|serve [--debug]}".into())
+    Err("usage: earth-native {start [--debug]|stop|restart [--debug]|control [MONITOR]|body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune}|status|capture_frame|camera {live|globe|next|aurora|reset|zoom {in|out}|iss HEADING PITCH FOV|pov LAT LON ALT_KM HEADING PITCH|YAW PITCH DISTANCE}|validate-bundle MANIFEST.json|celestial {show|freeze|sun YAW PITCH|moon YAW PITCH|live}|time {show|unix SECONDS|live}|look {realistic|cinematic}|serve [--debug]}".into())
 }
 
 fn parse_debug_flag(

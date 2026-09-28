@@ -8,6 +8,9 @@ layout(location = 0) out vec4 out_color;
 // when the optional production panorama is absent.
 layout(set = 0, binding = 0) uniform sampler2D star_panorama;
 layout(set = 0, binding = 10) uniform sampler2D moon_albedo;
+// Cinematic look: the star-free Milky Way baked from the panorama at
+// startup (src/milky_way.rs), display-referred sRGB, same UVs.
+layout(set = 0, binding = 5) uniform sampler2D milky_way;
 
 layout(push_constant) uniform FrameData {
     vec4 camera_position_distance;
@@ -155,6 +158,10 @@ void main() {
     // keep their display-referred presentation.
     bool physical = body == 0;
     float exposure = frame.camera_position_distance.w;
+    // Cinematic look (look.rs): the sky keeps a fixed night-series exposure
+    // whatever the camera's, so the Milky Way and stars show next to the
+    // daylit Earth and the Sun.
+    bool cinematic = (uint(frame.material_state.x) & 32u) != 0u;
     // The panorama only supplies the unresolved background (Milky Way,
     // zodiacal and faint-star glow). A 4-tap minimum (morphological erosion)
     // removes its magnified, BC1-blocky point stars, which cannot cover all
@@ -166,13 +173,20 @@ void main() {
         min(textureGrad(star_panorama, panorama_uv + erosion * vec2(1.0, -1.0), panorama_dx, panorama_dy).rgb,
             textureGrad(star_panorama, panorama_uv + erosion * vec2(-1.0, -1.0), panorama_dx, panorama_dy).rgb));
     vec3 colour = pow(max(source_colour, vec3(0.0)), vec3(1.7)) * 0.75;
-    // The eye sees the Milky Way with rods only, so colourless; the map's
-    // photographic H-alpha red (a brown haze on screen) is not visible.
-    colour = vec3(dot(colour, vec3(0.2126, 0.7152, 0.0722)));
-    // The Milky Way's brightest clouds are ~19 mag/arcsec^2, ~7e-8 of
-    // sunlight per steradian: black at daylight exposure, faint in a long
-    // night exposure, as in ISS night photographs.
-    if (physical) colour *= 1.0e-6 * exposure;
+    float sky_luma = dot(colour, vec3(0.2126, 0.7152, 0.0722));
+    if (physical && cinematic) {
+        // The Milky Way as a long-exposure astrophotograph shows it, from
+        // the star-free bake (the catalogue stars are drawn next).
+        colour = textureGrad(milky_way, panorama_uv, panorama_dx, panorama_dy).rgb;
+    } else {
+        // The eye sees the Milky Way with rods only, so colourless; the map's
+        // photographic H-alpha red (a brown haze on screen) is not visible.
+        colour = vec3(sky_luma);
+        // The Milky Way's brightest clouds are ~19 mag/arcsec^2, ~7e-8 of
+        // sunlight per steradian: black at daylight exposure, faint in a long
+        // night exposure, as in ISS night photographs.
+        if (physical) colour *= 1.0e-6 * exposure;
+    }
     // The catalogue stars themselves are drawn next, one quad per star
     // (stars_points.vert/.frag).
 
@@ -197,12 +211,13 @@ void main() {
         float mu_disc = sqrt(max(1.0 - radial_sun * radial_sun, 0.0));
         float limb = (1.0 - 0.6 * (1.0 - mu_disc)) / 0.8;
         float disc = celestial_disc(sun_cosine, sun_angular_radius, sun_angular_radius * 0.04);
-        // Local adaptation, as for the Moon: the disc is stored at most 40
-        // (well past white after the camera curve, so it stays a saturated
-        // disc at any exposure). The lens glare (post.frag) is likewise
-        // display-relative (vulkan.rs SUN_GLARE); 3000 here spread through
-        // the bloom pyramid into a halo that greyed out the night sky.
-        colour += vec3(disc * limb * min(mean_radiance * exposure, 40.0));
+        // Realistic: stored at most 3000; the lens model (post.frag) carries
+        // the rest of the Sun's energy analytically, and this keeps the disc
+        // saturated without the box pyramid spreading 46000x radiance into a
+        // halo. Cinematic: local adaptation, as for the Moon: at most 40
+        // (still past white after the camera curve) with a display-relative
+        // glare (vulkan.rs), so no bloom halo greys out the night sky.
+        colour += vec3(disc * limb * min(mean_radiance * exposure, cinematic ? 40.0 : 3000.0));
     }
     float sun_outer_corona = exp(-max(sun_angle - sun_angular_radius, 0.0) / (sun_angular_radius * 8.0));
     float sun_aureole = exp(-max(sun_angle, 0.0) / (sun_angular_radius * 12.0));

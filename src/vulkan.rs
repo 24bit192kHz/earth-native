@@ -114,6 +114,9 @@ pub struct FrameUniforms {
     pub live_aerosol: bool,
     /// Binding 12 also carries OSI SAF sea-ice concentration (G).
     pub live_sea_ice: bool,
+    /// Cinematic look (look.rs): the sky at a fixed display brightness and
+    /// a soft Sun, whatever the camera exposure.
+    pub cinematic: bool,
     pub camera_position: [f32; 3],
     pub camera_distance: f32,
     pub forward: [f32; 3],
@@ -154,6 +157,7 @@ impl Default for FrameUniforms {
             live_clouds: false,
             live_aerosol: false,
             live_sea_ice: false,
+            cinematic: false,
             camera_position: [-5.5, 0.0, 0.0],
             camera_distance: 5.5,
             forward: [1.0, 0.0, 0.0],
@@ -361,11 +365,13 @@ impl ShaderFrame {
             ],
             // x: 0 authored, 1 NASA surface, 2 NASA surface + NASA cloud map;
             // +4 when observed live clouds are bound (binding 12), +8 when
-            // that texture also carries aerosol optical depth, +16 sea ice.
+            // that texture also carries aerosol optical depth, +16 sea ice,
+            // +32 cinematic look.
             material_state: [(u32::from(uniforms.nasa_materials) + u32::from(uniforms.nasa_clouds)
                 + 4 * u32::from(uniforms.live_clouds)
                 + 8 * u32::from(uniforms.live_clouds && uniforms.live_aerosol)
-                + 16 * u32::from(uniforms.live_clouds && uniforms.live_sea_ice)) as f32,
+                + 16 * u32::from(uniforms.live_clouds && uniforms.live_sea_ice)
+                + 32 * u32::from(uniforms.cinematic)) as f32,
                 u32::from(uniforms.weather_valid_unix_utc > 0) as f32,
                 u32::from(uniforms.aurora_valid_unix_utc > 0) as f32, moon_disc_hi],
             camera_forward: [
@@ -527,6 +533,7 @@ pub struct Renderer {
     star_format: &'static str,
     current_body: crate::body::Body,
     exposure: ExposureController,
+    look: crate::look::Look,
     /// The GMGSI cloud texture occupies binding 12.
     live_clouds_bound: bool,
 }
@@ -579,9 +586,21 @@ impl ExposureController {
         1.22 + 0.33 * night * night * (3.0 - 2.0 * night)
     }
 
-    fn update(&mut self, reading: Option<post::MeterReading>, now: Instant) {
+    /// Light adaptation (toward a lower exposure) is fast, as for the eye
+    /// and a camera's highlight protection; dark adaptation keeps the slow
+    /// constant. Symmetric easing left the daylit Earth white for seconds
+    /// after a look at the night sky (EV 17 -> 0 at ~1 stop per second).
+    const LIGHT_TIME_CONSTANT_S: f32 = 0.12;
+    const MAX_OVEREXPOSURE_STOPS: f32 = 1.5;
+
+    fn update(&mut self, reading: Option<post::MeterReading>, sun_cap: Option<f32>, now: Instant) {
         if let Some(reading) = reading {
             self.target_ev = Self::target_for(reading.log2_luminance);
+        }
+        // A photographer never shoots a night exposure with the Sun in the
+        // frame: its glare (added after metering) would white it out.
+        if let Some(cap) = sun_cap {
+            self.target_ev = self.target_ev.min(cap.max(Self::MIN_EV));
         }
         let dt = self.last_update.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32());
         self.last_update = Some(now);
@@ -590,6 +609,9 @@ impl ExposureController {
             // drawing, see `converging`) until they describe the new view.
             self.snap_frames -= 1;
             self.ev = self.target_ev;
+        } else if self.target_ev < self.ev {
+            self.ev = self.ev.min(self.target_ev + Self::MAX_OVEREXPOSURE_STOPS);
+            self.ev += (self.target_ev - self.ev) * (1.0 - (-dt / Self::LIGHT_TIME_CONSTANT_S).exp());
         } else {
             self.ev += (self.target_ev - self.ev) * (1.0 - (-dt / Self::TIME_CONSTANT_S).exp());
         }
@@ -720,6 +742,8 @@ struct PinnedStarTexture {
     /// Hipparcos catalogue (binding 16), drawn as `star_count` quads.
     catalog: PinnedBgraTexture,
     star_count: u32,
+    /// Star-free Milky Way for the cinematic look (binding 5, milky_way.rs).
+    milky_way: PinnedBgraTexture,
     moon: PinnedBgraTexture,
     /// False while a non-Earth body is selected: binding 10 carries a 1x1
     /// fallback because the Moon disc only renders for Earth.
@@ -1408,6 +1432,9 @@ struct OutputTarget {
 #[derive(Clone, Copy)]
 struct CameraSettings {
     preexposure: f32,
+    /// Pre-exposure of the catalogue stars (the camera's, or the cinematic
+    /// look's fixed sky exposure).
+    sky_preexposure: f32,
     post: PostFrame,
 }
 
@@ -1731,6 +1758,7 @@ impl Renderer {
             star_format,
             current_body: crate::body::from_environment(),
             exposure: ExposureController::new(),
+            look: crate::look::Look::startup(),
             live_clouds_bound: false,
         })
     }
@@ -1780,7 +1808,7 @@ impl Renderer {
             Some(state) if state.live_clouds(now).is_some() && state.live_sea_ice(now) => "OSI-SAF",
             _ => "none",
         };
-        format!("body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2})", self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
+        format!("look={} body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2})", self.look.name(), self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
     }
 
     pub unsafe fn configure_output(
@@ -2054,6 +2082,7 @@ impl Renderer {
         }
         uniforms.nasa_materials = self.nasa_materials;
         uniforms.nasa_clouds = self.nasa_clouds;
+        uniforms.cinematic = self.look == crate::look::Look::Cinematic;
         if let Some(weather) = &self.weather {
             uniforms.weather_valid_unix_utc = weather.valid_unix_utc;
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
@@ -2119,7 +2148,13 @@ impl Renderer {
             .max_by_key(|target| target.extent.width as u64 * target.extent.height as u64)
             .and_then(|target| target.last_meter);
         let earth = self.current_body == crate::body::Body::Earth;
-        self.exposure.update(if earth { reading } else { None }, Instant::now());
+        // Realistic: one camera, so the Sun in frame caps the exposure and a
+        // starfield frame is exposed for the stars. Cinematic: the sky has
+        // its own fixed brightness, so a frame without the Earth keeps the
+        // exposure it had (no flash when the Earth comes back into view).
+        let reading = reading.filter(|reading| !(uniforms.cinematic && reading.starfield));
+        let sun_cap = if earth && !uniforms.cinematic { sun_exposure_cap(uniforms, body_selector) } else { None };
+        self.exposure.update(if earth { reading } else { None }, sun_cap, Instant::now());
         needs_redraw |= earth && self.exposure.converging();
         let camera = camera_settings(uniforms, body_selector, &self.exposure, earth);
         for target in self.outputs.values_mut() {
@@ -2144,6 +2179,11 @@ impl Renderer {
 
     pub fn exposure_ev(&self) -> f32 {
         self.exposure.ev
+    }
+
+    pub fn set_look(&mut self, look: crate::look::Look) {
+        self.look = look;
+        self.snap_exposure();
     }
 
     pub fn set_debug_scene(&mut self, scene_name: &str) {
@@ -2614,8 +2654,72 @@ impl Renderer {
     }
 }
 
-/// Display-relative strength of the Sun's lens glare (see `camera_settings`).
-const SUN_GLARE: f64 = 0.03;
+/// Veiling-glare point-spread function of the lens model (post.frag's
+/// `source_glare` lobes), per steradian at `angle` radians off the source.
+fn lens_glare_psf(angle: f64) -> f64 {
+    let near = angle / 0.010;
+    let far = angle / 0.15;
+    0.004 * 0.6 / (std::f64::consts::PI * 0.010 * 0.010) * (1.0 + near * near).powf(-1.6)
+        + 0.0015 / (std::f64::consts::PI * 0.15 * 0.15) * (1.0 + far * far).powf(-2.0)
+}
+
+/// Exposure ceiling (EV) set by the Sun. The scene meter reads the HDR
+/// target before post.frag adds the lens glare, so the Sun's veiling glare is
+/// metered here over a 33 x 15 grid across the whole frame, as a camera's
+/// matrix meter would see it: the exposure keeps the frame's mean glare
+/// under 8 % and all but 8 % of the frame under half white. A Sun just off
+/// the edge then flares that side instead of whiting out the view, and a
+/// night exposure cannot open up while the (sunlit) ISS camera faces the
+/// Sun. A Sun in frame caps it at log2(1 / visible fraction): "sunny 16"
+/// (EV 0) for an open Sun, more for one sinking through the limb.
+fn sun_exposure_cap(uniforms: FrameUniforms, body_selector: f32) -> Option<f32> {
+    let frame = ShaderFrame::from_uniforms(uniforms, LogicalRect::default(), body_selector);
+    let view = frame.celestial_sun_view;
+    let sun = [view[0], view[1], view[2]].map(f64::from);
+    let dot = |a: [f64; 3], b: [f32; 3]| a[0] * f64::from(b[0]) + a[1] * f64::from(b[1]) + a[2] * f64::from(b[2]);
+    let (x, y, z) = (dot(sun, uniforms.right), dot(sun, uniforms.up), dot(sun, uniforms.forward));
+    // Same acceptance as post.frag: no glare from > ~75 degrees off axis.
+    let t = ((z - 0.26) / (0.64 - 0.26)).clamp(0.0, 1.0);
+    let acceptance = t * t * (3.0 - 2.0 * t);
+    if acceptance <= 0.0 {
+        return None;
+    }
+    let km_per_unit = crate::sky::GROUND_KM / f64::from(SCENE_EARTH_RADIUS);
+    let camera_km = uniforms.camera_position.map(|v| f64::from(v) * km_per_unit);
+    let visible = disc_visibility(camera_km, sun, f64::from(view[3]));
+    let luminance = 0.2126 * visible[0] + 0.7152 * visible[1] + 0.0722 * visible[2];
+    if luminance <= 1.0e-7 {
+        return None;
+    }
+    let (tan_x, tan_y) = (f64::from(uniforms.tan_half_fov_x), f64::from(uniforms.tan_half_fov_y));
+    let in_frame = z > 0.0 && (x / z / tan_x).abs() < 1.0 && (y / z / tan_y).abs() < 1.0;
+    let mut glare = Vec::with_capacity(33 * 15);
+    for row in 0..15 {
+        for column in 0..33 {
+            let (u, v) = (f64::from(column) / 16.0 - 1.0, f64::from(row) / 7.0 - 1.0);
+            let direction = [0, 1, 2].map(|c| f64::from(uniforms.forward[c])
+                + f64::from(uniforms.right[c]) * u * tan_x + f64::from(uniforms.up[c]) * v * tan_y);
+            let length = direction.iter().map(|d| d * d).sum::<f64>().sqrt();
+            let cosine = (direction.iter().zip(sun).map(|(d, s)| d * s).sum::<f64>() / length).clamp(-1.0, 1.0);
+            glare.push(std::f64::consts::PI * luminance * acceptance * lens_glare_psf(cosine.acos()));
+        }
+    }
+    glare.sort_by(f64::total_cmp);
+    let mean = glare.iter().sum::<f64>() / glare.len() as f64;
+    let high = glare[glare.len() * 92 / 100];
+    let glare_cap = (0.08 / mean).log2().min((0.5 / high).log2());
+    let cap = if in_frame { glare_cap.min((1.0 / luminance).log2()) } else { glare_cap };
+    Some(cap as f32)
+}
+
+/// Cinematic look: display-relative strength of the Sun's lens glare, its
+/// diffraction rays and ghosts (see `camera_settings`).
+const CINEMATIC_SUN_GLARE: f64 = 0.03;
+const CINEMATIC_STARBURST: f32 = 0.18;
+const CINEMATIC_GHOSTS: f32 = 0.0;
+/// Cinematic look: the pre-exposure the catalogue stars and the Milky Way
+/// are drawn with, whatever the camera's (a night series, EV 17).
+pub(crate) const CINEMATIC_SKY_PREEXPOSURE: f32 = 131072.0;
 
 fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &ExposureController, earth: bool) -> CameraSettings {
     if !earth {
@@ -2623,6 +2727,7 @@ fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &Expos
         // exposure and the legacy filmic curve).
         return CameraSettings {
             preexposure: 1.0,
+            sky_preexposure: 1.0,
             post: PostFrame { tone: [1.0, 1.0, 0.0, 0.0], ..PostFrame::default() },
         };
     }
@@ -2649,20 +2754,22 @@ fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &Expos
     let solar_au = f64::from(uniforms.sun_distance_earth_radii) * crate::sky::GROUND_KM / 149_597_870.7;
     let sun_irradiance = 1.0 / (solar_au * solar_au).max(1.0e-6);
     let noise = 0.003 + 0.022 * ((exposure.ev - 7.0) / 8.0).clamp(0.0, 1.0);
+    let cinematic = uniforms.cinematic;
     CameraSettings {
         preexposure,
+        sky_preexposure: if cinematic { CINEMATIC_SKY_PREEXPOSURE } else { preexposure },
         post: PostFrame {
             tone: [exposure.contrast(), 0.0, (exposure.frame % 4096) as f32, noise],
             sun: to_camera(frame.celestial_sun_view),
-            // The Sun, like the Moon, is shown as the adapted eye (or an HDR
-            // merge) sees it: its disc saturates (stars_textured.frag) and
-            // its glare carries a fixed display-relative energy, SUN_GLARE
-            // of the daylight-exposure glare at most, whatever the exposure.
-            // At full strength the veil, the 18 rays and the ghosts covered
-            // the screen, and holding a daylight exposure for them blacked
-            // out the night side and the stars behind a Sun in frame.
-            sun_light: source(frame.celestial_sun_view,
-                sun_irradiance * (SUN_GLARE / (f64::from(preexposure) * sun_irradiance)).min(1.0)),
+            // Realistic: the Sun's full glare. Cinematic: like the Moon, the
+            // Sun is shown as the adapted eye sees it: the disc saturates
+            // (stars_textured.frag) and the glare carries a fixed
+            // display-relative energy, a soft glow with faint rays.
+            sun_light: source(frame.celestial_sun_view, if cinematic {
+                sun_irradiance * (CINEMATIC_SUN_GLARE / (f64::from(preexposure) * sun_irradiance)).min(1.0)
+            } else {
+                sun_irradiance
+            }),
             moon: to_camera(frame.celestial_moon_view),
             // The Moon disc is compressed toward display white like the
             // eye's local adaptation (stars_textured.frag); so is its glare.
@@ -3849,11 +3956,12 @@ impl PinnedStarTexture {
         planet_previews: &PlanetPreviews,
         saturn_ring_preview: Option<&RingPreview>,
     ) -> RendererResult<Self> {
-        let panorama_texture = match panorama {
+        let (panorama_texture, milky_way_source) = match panorama {
             Some(panorama) => {
                 let (width, height) = panorama.extent();
                 let mapped = panorama.map_payload()?;
-                match panorama.format() {
+                let bc1 = panorama.format() == StarPanoramaFormat::Bc1Srgb;
+                let texture = match panorama.format() {
                     StarPanoramaFormat::Bgra8Srgb => PinnedBgraTexture::create(
                         device,
                         resources,
@@ -3875,9 +3983,13 @@ impl PinnedStarTexture {
                         mapped.bytes(),
                         "BC1 star panorama",
                     )?,
-                }
+                };
+                let started = Instant::now();
+                let milky_way = crate::milky_way::bake(mapped.bytes(), panorama.mips(), (width, height), bc1);
+                eprintln!("earth-native: Milky Way baked in {:?}", started.elapsed());
+                (texture, milky_way)
             }
-            None => PinnedBgraTexture::create(
+            None => (PinnedBgraTexture::create(
                 device,
                 resources,
                 STAR_PANORAMA_FORMAT,
@@ -3886,7 +3998,21 @@ impl PinnedStarTexture {
                 1,
                 &[0, 0, 0, 255],
                 "star panorama fallback",
-            )?,
+            )?, None),
+        };
+        let milky_way = match &milky_way_source {
+            Some(source) => PinnedBgraTexture::create(device, resources, STAR_PANORAMA_FORMAT,
+                vk::SamplerAddressMode::CLAMP_TO_EDGE, source.width, source.height, &source.bytes, "Milky Way"),
+            None => PinnedBgraTexture::create(device, resources, STAR_PANORAMA_FORMAT,
+                vk::SamplerAddressMode::CLAMP_TO_EDGE, 1, 1, &[0, 0, 0, 255], "Milky Way fallback"),
+        };
+        drop(milky_way_source);
+        let milky_way = match milky_way {
+            Ok(texture) => texture,
+            Err(error) => {
+                unsafe { panorama_texture.destroy(device) };
+                return Err(error);
+            }
         };
         // The Moon disc only renders for Earth, so any other startup body
         // keeps a 1x1 fallback here exactly like a missing Moon preview.
@@ -3934,6 +4060,7 @@ impl PinnedStarTexture {
             Err(error) => {
                 unsafe {
                     panorama_texture.destroy(device);
+                    milky_way.destroy(device);
                     moon.destroy(device);
                     planets.destroy(device);
                 }
@@ -3945,6 +4072,7 @@ impl PinnedStarTexture {
             Err(error) => {
                 unsafe {
                     panorama_texture.destroy(device);
+                    milky_way.destroy(device);
                     moon.destroy(device);
                     planets.destroy(device);
                     catalog.destroy(device);
@@ -3964,6 +4092,10 @@ impl PinnedStarTexture {
             .sampler(catalog.sampler)
             .image_view(catalog.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let milky_way_info = [vk::DescriptorImageInfo::default()
+            .sampler(milky_way.sampler)
+            .image_view(milky_way.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let planet_infos = planets.descriptor_infos();
         let mut writes = vec![
             vk::WriteDescriptorSet::default()
@@ -3971,6 +4103,13 @@ impl PinnedStarTexture {
                 .dst_binding(16)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&catalog_info),
+            // Binding 5 is the Earth set's cloud layer; the star set carries
+            // the cinematic Milky Way there.
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&milky_way_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(0)
@@ -3996,6 +4135,7 @@ impl PinnedStarTexture {
             texture: panorama_texture,
             catalog,
             star_count,
+            milky_way,
             moon,
             planets,
             descriptor_set,
@@ -4008,6 +4148,7 @@ impl PinnedStarTexture {
         self.moon.destroy(device);
         self.planets.destroy(device);
         self.catalog.destroy(device);
+        self.milky_way.destroy(device);
     }
 }
 
@@ -5808,7 +5949,10 @@ impl OutputTarget {
                     star_frame.params[2] = 1.0;
                     star_frame.params[3] = 1.0;
                 } else {
-                    star_frame.params[2] = camera.preexposure * std::f32::consts::PI / (pixel_angle * pixel_angle);
+                    star_frame.params[2] = camera.sky_preexposure * std::f32::consts::PI / (pixel_angle * pixel_angle);
+                    if uniforms.cinematic {
+                        star_frame.params[3] = -1.0;
+                    }
                 }
                 let star_bytes = std::slice::from_raw_parts(
                     (&star_frame as *const StarFrame).cast::<u8>(),
@@ -5924,7 +6068,10 @@ impl OutputTarget {
             device.device.cmd_set_scissor(command_buffer, 0, &scissor);
             let mut post_frame = camera.post;
             post_frame.projection = [uniforms.tan_half_fov_x, uniforms.tan_half_fov_y, uniforms.focus_x, uniforms.focus_y];
-            post_frame.canvas = [uniforms.canvas.x, uniforms.canvas.y, uniforms.canvas.width, uniforms.canvas.height];
+            // canvas.xy (unused by post.frag as an origin) carry the Sun's
+            // starburst and ghost strengths.
+            let (starburst, ghosts) = if uniforms.cinematic { (CINEMATIC_STARBURST, CINEMATIC_GHOSTS) } else { (1.0, 1.0) };
+            post_frame.canvas = [starburst, ghosts, uniforms.canvas.width, uniforms.canvas.height];
             post_frame.viewport = [self.viewport.x, self.viewport.y, self.viewport.width, self.viewport.height];
             device.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.post.pipeline);
             device.device.cmd_bind_descriptor_sets(
@@ -6193,6 +6340,27 @@ impl OutputTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exposure_adapts_to_light_fast_and_to_dark_slowly() {
+        let start = Instant::now();
+        let mut exposure = ExposureController::new();
+        exposure.snap_frames = 0;
+        exposure.ev = 17.0;
+        // Panning from the night sky back to the daylit Earth (no cut):
+        // at most 1.5 stops over on the first frame, within 0.1 stop by 0.4 s.
+        let day = post::MeterReading { log2_luminance: ExposureController::DAY_LUMINANCE_LOG2, coverage: 1.0, starfield: false };
+        exposure.update(Some(day), None, start);
+        exposure.update(Some(day), None, start + Duration::from_millis(33));
+        assert!(exposure.ev <= 1.5, "first frames {:.2} EV over", exposure.ev);
+        exposure.update(Some(day), None, start + Duration::from_millis(400));
+        assert!(exposure.ev < 0.1, "{:.2}", exposure.ev);
+        // Back to the night: still the slow ~0.9 s easing.
+        let night = post::MeterReading { log2_luminance: -21.4, coverage: 1.0, starfield: true };
+        exposure.update(Some(night), None, start + Duration::from_millis(433));
+        exposure.update(Some(night), None, start + Duration::from_millis(533));
+        assert!(exposure.ev < 3.0, "{:.2}", exposure.ev);
+    }
 
     #[test]
     fn moon_basis_undoes_the_scene_longitude_mirror() {

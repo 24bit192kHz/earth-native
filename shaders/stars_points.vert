@@ -17,7 +17,8 @@ layout(push_constant) uniform StarFrame {
     vec4 canvas_rect;
     vec4 viewport_rect;
     // x: Julian years since the catalogue epoch; y: physical pixels per canvas
-    // unit; z: brightness gain; w: 1 for the legacy (planet view) scale.
+    // unit; z: brightness gain; w: 1 for the legacy (planet view) scale,
+    // -1 for the cinematic look.
     vec4 params;
 } frame;
 
@@ -83,8 +84,10 @@ void main() {
         // exposure exactly as in the ISS photographs; the camera stage's
         // glare makes the bright ones bloom.
         energy = frame.params.z * exp(-0.921034 * (vmag + 26.74));
-        // A sharp wide-angle lens: ~0.6 px Gaussian core.
-        sigma = 0.62;
+        // A sharp wide-angle lens: ~0.6 px Gaussian core. Cinematic look
+        // (params.w < 0): bright stars swell a little, as in astrophotos,
+        // so they read on a desktop.
+        sigma = frame.params.w < -0.5 ? 0.8 * pow(max(energy, 1.0), 0.1) : 0.62;
     }
     float radius_px = max(4.0 * sigma, 1.5);
 

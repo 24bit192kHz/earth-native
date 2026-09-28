@@ -24,7 +24,7 @@ layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(push_constant) uniform PostFrame {
     vec4 tone;        // x contrast, y mode (0 camera, 1 legacy), z seed, w noise
     vec4 projection;  // tan half-fov x/y, optical centre x/y (canvas units)
-    vec4 canvas;
+    vec4 canvas;      // x Sun starburst strength, y ghost strength, zw canvas size
     vec4 viewport;
     vec4 sun;         // camera-space direction, w angular radius
     vec4 sun_light;   // visible irradiance (pre-exposed), w in front
@@ -201,9 +201,9 @@ void main() {
     vec3 ray = normalize(vec3(ndc * post.projection.xy, 1.0));
     float px_per_rad = post.canvas.w * 0.5 / post.projection.y;
 
-    colour += source_glare(ray, ndc, post.sun, post.sun_light, 1.0, px_per_rad);
+    colour += source_glare(ray, ndc, post.sun, post.sun_light, post.canvas.x, px_per_rad);
     colour += source_glare(ray, ndc, post.moon, post.moon_light, 0.15, px_per_rad);
-    colour += ghosts(ndc, post.sun, post.sun_light, px_per_rad);
+    colour += ghosts(ndc, post.sun, post.sun_light, px_per_rad) * post.canvas.y;
 
     // Natural vignetting, 60 % corrected (a lens profile's residual).
     float cos_axis = ray.z;
