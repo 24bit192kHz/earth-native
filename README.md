@@ -37,11 +37,12 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 - **Every planet.** Mercury, Venus, Mars, Jupiter, Saturn (with rings),
   Uranus and Neptune plus the Moon — each with its IAU axis and rotation,
   real flattening and its own limb-darkening law.
-- **Built to sit in the background.** Block-compressed maps and a streamed
-  virtual texture, motion-gated redraws (30 fps while riding the ISS, 15 on
+- **Built to sit in the background.** Block-compressed maps, streamed
+  virtual textures, motion-gated redraws (30 fps while riding the ISS, 15 on
   the globe), idle CPU priority. On an RTX 3080 Ti driving 3440×1440 and
-  2560×1080 monitors with the 500 m set: ~9 ms of GPU time per frame from
-  the ISS, ~12 ms on the globe, ~2 GB of VRAM.
+  2560×1080 monitors with the 500 m set: ~7 ms of GPU time per frame from
+  the ISS, ~560 MiB of VRAM, ~3 % of one CPU core, ~150 MB of RAM, first
+  frame 0.55 s after start; the weather feed holds 26 MB between updates.
 - **Native everywhere.** Wayland via wlr-layer-shell (Hyprland, Sway, KDE
   Plasma, niri, river, labwc, Wayfire…) and Xorg via an EWMH desktop window on
   every monitor. Multi-monitor desktops share one continuous camera.
