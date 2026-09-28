@@ -50,6 +50,21 @@ earth-bake gray-bc4 --tiles A1,B1,C1,D1,A2,B2,C2,D2 --grid 4x2 --width 32768 \
 earth-bake relief-bc5 --gebco DIR --width 32768 --out relief.bc5
 ```
 
+
+With these, stream the three finest levels of the night lights, cloud map
+and relief instead of keeping 1.4 GB of them resident:
+
+```sh
+earth-bake static-vt --textures <texture set>   # ~2 s: re-tiles the blocks, no re-encode
+```
+
+This writes `earth-static.earthvt` (three layers, 256 px tiles; 1.5 GB on
+disk) and `night-tail.bc4`, `clouds-tail.bc4`, `relief-tail.bc5` (the levels
+from 4096 px down, 23 MB, always resident). When all four are present the
+renderer streams the rest on demand (`EARTH_NATIVE_STATIC_VT_BUDGET_MB`,
+default 96) and blends between the two nearest levels; the full-size maps
+are no longer loaded (VRAM 2.0 -> 0.85 GB with the 500 m set).
+
 Sources: the Blue Marble NG "world" tiles
 (`world.2004MM.3x21600x21600.{A1..D2}.png`, NASA Visible Earth, one record
 per month), the Black Marble 2016 gray tiles

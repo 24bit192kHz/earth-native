@@ -85,12 +85,13 @@ fn run() -> Result<()> {
             bake_gray_bc4(&tiles, grid[0], grid[1], width, args.required("--color-space")?,
                 args.required("--name")?, Path::new(args.required("--out")?))
         }
+        "static-vt" => bake_static_vt(Path::new(args.required("--textures")?), args.value("--tail-width").unwrap_or("4096").parse()?),
         "relief-bc5" => {
             let width: usize = args.required("--width")?.parse()?;
             let exaggeration: f32 = args.value("--exaggeration").unwrap_or("1.0").parse()?;
             bake_relief_bc5(Path::new(args.required("--gebco")?), width, exaggeration, Path::new(args.required("--out")?))
         }
-        _ => Err("usage: earth-bake day-vt --bmng DIR --month YYYYMM [--gebco DIR] --out FILE [--width 65536]\n       earth-bake gray-bc4 --tiles A,B,... --grid CxR --width W --color-space srgb|linear --name NASA/x --out FILE.bc4".into()),
+        _ => Err("usage: earth-bake day-vt --bmng DIR --month YYYYMM [--gebco DIR] --out FILE [--width 65536]\n       earth-bake gray-bc4 --tiles A,B,... --grid CxR --width W --color-space srgb|linear --name NASA/x --out FILE.bc4\n       earth-bake static-vt --textures DIR [--tail-width 4096]".into()),
     }
 }
 
@@ -456,6 +457,196 @@ fn write_png(path: &Path, image: &Image) -> Result<()> {
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(&image.rgba)?;
+    Ok(())
+}
+
+
+// ---------------------------------------------------------------- static VT
+
+/// One block-compressed source map (a `.bc4`/`.bc5` with its mip chain).
+struct BlockMap {
+    bytes: memmap2::Mmap,
+    meta: serde_json::Value,
+    block_bytes: usize,
+    /// (width, height, byte offset) per mip.
+    mips: Vec<(usize, usize, usize)>,
+}
+
+impl BlockMap {
+    fn open(path: &Path) -> Result<Self> {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(".json");
+        let meta: serde_json::Value = serde_json::from_slice(&fs::read(&sidecar)?)?;
+        let block_bytes = match meta["pixel_format"].as_str() {
+            Some("bc4") => 8,
+            Some("bc5") => 16,
+            other => return Err(format!("{}: unsupported pixel format {other:?}", path.display()).into()),
+        };
+        let mips = meta["mips"].as_array().ok_or("sidecar has no mips")?.iter().map(|m| -> Result<_> {
+            Ok((m["width"].as_u64().ok_or("mip width")? as usize, m["height"].as_u64().ok_or("mip height")? as usize,
+                m["byte_offset"].as_u64().ok_or("mip offset")? as usize))
+        }).collect::<Result<Vec<_>>>()?;
+        let bytes = unsafe { memmap2::Mmap::map(&File::open(path)?)? };
+        Ok(Self { bytes, meta, block_bytes, mips })
+    }
+
+    /// One 264x264 tile (66x66 blocks, a one-block gutter) of `mip`, copied
+    /// block for block: longitude wraps, latitude and small levels clamp.
+    fn tile(&self, mip: usize, x: u32, y: u32) -> Vec<u8> {
+        let (width, height, offset) = self.mips[mip.min(self.mips.len() - 1)];
+        let (bw, bh) = ((width / 4).max(1), (height / 4).max(1));
+        let blocks = PADDED_TILE_SIZE as usize / 4;
+        let mut out = Vec::with_capacity(blocks * blocks * self.block_bytes);
+        for j in 0..blocks as i64 {
+            let by = (y as i64 * 64 + j - 1).clamp(0, bh as i64 - 1) as usize;
+            for i in 0..blocks as i64 {
+                let bx = (x as i64 * 64 + i - 1).rem_euclid(bw as i64).min(bw as i64 - 1) as usize;
+                let at = offset + (by * bw + bx) * self.block_bytes;
+                out.extend_from_slice(&self.bytes[at..at + self.block_bytes]);
+            }
+        }
+        out
+    }
+
+    /// The mips from `tail_width` down, as a standalone map (its sidecar
+    /// rebased), for the always-resident part the renderer samples beyond
+    /// the virtual texture.
+    fn write_tail(&self, tail_width: usize, out: &Path) -> Result<()> {
+        let first = self.mips.iter().position(|m| m.0 <= tail_width).ok_or("no mip at the tail width")?;
+        let base = self.mips[first].2;
+        let end = self.meta["payload_bytes"].as_u64().ok_or("payload_bytes")? as usize;
+        let temporary = out.with_extension("partial");
+        fs::write(&temporary, &self.bytes[base..end])?;
+        let mut meta = self.meta.clone();
+        let (width, height, _) = self.mips[first];
+        meta["width"] = width.into();
+        meta["height"] = height.into();
+        meta["row_stride_bytes"] = ((width / 4) * self.block_bytes).into();
+        meta["payload_bytes"] = (end - base).into();
+        meta["mips"] = self.mips[first..].iter()
+            .map(|&(w, h, o)| serde_json::json!({"byte_offset": o - base, "width": w, "height": h}))
+            .collect();
+        let mut sidecar = out.as_os_str().to_owned();
+        sidecar.push(".json");
+        fs::write(&sidecar, serde_json::to_vec_pretty(&meta)?)?;
+        fs::rename(&temporary, out)?;
+        Ok(())
+    }
+}
+
+/// `earth-static.earthvt`: the 32K night lights, NASA cloud map and GEBCO
+/// relief normals as one three-layer virtual texture (their blocks re-tiled,
+/// not re-encoded), plus `*-tail` maps of the levels from `tail_width` down.
+/// The renderer streams only the three finest levels and keeps the tails
+/// resident: ~1.4 GB of fully resident VRAM becomes ~0.1 GB.
+fn bake_static_vt(textures: &Path, tail_width: usize) -> Result<()> {
+    let started = Instant::now();
+    let sources = [
+        ("night.bc4", TextureChannel::NightEmission, PixelFormat::Bc4, "night-tail.bc4"),
+        ("clouds.bc4", TextureChannel::CloudDensity, PixelFormat::Bc4, "clouds-tail.bc4"),
+        ("relief.bc5", TextureChannel::SurfaceNormal, PixelFormat::Bc5, "relief-tail.bc5"),
+    ];
+    let maps = sources.iter().map(|(name, ..)| BlockMap::open(&textures.join(name))).collect::<Result<Vec<_>>>()?;
+    let (width, height, _) = maps[0].mips[0];
+    if maps.iter().any(|m| m.mips[0].0 != width || m.mips[0].1 != height) {
+        return Err("night, clouds and relief must share one size".into());
+    }
+    let mip_count = full_mip_count(width as u32, height as u32).ok_or("bad size")?;
+    let mut layers = Vec::new();
+    let mut keys = Vec::new();
+    for (ordinal, (&(_, channel, format, _), _)) in sources.iter().zip(&maps).enumerate() {
+        let mut layer = LayerDescriptor {
+            id: ordinal as u16 + 1, channel, format, mip_count,
+            base_width: width as u32, base_height: height as u32,
+            first_index: keys.len() as u32, index_count: 0,
+            flags: LAYER_FLAG_WRAP_X | LAYER_FLAG_CLAMP_Y,
+        };
+        for mip in 0..mip_count {
+            let (tx, ty) = layer.tile_grid(mip).ok_or("grid")?;
+            for y in 0..ty {
+                for x in 0..tx {
+                    keys.push((ordinal, layer.id, mip, x, y));
+                }
+            }
+        }
+        layer.index_count = keys.len() as u32 - layer.first_index;
+        layers.push(layer);
+    }
+    let layer_table_offset = HEADER_BYTES as u64;
+    let index_offset = layer_table_offset + (LAYER_ENTRY_BYTES * layers.len()) as u64;
+    let payload_offset = (index_offset + keys.len() as u64 * INDEX_ENTRY_BYTES as u64).div_ceil(PAYLOAD_ALIGNMENT) * PAYLOAD_ALIGNMENT;
+    let mut offsets = Vec::with_capacity(keys.len());
+    let mut cursor = payload_offset;
+    for &(ordinal, ..) in &keys {
+        offsets.push(cursor);
+        cursor += sources[ordinal].2.encoded_tile_bytes();
+    }
+    let file_bytes = cursor;
+    let out = textures.join("earth-static.earthvt");
+    let temporary = out.with_extension("earthvt.partial");
+    let _ = fs::remove_file(&temporary);
+    let mut file = OpenOptions::new().create_new(true).read(true).write(true).open(&temporary)?;
+    file.set_len(file_bytes)?;
+    let hashes: Vec<u32> = keys.par_iter().zip(&offsets).map(|(&(ordinal, _, mip, x, y), &offset)| -> Result<u32> {
+        let payload = maps[ordinal].tile(mip as usize, x, y);
+        file.write_all_at(&payload, offset)?;
+        Ok(fnv1a(&payload))
+    }).collect::<Result<Vec<_>>>()?;
+
+    let mut header = [0u8; HEADER_BYTES];
+    header[..8].copy_from_slice(&MAGIC);
+    put16(&mut header, 8, VERSION);
+    put16(&mut header, 10, HEADER_BYTES as u16);
+    put16(&mut header, 16, TILE_SIZE);
+    put16(&mut header, 18, GUTTER_SIZE);
+    put16(&mut header, 20, layers.len() as u16);
+    put16(&mut header, 22, LAYER_ENTRY_BYTES as u16);
+    put16(&mut header, 24, INDEX_ENTRY_BYTES as u16);
+    put32(&mut header, 28, keys.len() as u32);
+    put64(&mut header, 32, layer_table_offset);
+    put64(&mut header, 40, index_offset);
+    put64(&mut header, 48, payload_offset);
+    put64(&mut header, 56, file_bytes);
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header)?;
+    for layer in &layers {
+        let mut entry = [0u8; LAYER_ENTRY_BYTES];
+        put16(&mut entry, 0, layer.id);
+        put16(&mut entry, 2, layer.channel.raw());
+        put16(&mut entry, 4, layer.format.raw());
+        put16(&mut entry, 6, layer.mip_count);
+        put32(&mut entry, 8, layer.base_width);
+        put32(&mut entry, 12, layer.base_height);
+        put32(&mut entry, 16, layer.first_index);
+        put32(&mut entry, 20, layer.index_count);
+        put32(&mut entry, 24, layer.flags);
+        file.write_all(&entry)?;
+    }
+    let mut index = Vec::with_capacity(keys.len() * INDEX_ENTRY_BYTES);
+    for (ordinal, &(source, id, mip, x, y)) in keys.iter().enumerate() {
+        let mut e = [0u8; INDEX_ENTRY_BYTES];
+        put16(&mut e, 0, id);
+        put16(&mut e, 2, mip);
+        put32(&mut e, 4, x);
+        put32(&mut e, 8, y);
+        put64(&mut e, 16, offsets[ordinal]);
+        put64(&mut e, 24, sources[source].2.encoded_tile_bytes());
+        put32(&mut e, 32, hashes[ordinal]);
+        index.extend_from_slice(&e);
+    }
+    file.seek(SeekFrom::Start(index_offset))?;
+    file.write_all(&index)?;
+    file.sync_all()?;
+    drop(file);
+    let mapped = unsafe { memmap2::Mmap::map(&File::open(&temporary)?)? };
+    EarthVt::parse(&mapped).map_err(|e| format!("validation: {e}"))?;
+    drop(mapped);
+    fs::rename(&temporary, &out)?;
+    for (map, &(.., tail)) in maps.iter().zip(&sources) {
+        map.write_tail(tail_width, &textures.join(tail))?;
+    }
+    eprintln!("earth-bake: wrote {} ({} tiles, {:.2} GB) and {tail_width}-wide tails in {:.1?}",
+        out.display(), keys.len(), file_bytes as f64 / 1e9, started.elapsed());
     Ok(())
 }
 

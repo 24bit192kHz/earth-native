@@ -93,10 +93,26 @@ pub fn configure_environment() -> Option<PathBuf> {
     if clouds_ok && env::var_os("EARTH_NATIVE_CLOUDS_A").is_none() {
         env::set_var("EARTH_NATIVE_NASA_CLOUDS", "1");
     }
+    // The static virtual texture streams the finest levels of the night
+    // lights, NASA cloud map and relief (tools/earth-bake static-vt); their
+    // resident maps are then only the small tails. Without all three tails
+    // the full maps load as before.
+    let static_vt = textures.join("earth-static.earthvt");
+    let tails = ["night-tail.bc4", "clouds-tail.bc4", "relief-tail.bc5"];
+    let use_static = static_vt.is_file()
+        && tails.iter().all(|tail| with_sidecar(textures.join(tail)).is_some())
+        && env::var_os("EARTH_NATIVE_STATIC_VT").is_none();
+    if use_static {
+        env::set_var("EARTH_NATIVE_STATIC_VT", &static_vt);
+    }
     for (variable, stem, extensions) in MAPS {
         if env::var_os(variable).is_some() {
             continue;
         }
+        let stem = match (use_static, *stem) {
+            (true, "night" | "clouds" | "relief") => format!("{stem}-tail"),
+            _ => (*stem).to_owned(),
+        };
         if let Some(path) = extensions
             .iter()
             .find_map(|extension| with_sidecar(textures.join(format!("{stem}.{extension}"))))

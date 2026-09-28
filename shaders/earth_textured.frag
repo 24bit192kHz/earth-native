@@ -43,6 +43,19 @@ layout(set = 1, binding = 2, std140) uniform VtParams {
     uvec4 base_dimensions_mip_count_enabled;
     uvec4 page_table_dimensions_slots_tile_size;
 } vt;
+// Static virtual texture (earth-static.earthvt): the 500 m night lights,
+// the 1 km NASA cloud map and the GEBCO relief normals stream their three
+// finest levels through one page table; the rest (and anything not yet
+// resident) comes from the resident tails bound as night_emission,
+// clouds_a and relief_normals.
+layout(set = 1, binding = 3) uniform usampler2DArray static_page_table;
+layout(set = 1, binding = 4, std140) uniform StaticVtParams {
+    uvec4 base_dimensions_mip_count_enabled;
+    uvec4 page_table_dimensions_slots_tile_size;
+} svt;
+layout(set = 1, binding = 5) uniform sampler2DArray static_night_atlas;
+layout(set = 1, binding = 6) uniform sampler2DArray static_clouds_atlas;
+layout(set = 1, binding = 7) uniform sampler2DArray static_relief_atlas;
 
 layout(push_constant) uniform FrameData {
     vec4 camera_position_distance;  // xyz camera, w pre-exposure
@@ -449,12 +462,59 @@ vec3 perturb_surface_normal(vec3 geometric_normal, vec2 map_uv, vec2 map_dx, vec
         + geometric_normal * tangent_normal.z);
 }
 
+bool static_vt() {
+    return svt.base_dimensions_mip_count_enabled.w != 0u;
+}
+
+// log2 of full-resolution texels per pixel (the static layers' mip).
+float static_lod(vec2 dx, vec2 dy) {
+    vec2 dimensions = vec2(svt.base_dimensions_mip_count_enabled.xy);
+    return log2(max(max(length(dx * dimensions), length(dy * dimensions)), 1.0e-5));
+}
+
+// One level of a static layer: the resident page of `mip`, or the nearest
+// coarser resident one, or the tail.
+vec4 static_level(sampler2DArray atlas, sampler2D tail, vec2 uv, int mip) {
+    int mips = int(svt.base_dimensions_mip_count_enabled.z);
+    vec2 wrapped_uv = vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0));
+    for (int level = mip; level < mips; ++level) {
+        uvec2 dims = max(svt.page_table_dimensions_slots_tile_size.xy >> uint(level), uvec2(1));
+        uvec2 page = min(uvec2(wrapped_uv * vec2(dims)), dims - 1u);
+        uint slot = texelFetch(static_page_table, ivec3(ivec2(page), level), 0).r;
+        if (slot != 0xffffffffu && slot < svt.page_table_dimensions_slots_tile_size.z) {
+            vec2 local = fract(wrapped_uv * vec2(dims));
+            vec2 atlas_uv = (local * 256.0 + 4.0) / float(svt.page_table_dimensions_slots_tile_size.w);
+            return textureLod(atlas, vec3(atlas_uv, float(slot)), 0.0);
+        }
+    }
+    return textureLod(tail, uv, 0.0);
+}
+
+// A static layer with trilinear blending between its two nearest levels;
+// coarser than the streamed levels it is the tail with the hardware's
+// anisotropic filtering. Without the static VT the tail is the full map.
+vec4 sample_static(sampler2DArray atlas, sampler2D tail, vec2 uv, vec2 dx, vec2 dy) {
+    dx.x -= round(dx.x);
+    dy.x -= round(dy.x);
+    if (!static_vt()) return textureGrad(tail, uv, dx, dy);
+    float lod = static_lod(dx, dy);
+    float mips = float(svt.base_dimensions_mip_count_enabled.z);
+    if (lod >= mips) return textureGrad(tail, uv, dx, dy);
+    float level = max(lod, 0.0);
+    int first = int(floor(level));
+    float blend = level - float(first);
+    vec4 fine = static_level(atlas, tail, uv, first);
+    if (blend < 1.0 / 256.0) return fine;
+    vec4 coarse = first + 1 < int(mips) ? static_level(atlas, tail, uv, first + 1) : textureLod(tail, uv, 0.0);
+    return mix(fine, coarse, blend);
+}
+
 // Terrain normal from the GEBCO slopes, in the renderer's frame (east =
 // n x z is geographic east in the longitude-mirrored scene).
 vec3 relief_normal(vec3 n, vec2 map_uv, vec2 dx, vec2 dy) {
     dx.x -= round(dx.x);
     dy.x -= round(dy.x);
-    vec2 stored = textureGrad(relief_normals, map_uv, dx, dy).rg * 2.0 - 1.0;
+    vec2 stored = sample_static(static_relief_atlas, relief_normals, map_uv, dx, dy).rg * 2.0 - 1.0;
     vec3 east = cross(n, vec3(0.0, 0.0, 1.0));
     float east_length = length(east);
     if (east_length < 1.0e-4) return n;
@@ -463,22 +523,16 @@ vec3 relief_normal(vec3 n, vec2 map_uv, vec2 dx, vec2 dy) {
     // Gradients from 1.2 km mean heights are gentle, and mips average them
     // further, but a pixel of real terrain still holds lit and shaded
     // slopes: exaggerate (as shaded-relief maps do), more for coarser mips.
-    float lod = max(textureQueryLod(relief_normals, map_uv).y, 0.0);
+    float lod = max(static_vt() ? static_lod(dx, dy) : textureQueryLod(relief_normals, map_uv).y, 0.0);
     float exaggeration = 2.5 * pow(1.3, lod);
     vec2 gradient = stored / max(sqrt(max(1.0 - dot(stored, stored), 0.0)), 0.2) * exaggeration;
     return normalize(east * gradient.x + north * gradient.y + n);
 }
 
-vec4 sample_cloud_map(sampler2D source, vec2 map_uv, vec2 tiling) {
-    // Choose mips before tiling/wrapping. fract() derivatives across a tile
-    // edge select coarse mips and draw a dark line through otherwise fine clouds.
-    // Repair the sphere's longitude discontinuity before scaling derivatives;
-    // the REPEAT sampler handles tile boundaries without a coordinate jump.
-    vec2 dx = dFdx(map_uv);
-    vec2 dy = dFdy(map_uv);
-    dx.x -= round(dx.x);
-    dy.x -= round(dy.x);
-    return textureGrad(source, map_uv * tiling, dx * tiling, dy * tiling);
+// The NASA cloud map (static VT or its tail). Derivatives are taken before
+// any wrap, with the sphere's longitude discontinuity repaired.
+vec4 sample_nasa_clouds(vec2 map_uv) {
+    return sample_static(static_clouds_atlas, clouds_a, map_uv, dFdx(map_uv), dFdy(map_uv));
 }
 
 // NASA Blue Marble cloud map: BC4 display-encoded
@@ -488,14 +542,14 @@ vec4 sample_cloud_map(sampler2D source, vec2 map_uv, vec2 tiling) {
 // showed each cloud's own offset shadow through it as a dark "double".
 // Faint values stay translucent haze and thin cirrus.
 float nasa_cloud_opacity(vec2 map_uv) {
-    float brightness = sample_cloud_map(clouds_a, map_uv, vec2(1.0)).r;
+    float brightness = sample_nasa_clouds(map_uv).r;
     return smoothstep(0.12, 0.72, brightness);
 }
 
 // Thin cloud is optically thin in albedo too: scale the lit cloud top from
 // grey (thin) to white (thick deck) so tops keep texture instead of flat white.
 float nasa_cloud_albedo(vec2 map_uv) {
-    float brightness = sample_cloud_map(clouds_a, map_uv, vec2(1.0)).r;
+    float brightness = sample_nasa_clouds(map_uv).r;
     return mix(0.62, 0.9, smoothstep(0.25, 0.8, brightness));
 }
 
@@ -532,7 +586,7 @@ float cloud_detail(vec3 n) {
 // so observed cover is sculpted like clouds rather than noise. Where that
 // historical map was clear the fractal alone decides.
 float cloud_morphology(vec2 map_uv, vec3 n) {
-    float composite = sample_cloud_map(clouds_a, map_uv, vec2(1.0)).r;
+    float composite = sample_nasa_clouds(map_uv).r;
     return mix(cloud_detail(n), composite, 0.45);
 }
 
@@ -645,7 +699,8 @@ float nasa_lights(float encoded) {
 
 // City-light radiance at a map position (linear, from the sRGB-coded BC4).
 float city_signal_at(vec2 map_uv, vec2 offset) {
-    return nasa_lights(texture(night_emission, map_uv + offset).r);
+    vec2 uv = map_uv + offset;
+    return nasa_lights(sample_static(static_night_atlas, night_emission, uv, dFdx(uv), dFdy(uv)).r);
 }
 
 float city_glow_at(vec2 map_uv, float lod) {
@@ -989,7 +1044,7 @@ void main() {
         if (night > 0.0) {
             // Black Marble lights are grayscale radiance; colour them from
             // intensity: dim suburbs read sodium orange, dense cores warm white.
-            float lights = nasa_lights(texture(night_emission, map_uv).r);
+            float lights = nasa_lights(sample_static(static_night_atlas, night_emission, map_uv, map_dx, map_dy).r);
             vec3 city = mix(vec3(1.0, 0.48, 0.14), vec3(1.0, 0.72, 0.38), smoothstep(0.02, 0.25, lights)) * lights;
             // Light scattered by the air over a city: a faint wide halo.
             float texture_width = float(textureSize(night_emission, 0).x);

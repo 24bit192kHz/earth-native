@@ -120,6 +120,22 @@ impl Crossfade {
     }
 }
 
+/// What a container streams: the monthly day colour (one BC7 layer), or
+/// the static layers, whose jobs carry the night (BC4), cloud (BC4) and
+/// relief (BC5) tiles of one key concatenated, in atlas order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamKind {
+    Day,
+    Static,
+}
+
+/// Channels of a static container, in payload order.
+pub const STATIC_CHANNELS: [(TextureChannel, PixelFormat); 3] = [
+    (TextureChannel::NightEmission, PixelFormat::Bc4),
+    (TextureChannel::CloudDensity, PixelFormat::Bc4),
+    (TextureChannel::SurfaceNormal, PixelFormat::Bc5),
+];
+
 /// Render-thread facade around a single memory-mapped I/O worker.
 pub struct VirtualTextureStreamer {
     requests: SyncSender<TileRequest>,
@@ -137,10 +153,17 @@ pub struct VirtualTextureStreamer {
 
 impl VirtualTextureStreamer {
     pub fn spawn(path: impl Into<PathBuf>, gpu_budget_bytes: u64) -> Result<Self, StreamError> {
+        Self::spawn_kind(path, gpu_budget_bytes, StreamKind::Day)
+    }
+
+    pub fn spawn_kind(path: impl Into<PathBuf>, gpu_budget_bytes: u64, kind: StreamKind) -> Result<Self, StreamError> {
         let path = path.into();
         let mapped = MappedEarthVt::open(&path)?;
         let container = mapped.parsed()?;
-        validate_startup(&container)?;
+        match kind {
+            StreamKind::Day => validate_startup(&container)?,
+            StreamKind::Static => validate_static(&container)?,
+        }
         let layers = container.layers().to_vec();
         drop(container);
         drop(mapped);
@@ -148,7 +171,7 @@ impl VirtualTextureStreamer {
         let (completion_sender, completion_receiver) = mpsc::sync_channel(COMPLETION_CHANNEL_DEPTH);
         thread::Builder::new()
             .name("earth-native-vt-io".to_owned())
-            .spawn(move || worker_loop(path, request_receiver, completion_sender))
+            .spawn(move || worker_loop(path, kind, request_receiver, completion_sender))
             .map_err(|error| StreamError::Worker(error.to_string()))?;
         Ok(Self::from_channels(
             request_sender,
@@ -402,6 +425,7 @@ impl VirtualTextureStreamer {
 
 fn worker_loop(
     path: PathBuf,
+    kind: StreamKind,
     requests: Receiver<TileRequest>,
     completed: SyncSender<(TileKey, Result<UploadJob, StreamError>)>,
 ) {
@@ -416,7 +440,10 @@ fn worker_loop(
     while let Ok(request) = requests.recv() {
         let key = request.key;
         if completed
-            .send((key, build_upload_job(&container, key)))
+            .send((key, match kind {
+                StreamKind::Day => build_upload_job(&container, key),
+                StreamKind::Static => build_static_job(&container, key),
+            }))
             .is_err()
         {
             break;
@@ -462,6 +489,49 @@ fn build_upload_job(container: &EarthVt<'_>, key: TileKey) -> Result<UploadJob, 
         content_hash: tile.entry.content_hash,
         payload: tile.payload.to_vec(),
     })
+}
+
+/// One static tile: the same (mip, x, y) of every static layer, concatenated.
+/// `key.layer` is the night layer's id.
+fn build_static_job(container: &EarthVt<'_>, key: TileKey) -> Result<UploadJob, StreamError> {
+    let night = container.layer(key.layer).ok_or_else(|| {
+        StreamError::Worker(format!("unknown virtual-texture layer {}", key.layer))
+    })?;
+    let mut payload = Vec::new();
+    let mut content_hash = 0u32;
+    for (channel, _) in STATIC_CHANNELS {
+        let layer = container.layer_for_channel(channel)
+            .ok_or(StreamError::InvalidContainer("missing static layer"))?;
+        let tile = container
+            .tile(TileKey::new(layer.id, key.mip, key.x, key.y))
+            .ok_or_else(|| StreamError::Worker(format!("missing tile {key:?} of {channel:?}")))?;
+        content_hash = content_hash.rotate_left(5) ^ tile.entry.content_hash;
+        payload.extend_from_slice(tile.payload);
+    }
+    Ok(UploadJob {
+        key,
+        parent: container.parent_key(key),
+        layer: night,
+        format: night.format,
+        content_hash,
+        payload,
+    })
+}
+
+fn validate_static(container: &EarthVt<'_>) -> Result<(), StreamError> {
+    let mut size = None;
+    for (channel, format) in STATIC_CHANNELS {
+        let layer = container.layer_for_channel(channel)
+            .ok_or(StreamError::InvalidContainer("static container needs night, cloud and relief layers"))?;
+        if layer.format != format {
+            return Err(StreamError::InvalidContainer("static layer has the wrong pixel format"));
+        }
+        let dimensions = (layer.base_width, layer.base_height, layer.mip_count);
+        if *size.get_or_insert(dimensions) != dimensions {
+            return Err(StreamError::InvalidContainer("static layers must share one size"));
+        }
+    }
+    Ok(())
 }
 
 fn prefetch_finer_mip(requests: &[TileRequest]) -> Vec<TileRequest> {

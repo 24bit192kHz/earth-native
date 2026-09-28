@@ -23,11 +23,11 @@ use crate::{
     },
     debug_capture::{self, PixelOrder},
     earthvt::{
-        LayerDescriptor, PixelFormat, TextureChannel, TileKey, PADDED_TILE_SIZE,
+        LayerDescriptor, PixelFormat, TextureChannel, TileKey, TileRequest, PADDED_TILE_SIZE,
         LAYER_FLAG_CLAMP_Y, LAYER_FLAG_SRGB, LAYER_FLAG_WRAP_X,
     },
     vt_feedback::{Feedback, OutputDescriptor},
-    vt_streamer::{UploadJob, VirtualTextureStreamer},
+    vt_streamer::{StreamKind, UploadJob, VirtualTextureStreamer},
     star_panorama::{
         load_optional_star_panorama, StarPanorama, StarPanoramaFormat, StarPanoramaMip,
     },
@@ -73,6 +73,8 @@ const VT_ATLAS_FORMAT: vk::Format = vk::Format::BC7_SRGB_BLOCK;
 const VT_PAGE_TABLE_FORMAT: vk::Format = vk::Format::R32_UINT;
 const VT_ENV: &str = "EARTH_NATIVE_EARTHVT";
 const VT_BUDGET_ENV: &str = "EARTH_NATIVE_EARTHVT_BUDGET_MB";
+const STATIC_VT_ENV: &str = "EARTH_NATIVE_STATIC_VT";
+const STATIC_VT_BUDGET_ENV: &str = "EARTH_NATIVE_STATIC_VT_BUDGET_MB";
 const VT_ATLAS_SIZE: u32 = PADDED_TILE_SIZE;
 const VT_DEFAULT_SLOT_BUDGET: u32 = 64;
 const DEBUG_CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
@@ -512,6 +514,11 @@ pub struct Renderer {
     saturn_ring_preview: Option<RingPreview>,
     vt_config: Option<(LayerDescriptor, u32)>,
     vt_streamer: Option<VirtualTextureStreamer>,
+    /// Static VT (night lights, NASA cloud map, relief): config, streamer and
+    /// the upload batch in flight.
+    static_vt_config: Option<(LayerDescriptor, u32)>,
+    static_streamer: Option<VirtualTextureStreamer>,
+    static_pending_jobs: Vec<UploadJob>,
     vt_feedback: Feedback,
     vt_frame: u64,
     /// Tiles of the upload batch in flight.
@@ -694,6 +701,7 @@ struct DeviceState {
     // VT day-colour path is set 1 and can therefore be enabled independently.
     day_color_textures: Option<PinnedDayColorTextures>,
     virtual_texture: Option<VirtualTexture>,
+    static_texture: Option<VirtualTexture>,
     /// Atmosphere tables bound at 17..=19 of the Earth set.
     sky_luts: Vec<PinnedBgraTexture>,
 }
@@ -919,9 +927,71 @@ impl VtSlotAllocator {
     }
 }
 
+/// Which virtual texture an instance is: the monthly 500 m day colour, or
+/// the static layers (night lights, NASA cloud map, relief normals) whose
+/// three finest levels stream and whose tails stay resident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VtKind {
+    Day,
+    Static,
+}
+
+/// Levels of the static layers that stream (32K, 16K, 8K); coarser ones are
+/// the resident tails.
+const STATIC_VT_MIPS: u16 = 3;
+
+impl VtKind {
+    /// Atlas formats in payload order (one per layer).
+    fn atlas_formats(self) -> &'static [vk::Format] {
+        match self {
+            Self::Day => &[VT_ATLAS_FORMAT],
+            Self::Static => &[vk::Format::BC4_UNORM_BLOCK, vk::Format::BC4_UNORM_BLOCK, vk::Format::BC5_UNORM_BLOCK],
+        }
+    }
+
+    fn pixel_formats(self) -> &'static [PixelFormat] {
+        match self {
+            Self::Day => &[PixelFormat::Bc7],
+            Self::Static => &[PixelFormat::Bc4, PixelFormat::Bc4, PixelFormat::Bc5],
+        }
+    }
+
+    /// Bytes of one tile across all layers.
+    fn tile_bytes(self) -> u64 {
+        self.pixel_formats().iter().map(|format| format.encoded_tile_bytes()).sum()
+    }
+
+    /// Set-1 bindings: page table, parameters, atlases.
+    fn bindings(self) -> (u32, u32, &'static [u32]) {
+        match self {
+            Self::Day => (1, 2, &[0]),
+            Self::Static => (3, 4, &[5, 6, 7]),
+        }
+    }
+
+    fn accepts(self, layer: LayerDescriptor) -> bool {
+        match self {
+            Self::Day => layer.channel == TextureChannel::DayColor && layer.format == PixelFormat::Bc7
+                && layer.flags & (LAYER_FLAG_SRGB | LAYER_FLAG_WRAP_X | LAYER_FLAG_CLAMP_Y)
+                    == (LAYER_FLAG_SRGB | LAYER_FLAG_WRAP_X | LAYER_FLAG_CLAMP_Y),
+            Self::Static => layer.channel == TextureChannel::NightEmission && layer.format == PixelFormat::Bc4
+                && layer.flags & (LAYER_FLAG_WRAP_X | LAYER_FLAG_CLAMP_Y) == (LAYER_FLAG_WRAP_X | LAYER_FLAG_CLAMP_Y),
+        }
+    }
+
+    /// Levels the page table addresses.
+    fn streamed_mips(self, layer: LayerDescriptor) -> u16 {
+        match self {
+            Self::Day => layer.mip_count,
+            Self::Static => layer.mip_count.min(STATIC_VT_MIPS),
+        }
+    }
+}
+
 struct VirtualTexture {
-    atlas: ImageAllocation,
-    atlas_view: vk::ImageView,
+    kind: VtKind,
+    /// One atlas per layer; a slot index addresses the same tile in each.
+    atlases: Vec<(ImageAllocation, vk::ImageView)>,
     atlas_sampler: vk::Sampler,
     page_table: ImageAllocation,
     page_table_view: vk::ImageView,
@@ -934,6 +1004,9 @@ struct VirtualTexture {
     allocator: VtSlotAllocator,
     staging: Option<VtUploadStaging>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Staging bytes per tile: all layers' payloads, then the page-table
+    /// words (eviction marker, new slot), 16-byte aligned.
+    tile_stride: u64,
 }
 
 struct VtUploadStaging {
@@ -953,9 +1026,6 @@ struct VtUploadStaging {
 const VT_UPLOAD_BATCH: usize = 48;
 /// Frames between CPU feedback passes when the view moves smoothly.
 const VT_FEEDBACK_INTERVAL: u64 = 6;
-/// Staging bytes per tile: the BC7 payload plus the page-table words
-/// (new slot, eviction marker), keeping each payload 16-byte aligned.
-const VT_STAGING_STRIDE: u64 = 264 * 264 + 16;
 
 #[derive(Clone, Copy, Debug)]
 struct VtPendingUpload {
@@ -965,6 +1035,9 @@ struct VtPendingUpload {
 }
 
 impl VirtualTexture {
+    /// Create the atlases, page table and parameters of `kind` (1x1 and
+    /// disabled without `config`) and bind them in set 1: in `descriptor_set`
+    /// when given (the static VT shares the day VT's set), else a new one.
     #[allow(clippy::too_many_arguments)]
     fn create_disabled(
         device: &Device,
@@ -976,152 +1049,126 @@ impl VirtualTexture {
         descriptor_set_layout: vk::DescriptorSetLayout,
         memory_properties: vk::PhysicalDeviceMemoryProperties,
         config: Option<(LayerDescriptor, u32)>,
+        kind: VtKind,
+        descriptor_set: Option<vk::DescriptorSet>,
     ) -> RendererResult<Self> {
-        let atlas_features = unsafe { instance.get_physical_device_format_properties(physical_device, VT_ATLAS_FORMAT) }
-            .optimal_tiling_features;
-        let page_features = unsafe { instance.get_physical_device_format_properties(physical_device, VT_PAGE_TABLE_FORMAT) }
-            .optimal_tiling_features;
         let required_transfer = vk::FormatFeatureFlags::TRANSFER_DST | vk::FormatFeatureFlags::SAMPLED_IMAGE;
-        if !atlas_features.contains(required_transfer) || !page_features.contains(required_transfer) {
+        let supports = |format| unsafe { instance.get_physical_device_format_properties(physical_device, format) }
+            .optimal_tiling_features.contains(required_transfer);
+        if !kind.atlas_formats().iter().all(|&format| supports(format)) || !supports(VT_PAGE_TABLE_FORMAT) {
             return Err("GPU does not support the required virtual-texture atlas/page-table formats".into());
         }
         let (base_width, base_height, mip_count, requested_slots, layer) = match config {
-            Some((layer, budget)) if layer.channel == TextureChannel::DayColor
-                && layer.format == PixelFormat::Bc7
+            Some((layer, budget)) if kind.accepts(layer)
                 && layer.base_width > 0 && layer.base_height > 0 && layer.mip_count > 0
-                && layer.flags & (LAYER_FLAG_SRGB | LAYER_FLAG_WRAP_X | LAYER_FLAG_CLAMP_Y)
-                    == (LAYER_FLAG_SRGB | LAYER_FLAG_WRAP_X | LAYER_FLAG_CLAMP_Y)
-                && budget > 0 => (layer.base_width, layer.base_height, layer.mip_count, budget, Some(layer)),
+                && budget > 0 => (layer.base_width, layer.base_height, kind.streamed_mips(layer), budget, Some(layer)),
             _ => (1, 1, 1, 1, None),
         };
-        let max_array_layers = unsafe {
-            instance
-                .get_physical_device_properties(physical_device)
-                .limits
-                .max_image_array_layers
-        };
+        let max_array_layers = unsafe { instance.get_physical_device_properties(physical_device).limits.max_image_array_layers };
         let slot_budget = requested_slots.min(max_array_layers).max(1);
         let page_width = layer.map(|layer| layer.tile_grid(0).map(|grid| grid.0).unwrap_or(1)).unwrap_or(1);
         let page_height = layer.map(|layer| layer.tile_grid(0).map(|grid| grid.1).unwrap_or(1)).unwrap_or(1);
-        let atlas = unsafe { ImageAllocation::create_array(device, memory_properties, VT_ATLAS_FORMAT, VT_ATLAS_SIZE, VT_ATLAS_SIZE, slot_budget, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)? };
-        let page_table = match unsafe { ImageAllocation::create_array(device, memory_properties, VT_PAGE_TABLE_FORMAT, page_width, page_height, mip_count as u32, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)? } {
-            allocation => allocation,
-        };
-        let atlas_view = create_image_view(device, atlas.image, VT_ATLAS_FORMAT, vk::ImageViewType::TYPE_2D_ARRAY, slot_budget)?;
-        let page_table_view = match create_image_view(device, page_table.image, VT_PAGE_TABLE_FORMAT, vk::ImageViewType::TYPE_2D_ARRAY, mip_count as u32) {
-            Ok(view) => view,
-            Err(error) => { unsafe { device.destroy_image_view(atlas_view, None); atlas.destroy(device); page_table.destroy(device); } return Err(error); }
-        };
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR).min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .max_lod(mip_count as f32);
-        let atlas_sampler = unsafe { device.create_sampler(&sampler_info, None) }?;
-        let page_sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST)
-            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let page_table_sampler = match unsafe { device.create_sampler(&page_sampler_info, None) } {
-            Ok(sampler) => sampler,
-            Err(error) => { unsafe { device.destroy_sampler(atlas_sampler, None); device.destroy_image_view(atlas_view, None); device.destroy_image_view(page_table_view, None); atlas.destroy(device); page_table.destroy(device); } return Err(error.into()); }
-        };
-        let params = VtParams {
-            base_dimensions_mip_count_enabled: [base_width, base_height, u32::from(mip_count), u32::from(layer.is_some())],
-            page_table_dimensions_slots_tile_size: [page_width, page_height, slot_budget, VT_ATLAS_SIZE],
-        };
-        let params_size = size_of::<VtParams>() as u64;
-        let buffer_info = vk::BufferCreateInfo::default().size(params_size).usage(vk::BufferUsageFlags::UNIFORM_BUFFER).sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let params_buffer = match unsafe { device.create_buffer(&buffer_info, None) } {
-            Ok(buffer) => buffer,
-            Err(error) => { unsafe { device.destroy_sampler(page_table_sampler, None); device.destroy_sampler(atlas_sampler, None); device.destroy_image_view(atlas_view, None); device.destroy_image_view(page_table_view, None); atlas.destroy(device); page_table.destroy(device); } return Err(error.into()); }
-        };
-        let requirements = unsafe { device.get_buffer_memory_requirements(params_buffer) };
-        let memory_type = match find_memory_type(
+        let tile_stride = (kind.tile_bytes() + 8).div_ceil(16) * 16;
+        // Handles start null (destroying a null handle is a no-op), so any
+        // failure below can release whatever was created so far.
+        let mut vt = Self {
+            kind,
+            atlases: Vec::new(),
+            atlas_sampler: vk::Sampler::null(),
+            page_table: ImageAllocation { image: vk::Image::null(), memory: vk::DeviceMemory::null() },
+            page_table_view: vk::ImageView::null(),
+            page_table_sampler: vk::Sampler::null(),
+            params_buffer: vk::Buffer::null(),
+            params_memory: vk::DeviceMemory::null(),
+            descriptor_set: descriptor_set.unwrap_or_default(),
+            params: VtParams {
+                base_dimensions_mip_count_enabled: [base_width, base_height, u32::from(mip_count), u32::from(layer.is_some())],
+                page_table_dimensions_slots_tile_size: [page_width, page_height, slot_budget, VT_ATLAS_SIZE],
+            },
+            layer,
+            allocator: VtSlotAllocator::new(slot_budget)?,
+            staging: None,
             memory_properties,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(error) => { unsafe { device.destroy_buffer(params_buffer, None); device.destroy_sampler(page_table_sampler, None); device.destroy_sampler(atlas_sampler, None); device.destroy_image_view(atlas_view, None); device.destroy_image_view(page_table_view, None); atlas.destroy(device); page_table.destroy(device); } return Err(error); }
+            tile_stride,
         };
-        let params_memory = match unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(memory_type), None) } {
-            Ok(memory) => memory,
-            Err(error) => { unsafe { device.destroy_buffer(params_buffer, None); device.destroy_sampler(page_table_sampler, None); device.destroy_sampler(atlas_sampler, None); device.destroy_image_view(atlas_view, None); device.destroy_image_view(page_table_view, None); atlas.destroy(device); page_table.destroy(device); } return Err(error.into()); }
-        };
-        unsafe { device.bind_buffer_memory(params_buffer, params_memory, 0)?; let mapped = device.map_memory(params_memory, 0, params_size, vk::MemoryMapFlags::empty())?; ptr::copy_nonoverlapping((&params as *const VtParams).cast::<u8>(), mapped.cast::<u8>(), size_of::<VtParams>()); device.unmap_memory(params_memory); }
-        let layouts = [descriptor_set_layout];
-        let descriptor_set = match unsafe { device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts)) } {
-            Ok(mut sets) => sets.remove(0),
-            Err(error) => { unsafe { device.destroy_buffer(params_buffer, None); device.free_memory(params_memory, None); device.destroy_sampler(page_table_sampler, None); device.destroy_sampler(atlas_sampler, None); device.destroy_image_view(atlas_view, None); device.destroy_image_view(page_table_view, None); atlas.destroy(device); page_table.destroy(device); } return Err(error.into()); }
-        };
-        let atlas_info = [vk::DescriptorImageInfo::default().sampler(atlas_sampler).image_view(atlas_view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let page_info = [vk::DescriptorImageInfo::default().sampler(page_table_sampler).image_view(page_table_view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let buffer_info = [vk::DescriptorBufferInfo::default().buffer(params_buffer).offset(0).range(params_size)];
-        let writes = [
-            vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(0).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&atlas_info),
-            vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(1).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&page_info),
-            vk::WriteDescriptorSet::default().dst_set(descriptor_set).dst_binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&buffer_info),
-        ];
-        unsafe { device.update_descriptor_sets(&writes, &[]); }
-        if let Err(error) = unsafe {
-            initialize_vt_images(device, queue, command_pool, atlas.image, slot_budget, page_table.image, mip_count as u32, page_width, page_height)
-        } {
+        let built = (|| -> RendererResult<()> {
             unsafe {
-                device.destroy_buffer(params_buffer, None);
-                device.free_memory(params_memory, None);
-                device.destroy_sampler(page_table_sampler, None);
-                device.destroy_sampler(atlas_sampler, None);
-                device.destroy_image_view(atlas_view, None);
-                device.destroy_image_view(page_table_view, None);
-                atlas.destroy(device);
-                page_table.destroy(device);
+                for &format in kind.atlas_formats() {
+                    let atlas = ImageAllocation::create_array(device, memory_properties, format, VT_ATLAS_SIZE, VT_ATLAS_SIZE, slot_budget, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)?;
+                    let view = create_image_view(device, atlas.image, format, vk::ImageViewType::TYPE_2D_ARRAY, slot_budget);
+                    let view = match view {
+                        Ok(view) => view,
+                        Err(error) => { atlas.destroy(device); return Err(error); }
+                    };
+                    vt.atlases.push((atlas, view));
+                }
+                vt.page_table = ImageAllocation::create_array(device, memory_properties, VT_PAGE_TABLE_FORMAT, page_width, page_height, u32::from(mip_count), vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)?;
+                vt.page_table_view = create_image_view(device, vt.page_table.image, VT_PAGE_TABLE_FORMAT, vk::ImageViewType::TYPE_2D_ARRAY, u32::from(mip_count))?;
+                vt.atlas_sampler = device.create_sampler(&vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR).min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .max_lod(f32::from(mip_count)), None)?;
+                vt.page_table_sampler = device.create_sampler(&vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE), None)?;
+                let params_size = size_of::<VtParams>() as u64;
+                vt.params_buffer = device.create_buffer(&vk::BufferCreateInfo::default().size(params_size).usage(vk::BufferUsageFlags::UNIFORM_BUFFER).sharing_mode(vk::SharingMode::EXCLUSIVE), None)?;
+                let requirements = device.get_buffer_memory_requirements(vt.params_buffer);
+                let memory_type = find_memory_type(memory_properties, requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
+                vt.params_memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(memory_type), None)?;
+                device.bind_buffer_memory(vt.params_buffer, vt.params_memory, 0)?;
+                let mapped = device.map_memory(vt.params_memory, 0, params_size, vk::MemoryMapFlags::empty())?;
+                ptr::copy_nonoverlapping((&vt.params as *const VtParams).cast::<u8>(), mapped.cast::<u8>(), size_of::<VtParams>());
+                device.unmap_memory(vt.params_memory);
+                if descriptor_set.is_none() {
+                    let layouts = [descriptor_set_layout];
+                    vt.descriptor_set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&layouts))?.remove(0);
+                }
+                let (page_binding, params_binding, atlas_bindings) = kind.bindings();
+                let atlas_infos: Vec<_> = vt.atlases.iter().map(|(_, view)| [vk::DescriptorImageInfo::default().sampler(vt.atlas_sampler).image_view(*view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]).collect();
+                let page_info = [vk::DescriptorImageInfo::default().sampler(vt.page_table_sampler).image_view(vt.page_table_view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let buffer_info = [vk::DescriptorBufferInfo::default().buffer(vt.params_buffer).offset(0).range(params_size)];
+                let mut writes = vec![
+                    vk::WriteDescriptorSet::default().dst_set(vt.descriptor_set).dst_binding(page_binding).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&page_info),
+                    vk::WriteDescriptorSet::default().dst_set(vt.descriptor_set).dst_binding(params_binding).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&buffer_info),
+                ];
+                for (binding, info) in atlas_bindings.iter().zip(&atlas_infos) {
+                    writes.push(vk::WriteDescriptorSet::default().dst_set(vt.descriptor_set).dst_binding(*binding).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(info));
+                }
+                device.update_descriptor_sets(&writes, &[]);
+                let atlas_images: Vec<_> = vt.atlases.iter().map(|(atlas, _)| atlas.image).collect();
+                initialize_vt_images(device, queue, command_pool, &atlas_images, slot_budget, vt.page_table.image, u32::from(mip_count))?;
+                vt.staging = Some(create_vt_staging(device, memory_properties, command_pool, tile_stride * VT_UPLOAD_BATCH as u64)?);
             }
+            Ok(())
+        })();
+        if let Err(error) = built {
+            unsafe { vt.destroy(device, command_pool) };
             return Err(error);
         }
-        let staging = Some(unsafe {
-            create_vt_staging(
-                device,
-                memory_properties,
-                command_pool,
-                VT_STAGING_STRIDE * VT_UPLOAD_BATCH as u64,
-            )?
-        });
-        Ok(Self { atlas, atlas_view, atlas_sampler, page_table, page_table_view, page_table_sampler, params_buffer, params_memory, descriptor_set, params, layer, allocator: VtSlotAllocator::new(slot_budget)?, staging, memory_properties })
+        Ok(vt)
     }
 
-    /// Array-layer span of the page-table image one tile upload touches: the
-    /// uploaded mip's layer plus the evicted entry's layer when residency
-    /// moved one. Both page-table copies in `submit_tile` land inside this
-    /// span, so the TRANSFER/SHADER barriers need no wider scope than it.
-    fn page_table_upload_layers(upload_mip: u16, evicted_mip: Option<u16>) -> (u32, u32) {
-        let base = match evicted_mip {
-            Some(evicted) => upload_mip.min(evicted),
-            None => upload_mip,
-        };
-        let end = match evicted_mip {
-            Some(evicted) => upload_mip.max(evicted),
-            None => upload_mip,
-        };
-        (u32::from(base), u32::from(end - base) + 1)
-    }
-
-    /// Submit up to `VT_UPLOAD_BATCH` already-encoded 264x264 BC7 tiles in one
-    /// command buffer. Returns the indices of `tiles` that were admitted (a
-    /// key that already owns a slot is skipped). Another batch is rejected
-    /// until `poll_upload` observes the fence, bounding staging and residency.
+    /// Submit up to `VT_UPLOAD_BATCH` already-encoded tiles (each payload is
+    /// every layer's 264x264 tile, concatenated) in one command buffer.
+    /// Returns the indices of `tiles` that were admitted (a key that already
+    /// owns a slot is skipped). Another batch is rejected until `poll_upload`
+    /// observes the fence, bounding staging and residency.
     unsafe fn submit_tiles(&mut self, device: &Device, queue: vk::Queue, tiles: &[(TileKey, &[u8])]) -> RendererResult<Vec<usize>> {
-        let Some(layer) = self.layer else { return Err("day-colour VT is disabled".into()); };
-        let tile_bytes = PixelFormat::Bc7.encoded_tile_bytes();
+        let Some(layer) = self.layer else { return Err("virtual texture is disabled".into()); };
+        let tile_bytes = self.kind.tile_bytes();
         if tiles.len() > VT_UPLOAD_BATCH {
             return Err("VT upload batch is larger than its staging".into());
         }
-        if tiles.iter().any(|(key, payload)| !layer.contains_key(*key) || payload.len() as u64 != tile_bytes) {
-            return Err("VT tile key or BC7 payload size is invalid".into());
+        if tiles.iter().any(|(key, payload)| !layer.contains_key(*key) || key.mip >= self.kind.streamed_mips(layer) || payload.len() as u64 != tile_bytes) {
+            return Err("VT tile key or payload size is invalid".into());
         }
         let Some(mut staging) = self.staging.take() else {
             return Err("VT staging must be initialized by the renderer integration hook".into());
@@ -1134,7 +1181,7 @@ impl VirtualTexture {
         let mut uploads = Vec::new();
         for (index, (key, payload)) in tiles.iter().enumerate() {
             let Some(allocation) = self.allocator.request(*key) else { continue };
-            let offset = VT_STAGING_STRIDE * uploads.len() as u64;
+            let offset = self.tile_stride * uploads.len() as u64;
             ptr::copy_nonoverlapping(payload.as_ptr(), staging.mapped.add(offset as usize), payload.len());
             ptr::copy_nonoverlapping(u32::MAX.to_ne_bytes().as_ptr(), staging.mapped.add((offset + tile_bytes) as usize), 4);
             ptr::copy_nonoverlapping(allocation.slot.to_ne_bytes().as_ptr(), staging.mapped.add((offset + tile_bytes + 4) as usize), 4);
@@ -1145,13 +1192,14 @@ impl VirtualTexture {
             self.staging = Some(staging);
             return Ok(admitted);
         }
+        let layer_bytes: Vec<u64> = self.kind.pixel_formats().iter().map(|format| format.encoded_tile_bytes()).collect();
         let result = (|| -> RendererResult<()> {
             device.reset_fences(&[staging.fence])?;
             device.reset_command_buffer(staging.command_buffer, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(staging.command_buffer, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             let color = |base_layer: u32, layer_count: u32| vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).base_array_layer(base_layer).layer_count(layer_count);
-            let page_layers = u32::from(layer.mip_count);
+            let page_layers = u32::from(self.kind.streamed_mips(layer));
             let barrier = |image: vk::Image, range: vk::ImageSubresourceRange, to_transfer: bool| {
                 let (old, new, src, dst) = if to_transfer {
                     (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE)
@@ -1160,9 +1208,13 @@ impl VirtualTexture {
                 };
                 vk::ImageMemoryBarrier::default().old_layout(old).new_layout(new).src_access_mask(src).dst_access_mask(dst).image(image).subresource_range(range)
             };
-            let mut barriers: Vec<_> = uploads.iter().map(|(upload, _)| barrier(self.atlas.image, color(upload.slot, 1), true)).collect();
-            barriers.push(barrier(self.page_table.image, color(0, page_layers), true));
-            device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &barriers);
+            let barriers = |to_transfer: bool| -> Vec<vk::ImageMemoryBarrier> {
+                let mut list: Vec<_> = uploads.iter().flat_map(|(upload, _)| self.atlases.iter()
+                    .map(move |(atlas, _)| barrier(atlas.image, color(upload.slot, 1), to_transfer))).collect();
+                list.push(barrier(self.page_table.image, color(0, page_layers), to_transfer));
+                list
+            };
+            device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &barriers(true));
             let page_copy = |offset: u64, mip: u16, x: u32, y: u32| vk::BufferImageCopy::default()
                 .buffer_offset(offset)
                 .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(u32::from(mip)).layer_count(1))
@@ -1176,17 +1228,19 @@ impl VirtualTexture {
                     device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.page_table.image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[page_copy(offset + tile_bytes, evicted.mip, old_x, old_y)]);
                 }
-                let copy = vk::BufferImageCopy::default().buffer_offset(*offset)
-                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(upload.slot).layer_count(1))
-                    .image_extent(vk::Extent3D { width: VT_ATLAS_SIZE, height: VT_ATLAS_SIZE, depth: 1 });
-                device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.atlas.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+                let mut layer_offset = *offset;
+                for ((atlas, _), bytes) in self.atlases.iter().zip(&layer_bytes) {
+                    let copy = vk::BufferImageCopy::default().buffer_offset(layer_offset)
+                        .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(upload.slot).layer_count(1))
+                        .image_extent(vk::Extent3D { width: VT_ATLAS_SIZE, height: VT_ATLAS_SIZE, depth: 1 });
+                    device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, atlas.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+                    layer_offset += bytes;
+                }
                 let (page_x, page_y) = key_page(layer, upload.key);
                 device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.page_table.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[page_copy(offset + tile_bytes + 4, upload.key.mip, page_x, page_y)]);
             }
-            let mut barriers: Vec<_> = uploads.iter().map(|(upload, _)| barrier(self.atlas.image, color(upload.slot, 1), false)).collect();
-            barriers.push(barrier(self.page_table.image, color(0, page_layers), false));
-            device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &barriers);
+            device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &barriers(false));
             device.end_command_buffer(staging.command_buffer)?;
             let command_buffers = [staging.command_buffer];
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&command_buffers)], staging.fence)?;
@@ -1232,10 +1286,60 @@ impl VirtualTexture {
 
     unsafe fn destroy(&mut self, device: &Device, command_pool: vk::CommandPool) {
         if let Some(staging) = self.staging.take() { device.unmap_memory(staging.memory); device.destroy_fence(staging.fence, None); device.free_command_buffers(command_pool, &[staging.command_buffer]); device.destroy_buffer(staging.buffer, None); device.free_memory(staging.memory, None); }
-        device.destroy_sampler(self.atlas_sampler, None); device.destroy_image_view(self.atlas_view, None); device.destroy_image(self.atlas.image, None); device.free_memory(self.atlas.memory, None);
+        device.destroy_sampler(self.atlas_sampler, None);
+        for (atlas, view) in self.atlases.drain(..) {
+            device.destroy_image_view(view, None);
+            atlas.destroy(device);
+        }
         device.destroy_sampler(self.page_table_sampler, None); device.destroy_image_view(self.page_table_view, None); device.destroy_image(self.page_table.image, None); device.free_memory(self.page_table.memory, None);
         device.destroy_buffer(self.params_buffer, None); device.free_memory(self.params_memory, None);
     }
+}
+
+/// Commit a finished upload batch, then submit the next one (up to
+/// `VT_UPLOAD_BATCH` tiles the I/O worker has read).
+fn pump_vt_uploads(
+    streamer: &mut VirtualTextureStreamer,
+    texture: &mut VirtualTexture,
+    pending: &mut Vec<UploadJob>,
+    device: &Device,
+    queue: vk::Queue,
+    frame: u64,
+) -> RendererResult<()> {
+    if let Some(completed) = unsafe { texture.poll_upload(device)? } {
+        let jobs = std::mem::take(pending);
+        if jobs.len() != completed.len() || jobs.iter().zip(&completed).any(|(job, upload)| job.key != upload.key) {
+            return Err("VT upload batch completed for the wrong tiles".into());
+        }
+        let now = Instant::now();
+        for (job, upload) in jobs.iter().zip(&completed) {
+            if let Some(evicted) = upload.evicted {
+                streamer.residency_mut().remove(evicted);
+            }
+            streamer.mark_uploaded(job, frame, now)?;
+        }
+    }
+    if pending.is_empty() {
+        // A tile can be requested again while its first upload is still
+        // on the GPU; drop such duplicates instead of failing the frame.
+        let mut batch: Vec<UploadJob> = Vec::new();
+        while batch.len() < VT_UPLOAD_BATCH {
+            let Some(job) = streamer.poll_one()? else { break };
+            if !texture.allocator.holds(job.key) && !batch.iter().any(|queued| queued.key == job.key) {
+                batch.push(job);
+            }
+        }
+        if !batch.is_empty() {
+            let tiles: Vec<(TileKey, &[u8])> = batch.iter().map(|job| (job.key, job.payload.as_slice())).collect();
+            let admitted = unsafe { texture.submit_tiles(device, queue, &tiles)? };
+            drop(tiles);
+            let mut admitted = admitted.into_iter().peekable();
+            *pending = batch.into_iter().enumerate()
+                .filter_map(|(index, job)| admitted.next_if_eq(&index).is_some().then_some(job))
+                .collect();
+        }
+    }
+    Ok(())
 }
 
 fn key_page(layer: LayerDescriptor, key: TileKey) -> (u32, u32) {
@@ -1290,12 +1394,10 @@ unsafe fn initialize_vt_images(
     device: &Device,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
-    atlas: vk::Image,
+    atlases: &[vk::Image],
     atlas_layers: u32,
     page_table: vk::Image,
     page_layers: u32,
-    page_width: u32,
-    page_height: u32,
 ) -> RendererResult<()> {
     let command = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
         .command_pool(command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))?[0];
@@ -1304,17 +1406,15 @@ unsafe fn initialize_vt_images(
         device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         let atlas_range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(atlas_layers);
         let page_range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(page_layers);
-        let to_transfer = [
-            vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).src_access_mask(vk::AccessFlags::empty()).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).image(atlas).subresource_range(atlas_range),
-            vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).src_access_mask(vk::AccessFlags::empty()).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).image(page_table).subresource_range(page_range),
-        ];
+        let transition = |image: vk::Image, range: vk::ImageSubresourceRange, old, new, src, dst| vk::ImageMemoryBarrier::default()
+            .old_layout(old).new_layout(new).src_access_mask(src).dst_access_mask(dst).image(image).subresource_range(range);
+        let mut to_transfer: Vec<_> = atlases.iter().map(|&atlas| transition(atlas, atlas_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)).collect();
+        to_transfer.push(transition(page_table, page_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE));
         device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_transfer);
         let page_clear = vk::ClearColorValue { uint32: [u32::MAX, 0, 0, 0] };
         device.cmd_clear_color_image(command, page_table, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &page_clear, &[page_range]);
-        let to_sampled = [
-            vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ).image(atlas).subresource_range(atlas_range),
-            vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ).image(page_table).subresource_range(page_range),
-        ];
+        let mut to_sampled: Vec<_> = atlases.iter().map(|&atlas| transition(atlas, atlas_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ)).collect();
+        to_sampled.push(transition(page_table, page_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ));
         device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_sampled);
         device.end_command_buffer(command)?;
         let commands = [command];
@@ -1324,7 +1424,6 @@ unsafe fn initialize_vt_images(
     })();
     device.destroy_fence(fence, None);
     device.free_command_buffers(command_pool, &[command]);
-    let _ = (page_width, page_height);
     result
 }
 
@@ -1651,6 +1750,18 @@ impl Renderer {
                 (layer, slots)
             })
         });
+        // The static layers stream their three finest levels; their tails
+        // (data_dir.rs points the night, cloud and relief maps at them) stay
+        // resident and stand in until a tile arrives.
+        let static_budget_mb = env::var(STATIC_VT_BUDGET_ENV).ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(96);
+        let static_streamer = env::var_os(STATIC_VT_ENV).and_then(|path| {
+            VirtualTextureStreamer::spawn_kind(path, static_budget_mb * 1024 * 1024, StreamKind::Static)
+                .map_err(|error| eprintln!("earth-native: static virtual texture disabled: {error}"))
+                .ok()
+        });
+        let static_vt_config = static_streamer.as_ref()
+            .and_then(|streamer| streamer.layer_for_channel(TextureChannel::NightEmission))
+            .map(|layer| (layer, (static_budget_mb * 1024 * 1024 / VtKind::Static.tile_bytes()).clamp(1, u64::from(u32::MAX)) as u32));
         let star_panorama = load_optional_star_panorama()?;
         let star_format = match star_panorama.as_ref().map(StarPanorama::format) {
             Some(StarPanoramaFormat::Bgra8Srgb) => "bgra8",
@@ -1724,6 +1835,9 @@ impl Renderer {
             outputs: HashMap::new(),
             vt_config,
             vt_streamer,
+            static_vt_config,
+            static_streamer,
+            static_pending_jobs: Vec::new(),
             vt_feedback: Feedback::default(),
             vt_frame: 0,
             vt_pending_jobs: Vec::new(),
@@ -2133,7 +2247,9 @@ impl Renderer {
         };
         let mut needs_redraw = self.pending_weather.is_some()
             || !self.vt_pending_jobs.is_empty()
-            || self.vt_streamer.as_ref().is_some_and(VirtualTextureStreamer::busy);
+            || self.vt_streamer.as_ref().is_some_and(VirtualTextureStreamer::busy)
+            || !self.static_pending_jobs.is_empty()
+            || self.static_streamer.as_ref().is_some_and(VirtualTextureStreamer::busy);
         // Integer body id carried in `sun_direction.w` (0=Earth, 1=Jupiter,
         // 2=Mercury, 3=Mars, 4=Saturn) so the shared push-constant layout
         // stays identical across every pipeline.
@@ -2192,50 +2308,31 @@ impl Renderer {
     }
 
     fn process_virtual_texture(&mut self, uniforms: FrameUniforms) -> RendererResult<()> {
-        let Some(streamer) = self.vt_streamer.as_mut() else {
+        let Self { device, vt_streamer, vt_pending_jobs, static_streamer, static_pending_jobs, vt_frame, .. } = self;
+        let Some(device) = device.as_mut() else {
             return Ok(());
         };
-        let Some(device) = self.device.as_mut() else {
-            return Ok(());
-        };
-        let Some(virtual_texture) = device.virtual_texture.as_mut() else {
-            return Ok(());
-        };
-
-        streamer.dispatch_feedback(self.vt_frame)?;
-        if let Some(completed) = unsafe { virtual_texture.poll_upload(&device.device)? } {
-            let jobs = std::mem::take(&mut self.vt_pending_jobs);
-            if jobs.len() != completed.len() || jobs.iter().zip(&completed).any(|(job, upload)| job.key != upload.key) {
-                return Err("VT upload batch completed for the wrong tiles".into());
+        let frame = *vt_frame;
+        let pairs = [
+            (vt_streamer.as_mut(), device.virtual_texture.as_mut(), vt_pending_jobs),
+            (static_streamer.as_mut(), device.static_texture.as_mut(), static_pending_jobs),
+        ];
+        let mut day_layer = None;
+        let mut static_layer = None;
+        for (streamer, texture, pending) in pairs {
+            let (Some(streamer), Some(texture)) = (streamer, texture) else { continue };
+            if texture.layer.is_none() {
+                continue;
             }
-            let now = std::time::Instant::now();
-            for (job, upload) in jobs.iter().zip(&completed) {
-                if let Some(evicted) = upload.evicted {
-                    streamer.residency_mut().remove(evicted);
-                }
-                streamer.mark_uploaded(job, self.vt_frame, now)?;
+            streamer.dispatch_feedback(frame)?;
+            pump_vt_uploads(streamer, texture, pending, &device.device, device.queue, frame)?;
+            match texture.kind {
+                VtKind::Day => day_layer = texture.layer,
+                VtKind::Static => static_layer = texture.layer,
             }
         }
-
-        if self.vt_pending_jobs.is_empty() {
-            // A tile can be requested again while its first upload is still
-            // on the GPU; drop such duplicates instead of failing the frame.
-            let mut batch = Vec::new();
-            while batch.len() < VT_UPLOAD_BATCH {
-                let Some(job) = streamer.poll_one()? else { break };
-                if !virtual_texture.allocator.holds(job.key) && !batch.iter().any(|queued: &UploadJob| queued.key == job.key) {
-                    batch.push(job);
-                }
-            }
-            if !batch.is_empty() {
-                let tiles: Vec<(TileKey, &[u8])> = batch.iter().map(|job| (job.key, job.payload.as_slice())).collect();
-                let admitted = unsafe { virtual_texture.submit_tiles(&device.device, device.queue, &tiles)? };
-                drop(tiles);
-                let mut admitted = admitted.into_iter().peekable();
-                self.vt_pending_jobs = batch.into_iter().enumerate()
-                    .filter_map(|(index, job)| (admitted.next_if_eq(&index).is_some()).then_some(job))
-                    .collect();
-            }
+        if day_layer.is_none() && static_layer.is_none() {
+            return Ok(());
         }
 
         // The visible tile set changes slowly (from the ISS the camera moves
@@ -2266,23 +2363,50 @@ impl Renderer {
                 physical_extent: [target.extent.width, target.extent.height],
             })
             .collect::<Vec<_>>();
-        // `layer` is 0-or-1 descriptors; borrowing avoids a per-frame heap Vec.
-        let layers: &[LayerDescriptor] = match &virtual_texture.layer {
-            Some(layer) => std::slice::from_ref(layer),
-            None => &[],
-        };
+        // One pass over the rays serves both textures. The static layer gets
+        // a distinct feedback id (its file's night layer shares id 1 with
+        // the day layer) and is mapped back below.
+        const STATIC_FEEDBACK_ID: u16 = 0x8001;
+        let mut layers = Vec::with_capacity(2);
+        layers.extend(day_layer);
+        layers.extend(static_layer.map(|layer| LayerDescriptor { id: STATIC_FEEDBACK_ID, ..layer }));
         let requests = self
             .vt_feedback
-            .collect_requests(uniforms, &outputs, layers, self.vt_frame);
-        if std::env::var_os("EARTH_NATIVE_VT_DEBUG").is_some() && (self.vt_frame % 60 == 0 || self.vt_frame < 5) {
-            let mut mips = std::collections::BTreeMap::<u16, usize>::new();
-            for request in &requests { *mips.entry(request.key.mip).or_default() += 1; }
-            eprintln!("vt-debug frame={} requests={} by_mip={:?} resident_bytes={} pending_job={}",
-                self.vt_frame, requests.len(), mips, streamer.residency().resident_bytes(), self.vt_pending_jobs.len());
+            .collect_requests(uniforms, &outputs, &layers, self.vt_frame);
+        let (static_requests, day_requests): (Vec<_>, Vec<_>) =
+            requests.into_iter().partition(|request| request.key.layer == STATIC_FEEDBACK_ID);
+        let Some(device) = self.device.as_mut() else { return Ok(()) };
+        if let (Some(streamer), Some(texture)) = (self.vt_streamer.as_mut(), device.virtual_texture.as_mut()) {
+            if std::env::var_os("EARTH_NATIVE_VT_DEBUG").is_some() && (self.vt_frame % 60 == 0 || self.vt_frame < 5) {
+                let mut mips = std::collections::BTreeMap::<u16, usize>::new();
+                for request in &day_requests { *mips.entry(request.key.mip).or_default() += 1; }
+                eprintln!("vt-debug frame={} requests={} by_mip={:?} resident_bytes={} pending_jobs={}",
+                    self.vt_frame, day_requests.len(), mips, streamer.residency().resident_bytes(), self.vt_pending_jobs.len());
+            }
+            if day_layer.is_some() {
+                let visible: std::collections::HashSet<TileKey> = day_requests.iter().map(|request| request.key).collect();
+                texture.allocator.touch_visible(&visible);
+                streamer.submit_feedback(self.vt_frame, day_requests, false);
+            }
         }
-        let visible: std::collections::HashSet<TileKey> = requests.iter().map(|request| request.key).collect();
-        virtual_texture.allocator.touch_visible(&visible);
-        streamer.submit_feedback(self.vt_frame, requests, false);
+        if let (Some(streamer), Some(texture), Some(layer)) = (self.static_streamer.as_mut(), device.static_texture.as_mut(), static_layer) {
+            // Only the streamed levels, each with the next coarser one for the
+            // shader's blend between the two nearest levels.
+            let mut wanted = std::collections::BTreeMap::<TileKey, TileRequest>::new();
+            for request in static_requests.into_iter().filter(|request| request.key.mip < STATIC_VT_MIPS) {
+                let key = TileKey::new(layer.id, request.key.mip, request.key.x, request.key.y);
+                let parent = (key.mip + 1 < STATIC_VT_MIPS).then(|| TileKey::new(layer.id, key.mip + 1, key.x / 2, key.y / 2));
+                for key in std::iter::once(key).chain(parent) {
+                    let entry = wanted.entry(key).or_insert(TileRequest::visible(key, 0, request.requested_frame));
+                    entry.priority = entry.priority.saturating_add(request.priority);
+                }
+            }
+            let mut static_requests: Vec<_> = wanted.into_values().collect();
+            static_requests.sort_by(|left, right| right.priority.cmp(&left.priority).then_with(|| left.key.cmp(&right.key)));
+            let visible: std::collections::HashSet<TileKey> = static_requests.iter().map(|request| request.key).collect();
+            texture.allocator.touch_visible(&visible);
+            streamer.submit_feedback(self.vt_frame, static_requests, false);
+        }
         self.vt_frame = self.vt_frame.wrapping_add(1);
         Ok(())
     }
@@ -2393,6 +2517,7 @@ impl Renderer {
             star_texture: None,
             day_color_textures: None,
             virtual_texture: None,
+            static_texture: None,
             sky_luts: Vec::new(),
         });
         Ok(())
@@ -2566,7 +2691,31 @@ impl Renderer {
             pipeline.vt_descriptor_set_layout,
             memory_properties,
             self.vt_config,
+            VtKind::Day,
+            None,
         )?;
+        // Always created (1x1 and disabled without the file): the shader
+        // statically uses bindings 3-7 of the day VT's set.
+        let mut vt = vt;
+        let static_texture = match VirtualTexture::create_disabled(
+            &device.device,
+            &self.instance,
+            device.physical_device,
+            device.queue,
+            device.command_pool,
+            pipeline.vt_descriptor_pool,
+            pipeline.vt_descriptor_set_layout,
+            memory_properties,
+            self.static_vt_config,
+            VtKind::Static,
+            Some(vt.descriptor_set),
+        ) {
+            Ok(texture) => texture,
+            Err(error) => {
+                unsafe { vt.destroy(&device.device, device.command_pool) };
+                return Err(error);
+            }
+        };
         let sky_luts = match upload_sky_luts(&device.device, &star_resources) {
             Ok(luts) => luts,
             Err(error) => {
@@ -2598,6 +2747,7 @@ impl Renderer {
         device.star_texture = star_texture;
         device.day_color_textures = day_color_textures;
         device.virtual_texture = Some(vt);
+        device.static_texture = Some(static_texture);
         device.pipeline = Some(pipeline);
         Ok(())
     }
@@ -2843,6 +2993,9 @@ impl Drop for Renderer {
                 }
                 if let Some(mut virtual_texture) = device.virtual_texture.take() {
                     virtual_texture.destroy(&device.device, device.command_pool);
+                }
+                if let Some(mut static_texture) = device.static_texture.take() {
+                    static_texture.destroy(&device.device, device.command_pool);
                 }
                 if let Some(texture) = device.star_texture.as_ref() {
                     texture.destroy(&device.device);
@@ -3099,6 +3252,33 @@ impl Pipeline {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Static VT (VtKind::Static): page table, parameters, night,
+            // cloud and relief atlases.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let vt_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&vt_bindings);
         let vt_descriptor_set_layout = match unsafe {
@@ -3121,10 +3301,10 @@ impl Pipeline {
         let vt_pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(2),
+                .descriptor_count(6),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(2),
         ];
         let vt_pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
@@ -6528,13 +6708,17 @@ mod tests {
     #[test]
     fn cloud_mips_use_continuous_gradients_before_tiling() {
         let shader = include_str!("../shaders/earth_textured.frag");
-        let start = shader.find("vec4 sample_cloud_map(").unwrap();
-        let end = shader[start..].find("float cloud_noise(").unwrap() + start;
-        let clouds = &shader[start..end];
-        assert!(clouds.contains("dx.x -= round(dx.x)"));
-        assert!(clouds.contains("dy.x -= round(dy.x)"));
-        assert!(clouds.contains("textureGrad(source, map_uv * tiling, dx * tiling, dy * tiling)"));
-        assert!(!clouds.contains("texture("), "cloud maps must not derive mips from wrapped UVs");
+        // The NASA cloud map goes through sample_static (static VT or tail).
+        let start = shader.find("vec4 sample_static(").unwrap();
+        let end = shader[start..].find("// Terrain normal").unwrap() + start;
+        let sampling = &shader[start..end];
+        assert!(sampling.contains("dx.x -= round(dx.x)"));
+        assert!(sampling.contains("dy.x -= round(dy.x)"));
+        assert!(sampling.contains("textureGrad(tail, uv, dx, dy)"));
+        assert!(!sampling.contains("texture("), "cloud maps must not derive mips from wrapped UVs");
+        let start = shader.find("vec4 sample_nasa_clouds(").unwrap();
+        let clouds = &shader[start..start + 200];
+        assert!(clouds.contains("dFdx(map_uv), dFdy(map_uv)"));
         // Adjacent pixels straddling longitude zero must keep their small
         // footprint, including the half-scale mist and highly tiled noise.
         for tiling in [0.5_f32, 2.0, 4.0, 6.0, 14.0, 33.0] {
@@ -6739,21 +6923,4 @@ mod tests {
         assert!(!tracker.take_self_heal());
     }
 
-    #[test]
-    fn page_table_barrier_covers_only_touched_mip_layers() {
-        use super::VirtualTexture;
-        assert_eq!(VirtualTexture::page_table_upload_layers(3, None), (3, 1));
-        assert_eq!(
-            VirtualTexture::page_table_upload_layers(3, Some(5)),
-            (3, 3)
-        );
-        assert_eq!(
-            VirtualTexture::page_table_upload_layers(5, Some(3)),
-            (3, 3)
-        );
-        assert_eq!(
-            VirtualTexture::page_table_upload_layers(2, Some(2)),
-            (2, 1)
-        );
-    }
 }

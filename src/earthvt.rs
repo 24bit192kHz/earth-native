@@ -140,9 +140,11 @@ impl TextureChannel {
     /// Restrict channel encodings to the formats selected by the renderer.
     pub const fn accepts_format(self, format: PixelFormat) -> bool {
         match self {
-            Self::DayColor | Self::NightEmission | Self::CityCloudGlow | Self::AuroraColor => {
+            Self::DayColor | Self::CityCloudGlow | Self::AuroraColor => {
                 matches!(format, PixelFormat::Bc7)
             }
+            // City lights are grayscale: BC4, or BC7 for coloured sources.
+            Self::NightEmission => matches!(format, PixelFormat::Bc7 | PixelFormat::Bc4),
             Self::SurfaceNormal | Self::CloudNormal => matches!(format, PixelFormat::Bc5),
             Self::WaterMask | Self::CloudDensity | Self::AuroraMask | Self::LightningMask => {
                 matches!(format, PixelFormat::Bc4)
