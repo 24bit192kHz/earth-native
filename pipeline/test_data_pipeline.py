@@ -12,6 +12,16 @@ import data_pipeline as pipeline
 
 
 class DataPipelineTests(unittest.TestCase):
+    def test_gmgsi_missing_segments_are_not_cloud(self):
+        # A missing satellite segment arrives as 255 (infrared) or 0
+        # (visible), not as the -9999 fill value; both must become NaN.
+        ir = pipeline.gmgsi_counts(np.array([[-9999.0, 255.0, 253.0, 120.0]]), "LW")
+        self.assertTrue(np.isnan(ir[0, 0]) and np.isnan(ir[0, 1]))
+        self.assertEqual(list(ir[0, 2:]), [253.0, 120.0])
+        vis = pipeline.gmgsi_counts(np.array([[0.0, 1.0, 255.0]]), "VIS")
+        self.assertTrue(np.isnan(vis[0, 0]))
+        self.assertEqual(list(vis[0, 1:]), [1.0, 255.0])
+
     def test_grib_ranges_are_exact_and_all_fields_required(self):
         index = "\n".join([
             "1:0:d=2026090512:TCDC:entire atmosphere:anl:",

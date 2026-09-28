@@ -596,15 +596,34 @@ def gmgsi_latest(product, now):
     raise ValueError(f"no recent GMGSI {product} image")
 
 
-def gmgsi_equirect(payload, size=CLOUD_SIZE):
+# Counts GMGSI writes where a satellite segment is missing, instead of its
+# declared _FillValue (-9999): 255 in the 10.7 um infrared (read as the
+# coldest cloud tops, the gap turned into a solid overcast block, e.g. the
+# Meteosat sectors on 2026-09-28: 98.7 % exactly 255 over 45-72 N, while no
+# real pixel reached 254), 0 in the visible (never a daylight count).
+GMGSI_MISSING = {"LW": 255.0, "VIS": 0.0}
+
+
+def gmgsi_counts(data, product):
+    """Raw GMGSI counts with fill values and missing segments as NaN."""
+    data = np.asarray(data, dtype=np.float32).copy()
+    data[~np.isfinite(data) | (data < 0) | (data > 255)] = np.nan
+    missing = GMGSI_MISSING.get(product)
+    if missing is not None:
+        data[data == missing] = np.nan
+    return data
+
+
+def gmgsi_equirect(payload, product, size=CLOUD_SIZE):
     """GMGSI 0-255 counts (Mercator, +-72.7 deg) resampled bilinearly to an
-    equirectangular grid; NaN outside the mosaic or where data are missing."""
+    equirectangular grid; NaN outside the mosaic or where data are missing
+    (bilinear taps spread a gap to its edges, so no seam of fill counts)."""
     import h5py
     with h5py.File(io.BytesIO(payload), "r") as stream:
-        data = stream["data"][0].astype(np.float32)
+        data = stream["data"][0]
         lat = stream["lat"][:, 0].astype(np.float64)
         lon = stream["lon"][0, :].astype(np.float64)
-    data[~np.isfinite(data) | (data < 0) | (data > 255)] = np.nan
+    data = gmgsi_counts(data, product)
     lon = np.where(lon > 179.95, lon - 360.0, lon)
     if np.any(np.diff(lon) <= 0) or np.any(np.diff(lat) >= 0):
         raise ValueError("unexpected GMGSI grid ordering")
@@ -671,8 +690,8 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
     """
     vis_url, vis_hour = gmgsi_latest("VIS", now)
     ir_url, ir_hour = gmgsi_latest("LW", now)
-    vis = gmgsi_equirect(download(vis_url, limit=40_000_000))
-    ir = gmgsi_equirect(download(ir_url, limit=40_000_000))
+    vis = gmgsi_equirect(download(vis_url, limit=40_000_000), "VIS")
+    ir = gmgsi_equirect(download(ir_url, limit=40_000_000), "LW")
     observed = datetime.fromtimestamp(min(vis_hour.timestamp(), ir_hour.timestamp()), timezone.utc) + timedelta(minutes=5)
     cosine = solar_cosine(vis_hour + timedelta(minutes=5))
     # Counts are ~255 sqrt(reflectance); normalise by the solar cosine.
@@ -716,10 +735,17 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
     gfs, low = upsample(gfs_cloud), upsample(gfs_low)
     # Infrared cannot see warm low cloud: at night the model's low layer
     # stands in for it (never its high cloud, which infrared observes).
-    cover = np.where(np.isfinite(vis_cloud), day * np.fmax(vis_cloud, 0.85 * np.nan_to_num(ir_cloud)), 0.0) \
-        + (1 - day) * np.fmax(np.nan_to_num(ir_cloud), 0.8 * low)
+    # Where the visible segment is missing by day, the infrared carries it.
+    ir_seen = np.nan_to_num(ir_cloud)
+    cover = day * np.where(np.isfinite(vis_cloud), np.fmax(vis_cloud, 0.85 * ir_seen), ir_seen) \
+        + (1 - day) * np.fmax(ir_seen, 0.8 * low)
     missing = ~np.isfinite(ir)
-    cover = np.where(missing, gfs, np.nan_to_num(cover))
+    # Feather the model fill into the observation over ~2.5 degrees, so a
+    # missing satellite segment leaves no straight seam.
+    feather = np.asarray(Image.fromarray((missing * 255).astype(np.uint8))
+                         .filter(ImageFilter.GaussianBlur(28)), dtype=np.float32) / 255.0
+    fill = np.maximum(missing.astype(np.float32), np.clip(2.0 * feather, 0.0, 1.0))
+    cover = fill * gfs + (1.0 - fill) * np.nan_to_num(cover)
     height = np.where(missing, 0.3 * gfs, smoothstep(90.0, 215.0, np.nan_to_num(ir)))
     # Blend the mosaic edge (+-72.7 deg) into the model over ~2 degrees.
     edge = smoothstep(72.7, 70.5, np.abs(lat))[:, None]
@@ -857,6 +883,10 @@ def main():
         build(args.width)
     elif args.command == "weather":
         weather()
+        try:
+            notify_renderer()
+        except OSError as error:
+            print(f"Renderer not notified (not running?): {error}", file=sys.stderr, flush=True)
     elif args.command == "aurora-preview":
         aurora_preview(min(max(args.kp, 0.0), 9.0))
         notify_renderer()

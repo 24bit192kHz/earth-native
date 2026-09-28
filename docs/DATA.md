@@ -83,7 +83,10 @@ refreshes every 30 minutes:
   lightning flashes), and low cloud.
 - **NOAA GMGSI** hourly geostationary mosaics (visible and 10.7 µm infrared)
   for observed cloud cover, against clear-sky composites kept in
-  `weather/clearsky.npz`.
+  `weather/clearsky.npz`. A missing satellite segment arrives as counts of
+  255 (infrared) or 0 (visible) rather than the declared fill value; both
+  are treated as missing, and the gap is filled from the GFS cloud field,
+  feathered into the observation over ~2.5° so it leaves no seam.
 - **NOAA GEFS-Aerosols analysis** (GOCART, 0.25°): aerosol optical depth at
   440, 550 and 645 nm.
 - **EUMETSAT OSI SAF** daily sea-ice concentration (OSI-401, 10 km polar
