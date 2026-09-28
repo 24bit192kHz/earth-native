@@ -515,6 +515,62 @@ impl OrbitCamera {
     }
 }
 
+/// How the onboard (ISS) camera is pointed. The station flies a local-
+/// vertical/local-horizontal attitude, so a camera fixed to it keeps a level
+/// horizon and a constant angle to the flight direction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PovLook {
+    /// Degrees clockwise from the reference horizontal direction (the flight
+    /// direction when riding the ISS, north for a fixed viewpoint).
+    pub heading_degrees: f32,
+    /// Degrees the view centre is below the local horizontal; None frames the
+    /// horizon near the top of the focus monitor, as in ISS window photos.
+    pub pitch_degrees: Option<f32>,
+    /// Horizontal field of view across the focus monitor.
+    pub fov_degrees: f32,
+}
+
+impl Default for PovLook {
+    fn default() -> Self {
+        // A ~22 mm lens on a full-frame body (the Earth Observation
+        // series' wide Nikkors): 78 degrees across.
+        Self { heading_degrees: 0.0, pitch_degrees: None, fov_degrees: 78.0 }
+    }
+}
+
+pub const POV_MIN_FOV_DEGREES: f32 = 8.0;
+pub const POV_MAX_FOV_DEGREES: f32 = 120.0;
+
+/// Pose of a level camera at `position` (scene units, Earth centred) looking
+/// `heading` from the horizontal `reference` and `pitch_down` degrees below
+/// the horizontal. Right = local up x forward, which is screen-right in the
+/// renderer's longitude-mirrored frame (as for the orbit camera).
+pub fn pov_pose(position: Vec3, reference: Vec3, heading_degrees: f32, pitch_down_degrees: f32) -> CameraPose {
+    let up_local = position.normalized();
+    let mut level = reference - up_local * reference.dot(up_local);
+    if level.length_squared() < 1.0e-12 {
+        level = Vec3::Z - up_local * up_local.z;
+        if level.length_squared() < 1.0e-12 {
+            level = Vec3::X;
+        }
+    }
+    let level = level.normalized();
+    let level_right = up_local.cross(level).normalized();
+    let heading = heading_degrees.to_radians();
+    let facing = (level * heading.cos() + level_right * heading.sin()).normalized();
+    let pitch = pitch_down_degrees.to_radians();
+    let forward = (facing * pitch.cos() - up_local * pitch.sin()).normalized();
+    let right = up_local.cross(forward).normalized();
+    let up = forward.cross(right).normalized();
+    CameraPose { position, forward, right, up }
+}
+
+/// Angle of the true horizon below the local horizontal at `altitude_km`.
+pub fn horizon_dip_degrees(altitude_km: f64) -> f32 {
+    let radius = 6_378.137;
+    (radius / (radius + altitude_km.max(0.0))).acos().to_degrees() as f32
+}
+
 fn sanitize_radius(radius: f32) -> f32 {
     if radius.is_finite() && radius > 0.0 {
         radius
@@ -1001,6 +1057,24 @@ mod tests {
                 OutputTransform::Normal,
             ),
         ]
+    }
+
+    #[test]
+    fn pov_pose_is_level_and_looks_down_by_the_pitch() {
+        // Over lat 0, lon 0 (scene +X), flying north, looking 30 degrees down.
+        let position = Vec3::X * 0.83;
+        let pose = pov_pose(position, Vec3::Z, 0.0, 30.0);
+        assert_close(pose.forward.dot(Vec3::X), -(30.0_f32.to_radians().sin()));
+        assert_close(pose.forward.dot(Vec3::Z), 30.0_f32.to_radians().cos());
+        // Level horizon: the right axis is horizontal.
+        assert_close(pose.right.dot(Vec3::X), 0.0);
+        // Facing north at lon 0, screen-right is east: scene -Y (mirrored).
+        assert_close(pose.right.dot(Vec3::Y), -1.0);
+        assert_close(pose.up.dot(pose.forward), 0.0);
+        // Heading 90 turns the view east.
+        let east = pov_pose(position, Vec3::Z, 90.0, 0.0);
+        assert_close(east.forward.dot(Vec3::Y), -1.0);
+        assert!((horizon_dip_degrees(420.0) - 20.1).abs() < 0.3);
     }
 
     #[test]

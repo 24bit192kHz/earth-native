@@ -1,7 +1,10 @@
 #version 460
 
 layout(location = 0) noperspective in vec2 in_uv;
-layout(location = 0) out vec4 out_color;
+// Dual-source output: premultiplied radiance and the transmittance of what
+// lies behind; the camera stage (post.frag) applies the tone curve.
+layout(location = 0, index = 0) out vec4 out_color;
+layout(location = 0, index = 1) out vec4 out_transmittance;
 
 // These values are supplied independently for every output. The shared camera
 // uses the complete logical desktop, so adjacent outputs sample the same frustum.
@@ -250,7 +253,8 @@ void main() {
         if (alpha <= 0.0) {
             discard;
         }
-        out_color = vec4(filmic(colour * exposure), alpha);
+        out_color = vec4(colour * exposure * alpha, alpha);
+        out_transmittance = vec4(vec3(1.0 - alpha), 1.0);
         return;
     }
 
@@ -311,5 +315,6 @@ void main() {
         colour = vec3(0.08, 0.28, 0.72) * alpha;
     }
 
-    out_color = vec4(colour * 0.75, alpha);
+    out_color = vec4(colour * 0.75 * alpha * frame.camera_position_distance.w, alpha);
+    out_transmittance = vec4(vec3(1.0 - alpha), 1.0);
 }

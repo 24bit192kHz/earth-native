@@ -79,6 +79,37 @@ impl IssTracker {
         })
     }
 
+    /// ISS position (scene units, the renderer's longitude-mirrored Earth
+    /// frame) and unit velocity at this instant, for the onboard camera. The
+    /// radius is the scene sphere plus the true height above the ellipsoid,
+    /// so horizon dip and ground scale match what the crew sees.
+    pub fn onboard_state(&mut self, seconds: i64, microseconds: i32) -> Option<IssState> {
+        self.poll_refresh();
+        self.request_refresh_if_due();
+        let orbit = self.orbit.as_mut()?;
+        let sample = |orbit: &mut IssOrbit, offset_us: i64| -> Option<([f64; 3], f64)> {
+            let total = seconds as i128 * 1_000_000 + microseconds as i128 + offset_us as i128;
+            let (s, us) = (total.div_euclid(1_000_000) as i64, total.rem_euclid(1_000_000) as i32);
+            let position = orbit.propagate_unix_utc(s, us).ok()?;
+            let latitude = geocentric_latitude(position.latitude_radians, position.altitude_kilometres);
+            let radius_km = crate::sky::GROUND_KM + position.altitude_kilometres;
+            let direction = scene_direction(latitude, position.longitude_radians);
+            Some((direction.map(|v| v * radius_km), position.altitude_kilometres))
+        };
+        let (before, _) = sample(orbit, -500_000)?;
+        let (now, altitude_km) = sample(orbit, 0)?;
+        let (after, _) = sample(orbit, 500_000)?;
+        let scale = f64::from(crate::camera::SCENE_EARTH_RADIUS) / crate::sky::GROUND_KM;
+        let velocity = [0, 1, 2].map(|c| after[c] - before[c]);
+        let speed = velocity.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0e-9);
+        Some(IssState {
+            position: Vec3::new((now[0] * scale) as f32, (now[1] * scale) as f32, (now[2] * scale) as f32),
+            velocity: Vec3::new((velocity[0] / speed) as f32, (velocity[1] / speed) as f32, (velocity[2] / speed) as f32),
+            altitude_km,
+            ground_speed_km_s: speed,
+        })
+    }
+
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -384,6 +415,21 @@ fn geocentric_latitude(latitude: f64, altitude_km: f64) -> f64 {
         .atan2((n + altitude_km) * latitude.cos())
 }
 
+/// Unit vector of a geocentric latitude/longitude in the renderer's Earth
+/// frame: ECEF with Y negated (the equirectangular maps grow U westward).
+pub fn scene_direction(latitude: f64, longitude: f64) -> [f64; 3] {
+    [latitude.cos() * longitude.cos(), -latitude.cos() * longitude.sin(), latitude.sin()]
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IssState {
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub altitude_km: f64,
+    /// Inertial speed relative to the rotating Earth, km/s.
+    pub ground_speed_km_s: f64,
+}
+
 fn asset_direction(latitude: f64, longitude: f64) -> Vec3 {
     let cosine_latitude = latitude.cos();
     let asset_longitude = longitude + std::f64::consts::PI;
@@ -414,6 +460,19 @@ fn slerp(from: Vec3, to: Vec3, fraction: f32) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onboard_state_is_at_iss_altitude_and_orbital_speed() {
+        let mut tracker = IssTracker::new();
+        let epoch = tracker.tle_epoch_unix_seconds().expect("embedded TLE");
+        let state = tracker.onboard_state(epoch + 600, 250_000).expect("state");
+        let radius_km = state.position.length() as f64 / f64::from(crate::camera::SCENE_EARTH_RADIUS) * crate::sky::GROUND_KM;
+        assert!((radius_km - crate::sky::GROUND_KM - state.altitude_km).abs() < 0.5);
+        assert!((380.0..460.0).contains(&state.altitude_km), "{}", state.altitude_km);
+        // ~7.66 km/s inertial, minus up to ~0.45 km/s of Earth rotation.
+        assert!((7.0..7.8).contains(&state.ground_speed_km_s), "{}", state.ground_speed_km_s);
+        assert!(state.velocity.dot(state.position.normalized()).abs() < 0.01);
+    }
 
     #[test]
     fn fallback_tle_is_valid() {

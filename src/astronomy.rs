@@ -54,6 +54,12 @@ pub struct CelestialState {
     pub body_world_to_fixed: [[[f32; 3]; 3]; crate::body::Body::COUNT],
     pub sun_angular_radius_radians: f32,
     pub moon_angular_radius_radians: f32,
+    /// Row-major `world = eqj_to_world * eqj`: J2000 mean equator (ICRS, the
+    /// star catalogue frame) to the Earth-fixed world frame, through
+    /// precession, nutation and apparent sidereal time.
+    pub eqj_to_world: [[f32; 3]; 3],
+    /// Earth's barycentric velocity over c, in J2000 (annual aberration).
+    pub earth_velocity_over_c: [f32; 3],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +176,35 @@ pub fn celestial_state(unix_seconds: i64) -> Result<CelestialState, AstronomyErr
         )?;
     }
 
+    // Rotate each J2000 basis vector exactly as the Sun and Moon are, so the
+    // stars share their frame by construction.
+    let mut eqj_to_world = [[0.0_f32; 3]; 3];
+    for column in 0..3 {
+        let mut basis = [0.0; 3];
+        basis[column] = 1.0;
+        let eqd = unsafe {
+            ffi::Astronomy_RotateVector(rotation, ffi::astro_vector_t {
+                status: ffi::astro_status_t_ASTRO_SUCCESS,
+                x: basis[0],
+                y: basis[1],
+                z: basis[2],
+                t: time,
+            })
+        };
+        check_vector("EQJ-to-EQD basis", &eqd)?;
+        let world = eqd_to_ecef([eqd.x, eqd.y, eqd.z], sidereal_radians);
+        for row in 0..3 {
+            eqj_to_world[row][column] = to_f32(world[row], "EQJ-to-world rotation")?;
+        }
+    }
+    let earth = unsafe { ffi::Astronomy_BaryState(ffi::astro_body_t_BODY_EARTH, time) };
+    check_status("Astronomy_BaryState(Earth)", earth.status)?;
+    const SPEED_OF_LIGHT_AU_PER_DAY: f64 = 173.144_632_674_240_3;
+    let earth_velocity_over_c = to_f32_vector(
+        [earth.vx, earth.vy, earth.vz].map(|v| v / SPEED_OF_LIGHT_AU_PER_DAY),
+        "Earth velocity",
+    )?;
+
     let sun_radius = angular_radius(SUN_RADIUS_KM, sun.distance_au, "Sun angular radius")?;
     let moon_radius = angular_radius(MOON_RADIUS_KM, moon.distance_au, "Moon angular radius")?;
 
@@ -203,6 +238,8 @@ pub fn celestial_state(unix_seconds: i64) -> Result<CelestialState, AstronomyErr
         body_world_to_fixed,
         sun_angular_radius_radians: to_f32(sun_radius, "Sun angular radius")?,
         moon_angular_radius_radians: to_f32(moon_radius, "Moon angular radius")?,
+        eqj_to_world,
+        earth_velocity_over_c,
     })
 }
 
@@ -563,6 +600,28 @@ mod tests {
             (190.0..205.0).contains(&subsolar_longitude),
             "sub-solar longitude {subsolar_longitude} not near 197.6 E"
         );
+    }
+
+    #[test]
+    fn stars_share_the_sun_frame_at_the_regulus_conjunction() {
+        // The Sun passes 0.46 degrees north of Regulus around 22-23 August
+        // (Regulus: ecliptic latitude +0.46 deg). Rotating the J2000 catalogue
+        // position into the world frame must land it next to the Sun, which
+        // Astronomy Engine places in that frame independently.
+        let state = celestial_state(1_787_443_200).unwrap(); // 2026-08-23 00:00 UTC
+        let (ra, dec) = (152.092_96_f64.to_radians(), 11.967_21_f64.to_radians());
+        let eqj = [dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()];
+        let world: Vec<f64> = state
+            .eqj_to_world
+            .iter()
+            .map(|row| row.iter().zip(eqj).map(|(m, v)| f64::from(*m) * v).sum())
+            .collect();
+        let cosine: f64 = world.iter().zip(state.sun_direction).map(|(a, b)| a * f64::from(b)).sum();
+        let separation = cosine.clamp(-1.0, 1.0).acos().to_degrees();
+        assert!(separation < 1.2, "Regulus {separation} deg from the Sun");
+        for row in state.eqj_to_world {
+            assert!((dot(row, row) - 1.0).abs() < 2.0e-6);
+        }
     }
 
     #[test]

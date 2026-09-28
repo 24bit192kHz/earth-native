@@ -18,10 +18,38 @@ class DataPipelineTests(unittest.TestCase):
             "2:100:d=2026090512:CAPE:surface:anl:",
             "3:400:d=2026090512:PRATE:surface:anl:",
             "4:600:d=2026090512:CWAT:entire atmosphere (considered as a single layer):anl:",
-            "5:900:d=2026090512:TMP:surface:anl:"])
-        self.assertEqual(pipeline.select_ranges(index), {"cloud": (0, 99), "cape": (100, 399), "rain": (400, 599), "water": (600, 899)})
+            "5:900:d=2026090512:LCDC:low cloud layer:anl:",
+            "6:1000:d=2026090512:TMP:surface:anl:"])
+        self.assertEqual(pipeline.select_ranges(index), {"cloud": (0, 99), "cape": (100, 399), "rain": (400, 599),
+                                                         "water": (600, 899), "low": (900, 999)})
         with self.assertRaises(ValueError):
             pipeline.select_ranges("\n".join(index.splitlines()[:3]))
+
+    def test_polar_stereographic_matches_osi_saf_grid_corners(self):
+        # OSI SAF 10 km grids: the pole is the origin, and on the true-scale
+        # parallel (70 deg) the radius is a cos(phi) / sqrt(1 - e^2 sin^2 phi).
+        south = "+proj=stere +a=6378273 +b=6356889.44891 +lat_0=-90 +lat_ts=-70 +lon_0=0"
+        north = "+proj=stere +a=6378273 +b=6356889.44891 +lat_0=90 +lat_ts=70 +lon_0=-45"
+        x, y = pipeline._polar_stereographic(np.array([-90.0]), np.array([0.0]), south)
+        self.assertLess(abs(x[0]) + abs(y[0]), 1e-6)
+        a, b, phi = 6378.273, 6356.88944891, np.radians(70.0)
+        radius = a * np.cos(phi) / np.sqrt(1 - (1 - (b / a) ** 2) * np.sin(phi) ** 2)
+        x, y = pipeline._polar_stereographic(np.array([-70.0]), np.array([0.0]), south)
+        self.assertAlmostEqual(x[0], 0.0, places=6)
+        self.assertAlmostEqual(y[0], radius, places=6)    # south grid: +y toward 0 deg E
+        x, y = pipeline._polar_stereographic(np.array([70.0]), np.array([-45.0]), north)
+        self.assertAlmostEqual(x[0], 0.0, places=6)
+        self.assertAlmostEqual(y[0], -radius, places=6)   # north grid: -y toward lon_0
+
+    def test_storm_preview_oval_is_nightside_and_in_both_hemispheres(self):
+        from datetime import datetime, timezone
+        oval = pipeline.storm_oval(datetime(2026, 9, 28, 0, 0, tzinfo=timezone.utc), 7) / 255
+        lat = 90 - (np.arange(720) + 0.5) * 0.25
+        column = lambda lon: oval[:, int((lon + 180) * 4)]
+        # Midnight at 0 deg E (UTC 00:00) against noon at 180 deg.
+        self.assertGreater(column(0.0)[lat > 0].max(), 2 * column(179.0)[lat > 0].max())
+        self.assertGreater(oval[lat < 0].max(), 0.4)
+        self.assertEqual(oval[np.abs(lat) < 35].max(), 0)
 
     def test_resize_averages_colour_in_linear_light(self):
         image = Image.fromarray(np.array([[[0, 0, 0], [255, 255, 255]]], np.uint8))

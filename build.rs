@@ -17,10 +17,10 @@ fn main() {
         .expect("could not bake atmosphere lookup");
     let glslc = env::var_os("EARTH_NATIVE_GLSLC").unwrap_or_else(|| "glslc".into());
 
-    // The explicit list below is authoritative: these five shaders are the
+    // The explicit list below is authoritative: these seven shaders are the
     // complete set compiled to SPIR-V. Watching the directory re-runs this
     // script when a new source appears, and the scan after the loop warns if
-    // it is not added to the list, so a 6th shader can never be silently
+    // it is not added to the list, so an 8th shader can never be silently
     // missed by the incremental cache.
     println!("cargo:rerun-if-changed={}", shader_dir.display());
     let shaders = [
@@ -29,6 +29,9 @@ fn main() {
         ("stars_textured.frag", "stars_textured.frag.spv"),
         ("earth.frag", "earth.frag.spv"),
         ("earth_textured.frag", "earth_textured.frag.spv"),
+        ("stars_points.vert", "stars_points.vert.spv"),
+        ("stars_points.frag", "stars_points.frag.spv"),
+        ("post.frag", "post.frag.spv"),
     ];
     // Fold the compiler identity into the cache key so a glslc upgrade
     // rebuilds even when every source is unchanged.

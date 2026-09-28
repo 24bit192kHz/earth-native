@@ -57,5 +57,5 @@ void main() {
     vec2 global_xy = frame.viewport_rect.xy + output_uv * frame.viewport_rect.zw;
     vec2 canvas_uv = (global_xy - frame.canvas_rect.xy) / frame.canvas_rect.zw;
     vec3 background = vec3(0.003, 0.006, 0.014) + star_field(canvas_uv);
-    out_color = vec4(background, 1.0);
+    out_color = vec4(background * (frame.sun_direction.w < 0.5 ? 1.0e-6 * frame.camera_position_distance.w : 1.0), 0.0);
 }

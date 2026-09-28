@@ -33,6 +33,10 @@ use crate::{
     },
 };
 
+mod post;
+
+use post::{HdrTarget, PostFrame, PostPipeline, HDR_FORMAT};
+
 pub type RendererResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 // The reference actor's bounds are wider than its visible Earth shell. These
@@ -54,6 +58,10 @@ const LINEAR_PREVIEW_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 const PREVIEW_BC3_SRGB_FORMAT: vk::Format = vk::Format::BC3_SRGB_BLOCK;
 const PREVIEW_BC3_LINEAR_FORMAT: vk::Format = vk::Format::BC3_UNORM_BLOCK;
 const PREVIEW_BC4_FORMAT: vk::Format = vk::Format::BC4_UNORM_BLOCK;
+const PREVIEW_BC5_FORMAT: vk::Format = vk::Format::BC5_UNORM_BLOCK;
+/// Atmosphere lookup tables (sky.rs). Linear filtering, sampling and transfer
+/// of this format are mandatory in Vulkan, so no feature query is needed.
+const SKY_LUT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 fn is_block_compressed(format: vk::Format) -> bool {
     matches!(
@@ -100,6 +108,12 @@ pub struct FrameUniforms {
     pub nasa_clouds: bool,
     pub weather_valid_unix_utc: i64,
     pub aurora_valid_unix_utc: i64,
+    /// Observed (GMGSI) clouds are bound at 12 and current.
+    pub live_clouds: bool,
+    /// Binding 12 also carries the live GEFS-Aerosols optical depth (B, A).
+    pub live_aerosol: bool,
+    /// Binding 12 also carries OSI SAF sea-ice concentration (G).
+    pub live_sea_ice: bool,
     pub camera_position: [f32; 3],
     pub camera_distance: f32,
     pub forward: [f32; 3],
@@ -123,6 +137,10 @@ pub struct FrameUniforms {
     pub tan_half_fov_y: f32,
     pub focus_x: f32,
     pub focus_y: f32,
+    /// Row-major J2000 -> world rotation (precession, nutation, sidereal).
+    pub star_eqj_to_world: [[f32; 3]; 3],
+    /// Earth's barycentric velocity / c in J2000, for annual aberration.
+    pub star_aberration: [f32; 3],
 }
 
 impl Default for FrameUniforms {
@@ -133,6 +151,9 @@ impl Default for FrameUniforms {
             nasa_clouds: false,
             weather_valid_unix_utc: 0,
             aurora_valid_unix_utc: 0,
+            live_clouds: false,
+            live_aerosol: false,
+            live_sea_ice: false,
             camera_position: [-5.5, 0.0, 0.0],
             camera_distance: 5.5,
             forward: [1.0, 0.0, 0.0],
@@ -159,6 +180,8 @@ impl Default for FrameUniforms {
             tan_half_fov_y: 0.262_3,
             focus_x: 0.5,
             focus_y: 0.5,
+            star_eqj_to_world: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            star_aberration: [0.0; 3],
         }
     }
 }
@@ -188,6 +211,43 @@ struct ShaderFrame {
     celestial_sun_view: [f32; 4],
     celestial_moon_view: [f32; 4],
     material_state: [f32; 4],
+}
+
+/// Push constants of the per-star quads (`stars_points.vert`). The camera
+/// basis is expressed in J2000 so the vertex shader only needs dot products.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StarFrame {
+    view_right: [f32; 4],
+    view_up: [f32; 4],
+    view_forward: [f32; 4],
+    projection_tangents: [f32; 4],
+    canvas_rect: [f32; 4],
+    viewport_rect: [f32; 4],
+    params: [f32; 4],
+}
+
+impl StarFrame {
+    fn from_uniforms(uniforms: FrameUniforms, viewport: LogicalRect, physical_width: u32) -> Self {
+        // world = M * eqj, so a world-space basis vector b is M^T b in J2000.
+        let m = uniforms.star_eqj_to_world;
+        let to_eqj = |b: [f32; 3]| -> [f32; 3] {
+            [0, 1, 2].map(|column| (0..3).map(|row| m[row][column] * b[row]).sum())
+        };
+        let (right, up, forward) = (to_eqj(uniforms.right), to_eqj(uniforms.up), to_eqj(uniforms.forward));
+        let v = uniforms.star_aberration;
+        let years = (uniforms.unix_seconds as f64 - crate::star_catalog::EPOCH_UNIX_SECONDS)
+            / crate::star_catalog::SECONDS_PER_JULIAN_YEAR;
+        Self {
+            view_right: [right[0], right[1], right[2], v[0]],
+            view_up: [up[0], up[1], up[2], v[1]],
+            view_forward: [forward[0], forward[1], forward[2], v[2]],
+            projection_tangents: [uniforms.tan_half_fov_x, uniforms.tan_half_fov_y, uniforms.focus_x, uniforms.focus_y],
+            canvas_rect: [uniforms.canvas.x, uniforms.canvas.y, uniforms.canvas.width, uniforms.canvas.height],
+            viewport_rect: [viewport.x, viewport.y, viewport.width, viewport.height],
+            params: [years as f32, physical_width as f32 / viewport.width.max(1.0), 1.0, 0.0],
+        }
+    }
 }
 
 impl ShaderFrame {
@@ -277,8 +337,14 @@ impl ShaderFrame {
                 uniforms.camera_position,
                 scene_units_per_earth_radius,
             );
-        let sidereal_sine = uniforms.greenwich_sidereal_radians.sin();
-        let sidereal_cosine = uniforms.greenwich_sidereal_radians.cos();
+        // Panorama (J2000) orientation: world = M * eqj with M ~ Rz(-angle),
+        // so this is sidereal time plus precession in right ascension (the
+        // remaining <= 0.15 degree of precession in declination is invisible
+        // in the diffuse Milky Way; catalogue stars use the full matrix).
+        let m = uniforms.star_eqj_to_world;
+        let panorama_angle = m[0][1].atan2(m[0][0]);
+        let sidereal_sine = panorama_angle.sin();
+        let sidereal_cosine = panorama_angle.cos();
         // Widest corona layer decays over 35 apparent radii; gate the whole
         // stack a little past that. Coherent across the frame, so the branch
         // costs nothing when the Sun is out of view.
@@ -293,8 +359,13 @@ impl ShaderFrame {
                 uniforms.camera_position[2],
                 uniforms.camera_distance,
             ],
-            // x: 0 authored, 1 NASA surface, 2 NASA surface + NASA cloud map.
-            material_state: [(u32::from(uniforms.nasa_materials) + u32::from(uniforms.nasa_clouds)) as f32,
+            // x: 0 authored, 1 NASA surface, 2 NASA surface + NASA cloud map;
+            // +4 when observed live clouds are bound (binding 12), +8 when
+            // that texture also carries aerosol optical depth, +16 sea ice.
+            material_state: [(u32::from(uniforms.nasa_materials) + u32::from(uniforms.nasa_clouds)
+                + 4 * u32::from(uniforms.live_clouds)
+                + 8 * u32::from(uniforms.live_clouds && uniforms.live_aerosol)
+                + 16 * u32::from(uniforms.live_clouds && uniforms.live_sea_ice)) as f32,
                 u32::from(uniforms.weather_valid_unix_utc > 0) as f32,
                 u32::from(uniforms.aurora_valid_unix_utc > 0) as f32, moon_disc_hi],
             camera_forward: [
@@ -455,6 +526,118 @@ pub struct Renderer {
     textures_label: &'static str,
     star_format: &'static str,
     current_body: crate::body::Body,
+    exposure: ExposureController,
+    /// The GMGSI cloud texture occupies binding 12.
+    live_clouds_bound: bool,
+}
+
+/// Camera auto-exposure, like an ISS photographer's: sunlit scenes, even
+/// dark ocean, are shot at one "sunny 16" exposure (pre-exposure 1); night
+/// series are long high-ISO exposures that render moonlit cloud nearly as
+/// bright as daylight while city lights saturate (Earth Observation night
+/// frames are ~15-19 stops above day frames).
+struct ExposureController {
+    ev: f32,
+    target_ev: f32,
+    last_update: Option<Instant>,
+    snap_frames: u32,
+    frame: u32,
+}
+
+impl ExposureController {
+    const DAY_LUMINANCE_LOG2: f32 = -1.32; // 85th percentile of a sunlit scene ~0.4
+    const ADAPTATION: f32 = 1.0;
+    const MIN_EV: f32 = -1.5;
+    const MAX_EV: f32 = 19.0;
+    const TIME_CONSTANT_S: f32 = 0.9;
+
+    fn new() -> Self {
+        Self { ev: 0.0, target_ev: 0.0, last_update: None, snap_frames: 4, frame: 0 }
+    }
+
+    /// Daylight scenes, even dark ocean, are shot at the same "sunny 16"
+    /// exposure (no opening up within this many stops of the day key).
+    const DAY_LATITUDE_STOPS: f32 = 1.5;
+
+    fn target_for(log2_luminance: f32) -> f32 {
+        let delta = log2_luminance - Self::DAY_LUMINANCE_LOG2;
+        let ev = if delta < 0.0 {
+            (-Self::ADAPTATION * delta - Self::DAY_LATITUDE_STOPS).max(0.0)
+        } else {
+            -delta
+        };
+        // Night series keep moonlit land dark (~3 % grey) and let cloud and
+        // lights carry the frame: ~1.5 stops below a full "normal" exposure.
+        let night = ((ev - 4.0) / 8.0).clamp(0.0, 1.0);
+        (ev - 1.6 * night * night * (3.0 - 2.0 * night)).clamp(Self::MIN_EV, Self::MAX_EV)
+    }
+
+    /// Log-space contrast of the photographic grade: the processed night
+    /// frames are much harder than the day ones.
+    fn contrast(&self) -> f32 {
+        let night = ((self.ev - 4.0) / 8.0).clamp(0.0, 1.0);
+        1.22 + 0.33 * night * night * (3.0 - 2.0 * night)
+    }
+
+    fn update(&mut self, reading: Option<post::MeterReading>, sun_cap: Option<f32>, now: Instant) {
+        if let Some(reading) = reading {
+            self.target_ev = Self::target_for(reading.log2_luminance);
+        }
+        // A photographer never shoots a night exposure with the Sun in the
+        // frame: its glare (added after metering) would white it out.
+        if let Some(cap) = sun_cap {
+            self.target_ev = self.target_ev.min(cap.max(Self::MIN_EV));
+        }
+        let dt = self.last_update.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32());
+        self.last_update = Some(now);
+        if self.snap_frames > 0 {
+            // Readings lag a frame or two behind the cut; keep snapping (and
+            // drawing, see `converging`) until they describe the new view.
+            self.snap_frames -= 1;
+            self.ev = self.target_ev;
+        } else {
+            self.ev += (self.target_ev - self.ev) * (1.0 - (-dt / Self::TIME_CONSTANT_S).exp());
+        }
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    fn converging(&self) -> bool {
+        self.snap_frames > 0 || (self.target_ev - self.ev).abs() > 0.03
+    }
+}
+
+/// Fraction of a luminous disc's light reaching the camera per channel:
+/// nine rays across the disc, each blocked by the ground or dimmed and
+/// reddened by the air (the Sun rising through the limb).
+fn disc_visibility(camera_km: [f64; 3], direction: [f64; 3], angular_radius: f64) -> [f64; 3] {
+    let d = {
+        let length = direction.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0e-9);
+        direction.map(|v| v / length)
+    };
+    let reference = if d[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [0.0, 1.0, 0.0] };
+    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let normalize = |v: [f64; 3]| {
+        let length = v.iter().map(|c| c * c).sum::<f64>().sqrt().max(1.0e-12);
+        v.map(|c| c / length)
+    };
+    let u = normalize(cross(reference, d));
+    let v = cross(d, u);
+    let mut sum = [0.0; 3];
+    let mut count = 0.0;
+    let mut add = |offset_u: f64, offset_v: f64| {
+        let ray = normalize([0, 1, 2].map(|c| d[c] + u[c] * offset_u + v[c] * offset_v));
+        let t = crate::sky::ray_transmittance(camera_km, ray);
+        for c in 0..3 {
+            sum[c] += t[c];
+        }
+        count += 1.0;
+    };
+    add(0.0, 0.0);
+    for k in 0..8 {
+        let a = k as f64 * std::f64::consts::FRAC_PI_4;
+        add(0.72 * angular_radius * a.cos(), 0.72 * angular_radius * a.sin());
+    }
+    sum.map(|value| value / count)
 }
 
 impl Renderer {
@@ -467,6 +650,11 @@ impl Renderer {
 
     pub fn body(&self) -> crate::body::Body {
         self.current_body
+    }
+
+    /// The loaded weather/aurora manifest, if any.
+    pub fn weather_state(&self) -> Option<&crate::weather::WeatherState> {
+        self.weather.as_ref()
     }
 
     pub fn has_weather_animation(&self) -> bool {
@@ -492,6 +680,8 @@ struct DeviceState {
     // VT day-colour path is set 1 and can therefore be enabled independently.
     day_color_textures: Option<PinnedDayColorTextures>,
     virtual_texture: Option<VirtualTexture>,
+    /// Atmosphere tables bound at 17..=19 of the Earth set.
+    sky_luts: Vec<PinnedBgraTexture>,
 }
 
 struct Pipeline {
@@ -505,6 +695,11 @@ struct Pipeline {
     stars_textured: vk::Pipeline,
     earth_procedural: vk::Pipeline,
     earth_textured: vk::Pipeline,
+    /// One additive quad per catalogue star, with its own push-constant block.
+    star_points_layout: vk::PipelineLayout,
+    star_points: vk::Pipeline,
+    /// Camera stage: HDR scene target -> swapchain.
+    post: PostPipeline,
 }
 
 #[repr(C)]
@@ -527,6 +722,9 @@ impl VtParams {
 /// renderer lifetime. The source uses explicit BGRA8 sRGB sidecar metadata.
 struct PinnedStarTexture {
     texture: PinnedBgraTexture,
+    /// Hipparcos catalogue (binding 16), drawn as `star_count` quads.
+    catalog: PinnedBgraTexture,
+    star_count: u32,
     moon: PinnedBgraTexture,
     /// False while a non-Earth body is selected: binding 10 carries a 1x1
     /// fallback because the Moon disc only renders for Earth.
@@ -625,6 +823,28 @@ impl VtSlotAllocator {
     }
 
     pub fn states(&self) -> &[VtSlotState] { &self.slots }
+
+    /// Whether `key` already owns a slot (uploaded, or upload in flight).
+    pub fn holds(&self, key: TileKey) -> bool {
+        self.slots.iter().any(|state| matches!(state, VtSlotState::Resident(k) | VtSlotState::Pending(k) if *k == key))
+    }
+
+    /// Refresh recency for resident tiles the current view still samples, so
+    /// eviction takes tiles that left the view rather than the oldest upload
+    /// (which evicted the always-visible coarse mips and thrashed).
+    pub fn touch_visible(&mut self, visible: &std::collections::HashSet<TileKey>) {
+        if visible.is_empty() {
+            return;
+        }
+        self.clock = self.clock.saturating_add(1);
+        for (slot, state) in self.slots.iter().enumerate() {
+            if let VtSlotState::Resident(key) = state {
+                if visible.contains(key) {
+                    self.last_used[slot] = self.clock;
+                }
+            }
+        }
+    }
 
     pub fn request(&mut self, key: TileKey) -> Option<VtSlotAllocation> {
         if let Some(slot) = self
@@ -1182,6 +1402,18 @@ struct OutputTarget {
     query_clock: u32,
     query_pending: bool,
     slow_waits: SlowWaitTracker,
+    /// Scene-referred radiance target of the camera stage (created on first
+    /// render, once the pipeline exists; rebuilt with the extent).
+    hdr: Option<HdrTarget>,
+    /// Exposure metering of the last completed frame.
+    last_meter: Option<post::MeterReading>,
+}
+
+/// Per-frame camera state shared by every output.
+#[derive(Clone, Copy)]
+struct CameraSettings {
+    preexposure: f32,
+    post: PostFrame,
 }
 
 struct DebugCapture {
@@ -1406,11 +1638,10 @@ impl Renderer {
             Some(StarPanoramaFormat::Bc1Srgb) => "bc1",
             None => "procedural",
         };
-        let day_color = if vt_streamer.is_some() {
-            None
-        } else {
-            load_optional_day_color_hemispheres()?
-        };
+        // The fixed-resolution day map stays loaded with a virtual texture:
+        // it fills pages that are not resident yet, and the other Earth
+        // layers (lights, clouds, relief) load only alongside it.
+        let day_color = load_optional_day_color_hemispheres()?;
         let surface_normals = load_optional_surface_normal_hemispheres(day_color.is_some())?;
         let night_emission = load_optional_night_emission(day_color.is_some())?;
         let cloud_previews = load_optional_cloud_previews(day_color.is_some())?;
@@ -1504,6 +1735,8 @@ impl Renderer {
             textures_label,
             star_format,
             current_body: crate::body::from_environment(),
+            exposure: ExposureController::new(),
+            live_clouds_bound: false,
         })
     }
 
@@ -1538,8 +1771,21 @@ impl Renderer {
         let weather = self.weather.as_ref().map(|state| format!("{} weather_utc={} weather_age_hours={:.1} aurora=NOAA-OVATION aurora_utc={} lightning=simulated",
             state.age_label(now), state.valid_unix_utc, (now - state.valid_unix_utc) as f64 / 3600.0, state.aurora_unix_utc)).unwrap_or_else(|| "unavailable".to_owned());
         let textures = self.textures_label;
-        let clouds = if self.nasa_clouds { "NASA" } else { "authored" };
-        format!("body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2})", self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
+        let live = self.weather.as_ref().filter(|_| self.live_clouds_bound);
+        let clouds = match live {
+            Some(state) if state.live_clouds(now).is_some() => "NOAA-GMGSI",
+            _ if self.nasa_clouds => "NASA",
+            _ => "authored",
+        };
+        let aerosol = match live {
+            Some(state) if state.live_clouds(now).is_some() && state.live_aerosol(now) => "NOAA-GEFS",
+            _ => "climatology",
+        };
+        let sea_ice = match live {
+            Some(state) if state.live_clouds(now).is_some() && state.live_sea_ice(now) => "OSI-SAF",
+            _ => "none",
+        };
+        format!("body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2})", self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
     }
 
     pub unsafe fn configure_output(
@@ -1711,6 +1957,37 @@ impl Renderer {
             }
         }
         textures.weather_fields = Some(replacement);
+        // Observed clouds (binding 12, in the slot of the authored cloud
+        // height map, unused by the NASA material).
+        let clouds = state.clouds_texture.clone();
+        self.live_clouds_bound = false;
+        if let Some(path) = clouds {
+            let upload = crate::day_color::load_preview_texture("EARTH_NATIVE_WEATHER_MANIFEST", path.into_os_string(),
+                    crate::day_color::PreviewColorSpace::Linear)
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+                .and_then(|source| {
+                    let mapped = source.map_payload()?;
+                    PinnedBgraTexture::create_from_preview(&device.device, &textures.resources, LINEAR_PREVIEW_FORMAT,
+                        vk::SamplerAddressMode::CLAMP_TO_EDGE, &source, mapped.bytes(), "GMGSI live clouds")
+                });
+            match upload {
+                Ok(texture) => {
+                    let info = [vk::DescriptorImageInfo::default().sampler(texture.sampler)
+                        .image_view(texture.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                    let write = [vk::WriteDescriptorSet::default().dst_set(textures.descriptor_set).dst_binding(12)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&info)];
+                    unsafe {
+                        device.device.update_descriptor_sets(&write, &[]);
+                        if let Some(previous) = textures.cloud_height.take() {
+                            previous.destroy(&device.device);
+                        }
+                    }
+                    textures.cloud_height = Some(texture);
+                    self.live_clouds_bound = true;
+                }
+                Err(error) => eprintln!("earth-native: live clouds unavailable: {error}"),
+            }
+        }
         self.weather = self.pending_weather.take();
         Ok(())
     }
@@ -1788,6 +2065,13 @@ impl Renderer {
             if (now - weather.aurora_unix_utc).abs() < 6 * 3600 {
                 uniforms.aurora_valid_unix_utc = weather.aurora_unix_utc;
             }
+            // Off-Earth eviction drops the texture; the flag follows it.
+            let resident = self.device.as_ref()
+                .and_then(|device| device.day_color_textures.as_ref())
+                .is_some_and(|textures| textures.earth_resident);
+            uniforms.live_clouds = self.live_clouds_bound && resident && weather.live_clouds(now).is_some();
+            uniforms.live_aerosol = uniforms.live_clouds && weather.live_aerosol(now);
+            uniforms.live_sea_ice = uniforms.live_clouds && weather.live_sea_ice(now);
         }
         self.process_virtual_texture(uniforms)?;
         // Fast path: outputs almost never need recreation, so skip the
@@ -1825,16 +2109,30 @@ impl Renderer {
         let Some(pipeline) = device.pipeline.as_ref() else {
             return Ok(false);
         };
-        let mut needs_redraw = self.pending_weather.is_some();
+        let mut needs_redraw = self.pending_weather.is_some()
+            || self.vt_pending_job.is_some()
+            || self.vt_streamer.as_ref().is_some_and(VirtualTextureStreamer::busy);
         // Integer body id carried in `sun_direction.w` (0=Earth, 1=Jupiter,
         // 2=Mercury, 3=Mars, 4=Saturn) so the shared push-constant layout
         // stays identical across every pipeline.
         let body_selector = self.current_body.id();
+        // Meter from the largest output that has a reading.
+        let reading = self
+            .outputs
+            .values()
+            .filter(|target| target.last_meter.is_some())
+            .max_by_key(|target| target.extent.width as u64 * target.extent.height as u64)
+            .and_then(|target| target.last_meter);
+        let earth = self.current_body == crate::body::Body::Earth;
+        let sun_cap = if earth { sun_exposure_cap(uniforms, body_selector) } else { None };
+        self.exposure.update(if earth { reading } else { None }, sun_cap, Instant::now());
+        needs_redraw |= earth && self.exposure.converging();
+        let camera = camera_settings(uniforms, body_selector, &self.exposure, earth);
         for target in self.outputs.values_mut() {
             if target.format != pipeline.color_format {
                 continue;
             }
-            target.render(device, pipeline, uniforms, body_selector)?;
+            target.render(device, pipeline, uniforms, body_selector, &camera)?;
             needs_redraw |= target.needs_recreate
                 || target
                     .debug_capture
@@ -1842,6 +2140,16 @@ impl Renderer {
                     .is_some_and(|capture| capture.pending);
         }
         Ok(needs_redraw)
+    }
+
+    /// Jump cuts (camera or time set over IPC) re-meter instead of easing,
+    /// so a capture right after the cut is correctly exposed.
+    pub fn snap_exposure(&mut self) {
+        self.exposure.snap_frames = 8;
+    }
+
+    pub fn exposure_ev(&self) -> f32 {
+        self.exposure.ev
     }
 
     pub fn set_debug_scene(&mut self, scene_name: &str) {
@@ -1887,7 +2195,16 @@ impl Renderer {
         }
 
         if self.vt_pending_job.is_none() {
-            if let Some(job) = streamer.poll_one()? {
+            // A tile can be requested again while its first upload is still
+            // on the GPU; drop such duplicates instead of failing the frame.
+            let mut next = streamer.poll_one()?;
+            while let Some(job) = next.as_ref() {
+                if !virtual_texture.allocator.holds(job.key) {
+                    break;
+                }
+                next = streamer.poll_one()?;
+            }
+            if let Some(job) = next {
                 unsafe {
                     virtual_texture.submit_tile(
                         &device.device,
@@ -1918,6 +2235,14 @@ impl Renderer {
         let requests = self
             .vt_feedback
             .collect_requests(uniforms, &outputs, layers, self.vt_frame);
+        if std::env::var_os("EARTH_NATIVE_VT_DEBUG").is_some() && (self.vt_frame % 60 == 0 || self.vt_frame < 5) {
+            let mut mips = std::collections::BTreeMap::<u16, usize>::new();
+            for request in &requests { *mips.entry(request.key.mip).or_default() += 1; }
+            eprintln!("vt-debug frame={} requests={} by_mip={:?} resident_bytes={} pending_job={}",
+                self.vt_frame, requests.len(), mips, streamer.residency().resident_bytes(), self.vt_pending_job.is_some());
+        }
+        let visible: std::collections::HashSet<TileKey> = requests.iter().map(|request| request.key).collect();
+        virtual_texture.allocator.touch_visible(&visible);
         streamer.submit_feedback(self.vt_frame, requests, false);
         self.vt_frame = self.vt_frame.wrapping_add(1);
         Ok(())
@@ -1981,7 +2306,11 @@ impl Renderer {
         let supported = unsafe { self.instance.get_physical_device_features(physical_device) };
         let base_features = vk::PhysicalDeviceFeatures::default()
             .texture_compression_bc(supported.texture_compression_bc == vk::TRUE)
-            .sampler_anisotropy(supported.sampler_anisotropy == vk::TRUE);
+            .sampler_anisotropy(supported.sampler_anisotropy == vk::TRUE)
+            .dual_src_blend(true);
+        if supported.dual_src_blend != vk::TRUE {
+            return Err("the GPU lacks dual-source blending (needed for atmospheric transmittance)".into());
+        }
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&extensions)
@@ -2025,6 +2354,7 @@ impl Renderer {
             star_texture: None,
             day_color_textures: None,
             virtual_texture: None,
+            sky_luts: Vec::new(),
         });
         Ok(())
     }
@@ -2198,6 +2528,34 @@ impl Renderer {
             memory_properties,
             self.vt_config,
         )?;
+        let sky_luts = match upload_sky_luts(&device.device, &star_resources) {
+            Ok(luts) => luts,
+            Err(error) => {
+                unsafe {
+                    if let Some(textures) = day_color_textures.as_ref() {
+                        textures.destroy(&device.device);
+                    }
+                    if let Some(texture) = star_texture.as_ref() {
+                        texture.destroy(&device.device);
+                    }
+                    pipeline.destroy(&device.device);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(textures) = day_color_textures.as_ref() {
+            let infos: Vec<_> = sky_luts.iter().map(|texture| vk::DescriptorImageInfo::default()
+                .sampler(texture.sampler)
+                .image_view(texture.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)).collect();
+            let writes: Vec<_> = infos.iter().enumerate().map(|(index, info)| vk::WriteDescriptorSet::default()
+                .dst_set(textures.descriptor_set)
+                .dst_binding(17 + index as u32)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(info))).collect();
+            unsafe { device.device.update_descriptor_sets(&writes, &[]) };
+        }
+        device.sky_luts = sky_luts;
         device.star_texture = star_texture;
         device.day_color_textures = day_color_textures;
         device.virtual_texture = Some(vt);
@@ -2262,6 +2620,168 @@ impl Renderer {
     }
 }
 
+/// Veiling-glare point-spread function of the lens model (post.frag's
+/// `source_glare` lobes), per steradian at `angle` radians off the source.
+fn lens_glare_psf(angle: f64) -> f64 {
+    let near = angle / 0.010;
+    let far = angle / 0.15;
+    0.004 * 0.6 / (std::f64::consts::PI * 0.010 * 0.010) * (1.0 + near * near).powf(-1.6)
+        + 0.0015 / (std::f64::consts::PI * 0.15 * 0.15) * (1.0 + far * far).powf(-2.0)
+}
+
+/// Exposure ceiling (EV) set by the Sun. The scene meter reads the HDR
+/// target before post.frag adds the lens glare, so the Sun's veiling glare is
+/// metered here over a 33 x 15 grid across the whole frame, as a camera's
+/// matrix meter would see it: the exposure keeps the frame's mean glare
+/// under 8 % and all but 8 % of the frame under half white. A Sun just off
+/// the edge then flares that side instead of whiting out the view, and a
+/// night exposure cannot open up while the (sunlit) ISS camera faces the
+/// Sun. A Sun in frame caps it at log2(1 / visible fraction): "sunny 16"
+/// (EV 0) for an open Sun, more for one sinking through the limb.
+fn sun_exposure_cap(uniforms: FrameUniforms, body_selector: f32) -> Option<f32> {
+    let frame = ShaderFrame::from_uniforms(uniforms, LogicalRect::default(), body_selector);
+    let view = frame.celestial_sun_view;
+    let sun = [view[0], view[1], view[2]].map(f64::from);
+    let dot = |a: [f64; 3], b: [f32; 3]| a[0] * f64::from(b[0]) + a[1] * f64::from(b[1]) + a[2] * f64::from(b[2]);
+    let (x, y, z) = (dot(sun, uniforms.right), dot(sun, uniforms.up), dot(sun, uniforms.forward));
+    // Same acceptance as post.frag: no glare from > ~75 degrees off axis.
+    let t = ((z - 0.26) / (0.64 - 0.26)).clamp(0.0, 1.0);
+    let acceptance = t * t * (3.0 - 2.0 * t);
+    if acceptance <= 0.0 {
+        return None;
+    }
+    let km_per_unit = crate::sky::GROUND_KM / f64::from(SCENE_EARTH_RADIUS);
+    let camera_km = uniforms.camera_position.map(|v| f64::from(v) * km_per_unit);
+    let visible = disc_visibility(camera_km, sun, f64::from(view[3]));
+    let luminance = 0.2126 * visible[0] + 0.7152 * visible[1] + 0.0722 * visible[2];
+    if luminance <= 1.0e-7 {
+        return None;
+    }
+    let (tan_x, tan_y) = (f64::from(uniforms.tan_half_fov_x), f64::from(uniforms.tan_half_fov_y));
+    let in_frame = z > 0.0 && (x / z / tan_x).abs() < 1.0 && (y / z / tan_y).abs() < 1.0;
+    let mut glare = Vec::with_capacity(33 * 15);
+    for row in 0..15 {
+        for column in 0..33 {
+            let (u, v) = (f64::from(column) / 16.0 - 1.0, f64::from(row) / 7.0 - 1.0);
+            let direction = [0, 1, 2].map(|c| f64::from(uniforms.forward[c])
+                + f64::from(uniforms.right[c]) * u * tan_x + f64::from(uniforms.up[c]) * v * tan_y);
+            let length = direction.iter().map(|d| d * d).sum::<f64>().sqrt();
+            let cosine = (direction.iter().zip(sun).map(|(d, s)| d * s).sum::<f64>() / length).clamp(-1.0, 1.0);
+            glare.push(std::f64::consts::PI * luminance * acceptance * lens_glare_psf(cosine.acos()));
+        }
+    }
+    glare.sort_by(f64::total_cmp);
+    let mean = glare.iter().sum::<f64>() / glare.len() as f64;
+    let high = glare[glare.len() * 92 / 100];
+    let glare_cap = (0.08 / mean).log2().min((0.5 / high).log2());
+    let cap = if in_frame { glare_cap.min((1.0 / luminance).log2()) } else { glare_cap };
+    Some(cap as f32)
+}
+
+fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &ExposureController, earth: bool) -> CameraSettings {
+    if !earth {
+        // Other bodies keep their per-body presentation (earth.frag's own
+        // exposure and the legacy filmic curve).
+        return CameraSettings {
+            preexposure: 1.0,
+            post: PostFrame { tone: [1.0, 1.0, 0.0, 0.0], ..PostFrame::default() },
+        };
+    }
+    let preexposure = exposure.ev.exp2();
+    let frame = ShaderFrame::from_uniforms(uniforms, LogicalRect::default(), body_selector);
+    let to_camera = |d: [f32; 4]| {
+        let dot = |b: [f32; 3]| d[0] * b[0] + d[1] * b[1] + d[2] * b[2];
+        [dot(uniforms.right), dot(uniforms.up), dot(uniforms.forward), d[3]]
+    };
+    let km_per_unit = crate::sky::GROUND_KM / f64::from(SCENE_EARTH_RADIUS);
+    let camera_km = uniforms.camera_position.map(|v| f64::from(v) * km_per_unit);
+    let source = |view: [f32; 4], irradiance: f64| {
+        let direction = [0, 1, 2].map(|c| f64::from(view[c]));
+        let visible = disc_visibility(camera_km, direction, f64::from(view[3]));
+        let scale = f64::from(preexposure) * std::f64::consts::PI * irradiance;
+        [visible[0] * scale, visible[1] * scale, visible[2] * scale, 1.0].map(|v| v as f32)
+    };
+    // Lunar irradiance relative to the Sun: Allen's phase law, mean full
+    // Moon 2.5e-6 at 60.27 Earth radii (the shader's moonlight_scale).
+    let phase_degrees = f64::from(uniforms.moon_phase_angle_radians).to_degrees();
+    let phase_law = 10f64.powf(-0.4 * (0.026 * phase_degrees + 4.0e-9 * phase_degrees.powi(4)));
+    let distance_ratio = 60.27 / f64::from(uniforms.moon_distance_earth_radii).max(1.0);
+    let moon_irradiance = 2.5e-6 * phase_law * distance_ratio * distance_ratio;
+    let solar_au = f64::from(uniforms.sun_distance_earth_radii) * crate::sky::GROUND_KM / 149_597_870.7;
+    let sun_irradiance = 1.0 / (solar_au * solar_au).max(1.0e-6);
+    let noise = 0.003 + 0.022 * ((exposure.ev - 7.0) / 8.0).clamp(0.0, 1.0);
+    CameraSettings {
+        preexposure,
+        post: PostFrame {
+            tone: [exposure.contrast(), 0.0, (exposure.frame % 4096) as f32, noise],
+            sun: to_camera(frame.celestial_sun_view),
+            sun_light: source(frame.celestial_sun_view, sun_irradiance),
+            moon: to_camera(frame.celestial_moon_view),
+            // The Moon disc is compressed toward display white like the
+            // eye's local adaptation (stars_textured.frag); so is its glare.
+            moon_light: source(frame.celestial_moon_view,
+                moon_irradiance * (0.35 / (0.12 * f64::from(preexposure) * sun_irradiance)).min(1.0)),
+            ..PostFrame::default()
+        },
+    }
+}
+
+/// Bakes the atmosphere tables (sky.rs) and uploads them as half floats.
+fn upload_sky_luts(device: &Device, resources: &StarTextureResources) -> RendererResult<Vec<PinnedBgraTexture>> {
+    let started = Instant::now();
+    let tables = crate::sky::bake();
+    let specs = [
+        (&tables.transmittance, crate::sky::TRANSMITTANCE_WIDTH, crate::sky::TRANSMITTANCE_HEIGHT, "sky transmittance LUT"),
+        (&tables.multiscatter, crate::sky::MULTISCATTER_SIZE, crate::sky::MULTISCATTER_SIZE, "sky multiple-scattering LUT"),
+        (&tables.irradiance, crate::sky::IRRADIANCE_WIDTH, crate::sky::IRRADIANCE_HEIGHT, "sky irradiance LUT"),
+    ];
+    let mut textures = Vec::with_capacity(specs.len());
+    for (table, width, height, label) in specs {
+        let bytes = crate::sky::rgba16f_bytes(table);
+        match PinnedBgraTexture::create(device, resources, SKY_LUT_FORMAT, vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            width as u32, height as u32, &bytes, label)
+        {
+            Ok(texture) => textures.push(texture),
+            Err(error) => {
+                unsafe { for texture in &textures { texture.destroy(device); } }
+                return Err(error);
+            }
+        }
+    }
+    eprintln!("earth-native: atmosphere tables baked in {:?}", started.elapsed());
+    // Relief normals (binding 20): GEBCO slopes as BC5, or flat.
+    let relief = match std::env::var_os("EARTH_NATIVE_RELIEF") {
+        Some(path) => crate::day_color::load_preview_texture("EARTH_NATIVE_RELIEF", path, crate::day_color::PreviewColorSpace::Linear)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+            .and_then(|texture| {
+                let mapped = texture.map_payload()?;
+                PinnedBgraTexture::create_from_preview(device, resources, LINEAR_PREVIEW_FORMAT,
+                    vk::SamplerAddressMode::CLAMP_TO_EDGE, &texture, mapped.bytes(), "relief normals")
+            }),
+        None => Err("unset".into()),
+    };
+    let relief = match relief {
+        Ok(texture) => {
+            eprintln!("earth-native: relief normals {}", std::env::var("EARTH_NATIVE_RELIEF").unwrap_or_default());
+            texture
+        }
+        Err(error) => {
+            if std::env::var_os("EARTH_NATIVE_RELIEF").is_some() {
+                eprintln!("earth-native: relief normals unavailable ({error}); using a flat surface");
+            }
+            match PinnedBgraTexture::create(device, resources, LINEAR_PREVIEW_FORMAT, vk::SamplerAddressMode::CLAMP_TO_EDGE, 1, 1, &[128, 128, 128, 255], "flat relief") {
+                Ok(texture) => texture,
+                Err(error) => {
+                    unsafe { for texture in &textures { texture.destroy(device); } }
+                    return Err(error);
+                }
+            }
+        }
+    };
+    textures.push(relief);
+    Ok(textures)
+}
+
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
@@ -2278,6 +2798,9 @@ impl Drop for Renderer {
                 }
                 if let Some(textures) = device.day_color_textures.as_ref() {
                     textures.destroy(&device.device);
+                }
+                for texture in device.sky_luts.drain(..) {
+                    texture.destroy(&device.device);
                 }
                 if let Some(mut virtual_texture) = device.virtual_texture.take() {
                     virtual_texture.destroy(&device.device, device.command_pool);
@@ -2454,6 +2977,34 @@ impl Pipeline {
                 .binding(15)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),            // Hipparcos star catalogue (star set only, stars_points.vert).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(16)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
+            // Atmosphere tables (Earth set only): transmittance, multiple
+            // scattering, sky irradiance.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(17)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(18)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(19)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // GEBCO relief normals (Earth set only).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(20)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let descriptor_layout_info =
@@ -2474,7 +3025,7 @@ impl Pipeline {
             };
         let descriptor_pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(32)];
+            .descriptor_count(42)];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(2)
             .pool_sizes(&descriptor_pool_sizes);
@@ -2585,8 +3136,8 @@ impl Pipeline {
             vertex_module,
             stars_procedural_module,
             layout,
-            color_format,
-            false,
+            HDR_FORMAT,
+            Blend::Opaque,
         );
         let stars_procedural = match stars_procedural {
             Ok(pipeline) => pipeline,
@@ -2609,8 +3160,8 @@ impl Pipeline {
             vertex_module,
             stars_textured_module,
             layout,
-            color_format,
-            false,
+            HDR_FORMAT,
+            Blend::Opaque,
         );
         let stars_textured = match stars_textured {
             Ok(pipeline) => pipeline,
@@ -2634,8 +3185,8 @@ impl Pipeline {
             vertex_module,
             earth_module,
             layout,
-            color_format,
-            true,
+            HDR_FORMAT,
+            Blend::Transmittance,
         );
         let earth_procedural = match earth_procedural {
             Ok(pipeline) => pipeline,
@@ -2660,8 +3211,8 @@ impl Pipeline {
             vertex_module,
             earth_textured_module,
             layout,
-            color_format,
-            true,
+            HDR_FORMAT,
+            Blend::Transmittance,
         );
         unsafe {
             device.destroy_shader_module(vertex_module, None);
@@ -2684,7 +3235,43 @@ impl Pipeline {
                 return Err(error);
             }
         };
+        let (star_points_layout, star_points) =
+            match create_star_points_pipeline(device, star_descriptor_set_layout, HDR_FORMAT) {
+                Ok(created) => created,
+                Err(error) => {
+                    unsafe {
+                        device.destroy_pipeline(stars_procedural, None);
+                        device.destroy_pipeline(stars_textured, None);
+                        device.destroy_pipeline(earth_procedural, None);
+                        device.destroy_pipeline(earth_textured, None);
+                        device.destroy_pipeline_layout(layout, None);
+                        device.destroy_descriptor_pool(star_descriptor_pool, None);
+                        device.destroy_descriptor_set_layout(star_descriptor_set_layout, None);
+                    }
+                    return Err(error);
+                }
+            };
+        let post = match PostPipeline::create(device, color_format) {
+            Ok(post) => post,
+            Err(error) => {
+                unsafe {
+                    device.destroy_pipeline(stars_procedural, None);
+                    device.destroy_pipeline(stars_textured, None);
+                    device.destroy_pipeline(earth_procedural, None);
+                    device.destroy_pipeline(earth_textured, None);
+                    device.destroy_pipeline(star_points, None);
+                    device.destroy_pipeline_layout(star_points_layout, None);
+                    device.destroy_pipeline_layout(layout, None);
+                    device.destroy_descriptor_pool(star_descriptor_pool, None);
+                    device.destroy_descriptor_set_layout(star_descriptor_set_layout, None);
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
+            post,
+            star_points_layout,
+            star_points,
             color_format,
             layout,
             star_descriptor_set_layout,
@@ -2699,15 +3286,73 @@ impl Pipeline {
     }
 
     unsafe fn destroy(&self, device: &Device) {
+        self.post.destroy(device);
         device.destroy_pipeline(self.stars_procedural, None);
         device.destroy_pipeline(self.stars_textured, None);
         device.destroy_pipeline(self.earth_procedural, None);
         device.destroy_pipeline(self.earth_textured, None);
+        device.destroy_pipeline(self.star_points, None);
+        device.destroy_pipeline_layout(self.star_points_layout, None);
         device.destroy_pipeline_layout(self.layout, None);
         device.destroy_descriptor_pool(self.vt_descriptor_pool, None);
         device.destroy_descriptor_set_layout(self.vt_descriptor_set_layout, None);
         device.destroy_descriptor_pool(self.star_descriptor_pool, None);
         device.destroy_descriptor_set_layout(self.star_descriptor_set_layout, None);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blend {
+    Opaque,
+    Additive,
+    /// Dual-source: premultiplied radiance plus per-channel transmittance of
+    /// what lies behind (the air reddens the Sun and stars it covers).
+    Transmittance,
+}
+
+/// Layout (star texture set + `StarFrame` push constants) and additive
+/// pipeline for the per-star quads.
+fn create_star_points_pipeline(
+    device: &Device,
+    star_descriptor_set_layout: vk::DescriptorSetLayout,
+    color_format: vk::Format,
+) -> RendererResult<(vk::PipelineLayout, vk::Pipeline)> {
+    let vertex_code = read_spv(&mut Cursor::new(include_bytes!(concat!(env!("OUT_DIR"), "/stars_points.vert.spv"))))?;
+    let fragment_code = read_spv(&mut Cursor::new(include_bytes!(concat!(env!("OUT_DIR"), "/stars_points.frag.spv"))))?;
+    let set_layouts = [star_descriptor_set_layout];
+    let push_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(size_of::<StarFrame>() as u32)];
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(&push_ranges);
+    let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
+    let modules = unsafe {
+        let vertex = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vertex_code), None);
+        let fragment = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&fragment_code), None);
+        match (vertex, fragment) {
+            (Ok(vertex), Ok(fragment)) => Ok((vertex, fragment)),
+            (vertex, fragment) => {
+                for module in [vertex.ok(), fragment.ok()].into_iter().flatten() {
+                    device.destroy_shader_module(module, None);
+                }
+                device.destroy_pipeline_layout(layout, None);
+                Err(vertex.err().or(fragment.err()).unwrap_or(vk::Result::ERROR_UNKNOWN))
+            }
+        }
+    }?;
+    let pipeline = create_graphics_pipeline(device, modules.0, modules.1, layout, color_format, Blend::Additive);
+    unsafe {
+        device.destroy_shader_module(modules.0, None);
+        device.destroy_shader_module(modules.1, None);
+    }
+    match pipeline {
+        Ok(pipeline) => Ok((layout, pipeline)),
+        Err(error) => {
+            unsafe { device.destroy_pipeline_layout(layout, None) };
+            Err(error)
+        }
     }
 }
 
@@ -2717,7 +3362,7 @@ fn create_graphics_pipeline(
     fragment_module: vk::ShaderModule,
     layout: vk::PipelineLayout,
     color_format: vk::Format,
-    blend: bool,
+    blend: Blend,
 ) -> RendererResult<vk::Pipeline> {
     let entry_name = CString::new("main")?;
     let stages = [
@@ -2743,13 +3388,18 @@ fn create_graphics_pipeline(
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    // Additive keeps the destination alpha: (0 * src) + (1 * dst).
+    let (src_color, dst_color, src_alpha, dst_alpha) = match blend {
+        Blend::Additive => (vk::BlendFactor::ONE, vk::BlendFactor::ONE, vk::BlendFactor::ZERO, vk::BlendFactor::ONE),
+        _ => (vk::BlendFactor::ONE, vk::BlendFactor::SRC1_COLOR, vk::BlendFactor::ONE, vk::BlendFactor::ONE_MINUS_SRC_ALPHA),
+    };
     let color_attachment = [vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(blend)
-        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .blend_enable(blend != Blend::Opaque)
+        .src_color_blend_factor(src_color)
+        .dst_color_blend_factor(dst_color)
         .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .src_alpha_blend_factor(src_alpha)
+        .dst_alpha_blend_factor(dst_alpha)
         .alpha_blend_op(vk::BlendOp::ADD)
         .color_write_mask(vk::ColorComponentFlags::RGBA)];
     let color_blend =
@@ -2839,6 +3489,7 @@ impl PinnedBgraTexture {
             Some(BlockFormat::Bc3) => PREVIEW_BC3_LINEAR_FORMAT,
             // Single-channel data; sRGB-encoded sources decode in the shader.
             Some(BlockFormat::Bc4) => PREVIEW_BC4_FORMAT,
+            Some(BlockFormat::Bc5) => PREVIEW_BC5_FORMAT,
         };
         Self::create_mipped(device, resources, format, address_mode_v, width, height, texture.mips(), bytes, label)
     }
@@ -2861,8 +3512,11 @@ impl PinnedBgraTexture {
             STAR_PANORAMA_FORMAT => resources.srgb_format_features,
             STAR_PANORAMA_BC1_FORMAT => resources.bc1_format_features,
             PREVIEW_BC3_SRGB_FORMAT | PREVIEW_BC3_LINEAR_FORMAT => resources.bc3_format_features,
-            PREVIEW_BC4_FORMAT => resources.bc4_format_features,
+            PREVIEW_BC4_FORMAT | PREVIEW_BC5_FORMAT => resources.bc4_format_features,
             LINEAR_PREVIEW_FORMAT => resources.linear_format_features,
+            SKY_LUT_FORMAT => vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::TRANSFER_DST,
             _ => return Err("unsupported pinned texture format".into()),
         };
         validate_pinned_bgra_image_support(
@@ -2877,6 +3531,7 @@ impl PinnedBgraTexture {
         let generate_mips = mips.len() == 1 && width > 1 && height > 1
             && !is_block_compressed(format)
             && !label.contains("surface-normal")
+            && format != SKY_LUT_FORMAT
             && format_features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST);
         let mip_levels = if generate_mips { u32::BITS - width.max(height).leading_zeros() } else { mips.len() as u32 };
         let staging = unsafe { StagingBuffer::create(device, resources.memory_properties, bytes)? };
@@ -2939,7 +3594,7 @@ impl PinnedBgraTexture {
         // Equirect maps wrap in U. A 1-texel-high strip (Saturn ring, atmosphere
         // LUT) is radial/tabular, not periodic: inherit V so LINEAR cannot blend
         // the inner edge with the outer edge.
-        let address_mode_u = if height == 1 {
+        let address_mode_u = if height == 1 || format == SKY_LUT_FORMAT {
             address_mode_v
         } else {
             vk::SamplerAddressMode::REPEAT
@@ -3317,6 +3972,27 @@ impl PinnedStarTexture {
             planet_previews,
             saturn_ring_preview,
         )?;
+        let (catalog_bytes, catalog_width, catalog_height, star_count) = crate::star_catalog::bake();
+        let catalog = match PinnedBgraTexture::create(
+            device,
+            resources,
+            LINEAR_PREVIEW_FORMAT,
+            vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            catalog_width,
+            catalog_height,
+            &catalog_bytes,
+            "bright star catalogue",
+        ) {
+            Ok(texture) => texture,
+            Err(error) => {
+                unsafe {
+                    panorama_texture.destroy(device);
+                    moon.destroy(device);
+                    planets.destroy(device);
+                }
+                return Err(error);
+            }
+        };
         let descriptor_set = match allocate_texture_descriptor_set(device, resources) {
             Ok(descriptor_set) => descriptor_set,
             Err(error) => {
@@ -3324,6 +4000,7 @@ impl PinnedStarTexture {
                     panorama_texture.destroy(device);
                     moon.destroy(device);
                     planets.destroy(device);
+                    catalog.destroy(device);
                 }
                 return Err(error);
             }
@@ -3336,8 +4013,17 @@ impl PinnedStarTexture {
             .sampler(moon.sampler)
             .image_view(moon.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let catalog_info = [vk::DescriptorImageInfo::default()
+            .sampler(catalog.sampler)
+            .image_view(catalog.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let planet_infos = planets.descriptor_infos();
         let mut writes = vec![
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(16)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&catalog_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(0)
@@ -3361,6 +4047,8 @@ impl PinnedStarTexture {
         unsafe { device.update_descriptor_sets(&writes, &[]) };
         Ok(Self {
             texture: panorama_texture,
+            catalog,
+            star_count,
             moon,
             planets,
             descriptor_set,
@@ -3372,6 +4060,7 @@ impl PinnedStarTexture {
         self.texture.destroy(device);
         self.moon.destroy(device);
         self.planets.destroy(device);
+        self.catalog.destroy(device);
     }
 }
 
@@ -4928,6 +5617,8 @@ impl OutputTarget {
             query_clock: 0,
             query_pending: false,
             slow_waits: SlowWaitTracker::default(),
+            hdr: None,
+            last_meter: None,
         })
     }
 
@@ -4937,6 +5628,7 @@ impl OutputTarget {
         pipeline: &Pipeline,
         uniforms: FrameUniforms,
         body_selector: f32,
+        camera: &CameraSettings,
     ) -> RendererResult<()> {
         unsafe {
             let capture_buffer = self.debug_capture.as_mut().and_then(|capture| {
@@ -4999,6 +5691,21 @@ impl OutputTarget {
                 self.last_gpu_ticks = ticks;
                 self.query_pending = false;
             }
+            // The same fence covers the last frame's metering copy.
+            if let Some(hdr) = self.hdr.as_mut() {
+                if hdr.pending_preexposure.is_some() {
+                    hdr.meter_preexposure = hdr.pending_preexposure;
+                    self.last_meter = hdr.read_meter();
+                }
+            }
+            if self.hdr.as_ref().map(|hdr| hdr.extent) != Some(self.extent) {
+                if let Some(old) = self.hdr.take() {
+                    old.destroy(&device.device);
+                }
+                self.hdr = Some(HdrTarget::create(&device.device, device.memory_properties, &pipeline.post, self.extent)?);
+                self.last_meter = None;
+            }
+            let hdr = self.hdr.as_ref().expect("HDR target created above");
             // Non-blocking acquire: timeout 0 polls the compositor for an
             // image without stalling the render thread or churning the
             // swapchain. When the compositor is starving (not releasing
@@ -5075,28 +5782,13 @@ impl OutputTarget {
                 .level_count(1)
                 .base_array_layer(0)
                 .layer_count(1);
-            let to_color = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .image(self.images[image_index as usize])
-                .subresource_range(range);
-            device.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_color],
-            );
-            // The opaque star pass overwrites every pixel of the swapchain
-            // image, so the prior contents are never read; DONT_CARE skips a
+            hdr.record_begin(&device.device, command_buffer);
+            // The opaque star pass overwrites every pixel of the scene target,
+            // so the prior contents are never read; DONT_CARE skips a
             // full-resolution clear on every output every frame. (If the star
             // pass ever gains discarded pixels, restore CLEAR or add depth.)
             let color_attachment = [vk::RenderingAttachmentInfo::default()
-                .image_view(self.views[image_index as usize])
+                .image_view(hdr.attachment_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .store_op(vk::AttachmentStoreOp::STORE)];
@@ -5122,7 +5814,9 @@ impl OutputTarget {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: self.extent,
             }];
-            let shader_frame = ShaderFrame::from_uniforms(uniforms, self.viewport, body_selector);
+            let mut shader_frame = ShaderFrame::from_uniforms(uniforms, self.viewport, body_selector);
+            // The otherwise unused .w lane carries the camera pre-exposure.
+            shader_frame.camera_position_distance[3] = camera.preexposure;
             let bytes = std::slice::from_raw_parts(
                 (&shader_frame as *const ShaderFrame).cast::<u8>(),
                 size_of::<ShaderFrame>(),
@@ -5155,6 +5849,60 @@ impl OutputTarget {
                 star_pipeline,
             );
             device.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            // Catalogue stars: one additive quad each, on top of the sky and
+            // under the planet (whose opaque disc covers them).
+            if let Some(texture) = device.star_texture.as_ref().filter(|texture| texture.star_count > 0) {
+                let mut star_frame = StarFrame::from_uniforms(uniforms, self.viewport, self.extent.width);
+                // Radiance per unit of catalogue irradiance: pre-exposure times
+                // the sunlight unit (pi) over one physical pixel's solid angle.
+                let pixel_angle = 2.0 * uniforms.tan_half_fov_y
+                    / (uniforms.canvas.height * star_frame.params[1]).max(1.0);
+                if camera.post.tone[1] > 0.5 {
+                    star_frame.params[2] = 1.0;
+                    star_frame.params[3] = 1.0;
+                } else {
+                    star_frame.params[2] = camera.preexposure * std::f32::consts::PI / (pixel_angle * pixel_angle);
+                }
+                let star_bytes = std::slice::from_raw_parts(
+                    (&star_frame as *const StarFrame).cast::<u8>(),
+                    size_of::<StarFrame>(),
+                );
+                device.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.star_points);
+                device.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.star_points_layout,
+                    0,
+                    &[texture.descriptor_set],
+                    &[],
+                );
+                device.device.cmd_push_constants(
+                    command_buffer,
+                    pipeline.star_points_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    star_bytes,
+                );
+                device.device.cmd_draw(command_buffer, texture.star_count * 6, 1, 0, 0);
+                // Different push-constant ranges make the layouts
+                // incompatible: restore set 0 and the push constants the
+                // body pass expects under the shared layout.
+                device.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.layout,
+                    0,
+                    &[texture.descriptor_set],
+                    &[],
+                );
+                device.device.cmd_push_constants(
+                    command_buffer,
+                    pipeline.layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytes,
+                );
+            }
             if sample_gpu {
                 device.device.cmd_write_timestamp(
                     command_buffer,
@@ -5194,6 +5942,60 @@ impl OutputTarget {
                 );
                 device.device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
+            device.device.cmd_end_rendering(command_buffer);
+            hdr.record_resolve(&device.device, command_buffer);
+            let to_color = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image(self.images[image_index as usize])
+                .subresource_range(range);
+            device.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_color],
+            );
+            let present_attachment = [vk::RenderingAttachmentInfo::default()
+                .image_view(self.views[image_index as usize])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE)];
+            let present_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.extent,
+                })
+                .layer_count(1)
+                .color_attachments(&present_attachment);
+            device.device.cmd_begin_rendering(command_buffer, &present_info);
+            device.device.cmd_set_viewport(command_buffer, 0, &viewport);
+            device.device.cmd_set_scissor(command_buffer, 0, &scissor);
+            let mut post_frame = camera.post;
+            post_frame.projection = [uniforms.tan_half_fov_x, uniforms.tan_half_fov_y, uniforms.focus_x, uniforms.focus_y];
+            post_frame.canvas = [uniforms.canvas.x, uniforms.canvas.y, uniforms.canvas.width, uniforms.canvas.height];
+            post_frame.viewport = [self.viewport.x, self.viewport.y, self.viewport.width, self.viewport.height];
+            device.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.post.pipeline);
+            device.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.post.layout,
+                0,
+                &[hdr.descriptor_set],
+                &[],
+            );
+            device.device.cmd_push_constants(
+                command_buffer,
+                pipeline.post.layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                std::slice::from_raw_parts((&post_frame as *const PostFrame).cast::<u8>(), size_of::<PostFrame>()),
+            );
+            device.device.cmd_draw(command_buffer, 3, 1, 0, 0);
             device.device.cmd_end_rendering(command_buffer);
             if sample_gpu {
                 device.device.cmd_write_timestamp(
@@ -5299,6 +6101,9 @@ impl OutputTarget {
             device
                 .device
                 .queue_submit(device.queue, &submit, self.in_flight)?;
+            if let Some(hdr) = self.hdr.as_mut() {
+                hdr.pending_preexposure = Some(camera.preexposure);
+            }
             self.query_clock = self.query_clock.wrapping_add(1);
             self.query_pending |= sample_gpu;
             let swapchains = [self.swapchain];
@@ -5413,6 +6218,9 @@ impl OutputTarget {
         if let Some(capture) = self.debug_capture.as_ref() {
             capture.destroy(device);
         }
+        if let Some(hdr) = self.hdr.as_ref() {
+            hdr.destroy(device);
+        }
         device.destroy_fence(self.in_flight, None);
         device.destroy_semaphore(self.image_available, None);
         for semaphore in &self.render_finished {
@@ -5513,6 +6321,26 @@ mod tests {
     }
 
     #[test]
+    fn slot_allocator_evicts_tiles_that_left_the_view() {
+        let coarse = TileKey::new(1, 5, 0, 0);
+        let fine = TileKey::new(1, 0, 7, 3);
+        let next = TileKey::new(1, 0, 8, 3);
+        let mut allocator = VtSlotAllocator::new(2).unwrap();
+        let a = allocator.request(coarse).unwrap();
+        assert!(allocator.holds(coarse));
+        assert!(allocator.mark_resident(a.slot, coarse));
+        let b = allocator.request(fine).unwrap();
+        assert!(allocator.mark_resident(b.slot, fine));
+        // The coarse tile was uploaded first but is still on screen.
+        allocator.touch_visible(&[coarse].into_iter().collect());
+        let c = allocator.request(next).unwrap();
+        assert_eq!(c.evicted, Some(fine));
+        assert!(allocator.holds(coarse));
+        assert!(allocator.holds(next));
+        assert!(!allocator.holds(fine));
+    }
+
+    #[test]
     fn body_residency_experiment_defaults_off() {
         use std::ffi::OsString;
         assert!(!Renderer::body_residency_flag(None));
@@ -5537,7 +6365,7 @@ mod tests {
         // fract() wraps the panorama value but not its screen derivative;
         // implicit LOD would collapse to the coarsest mip in a sky strip.
         let stars = include_str!("../shaders/stars_textured.frag");
-        assert!(stars.contains("textureGrad(star_panorama, panorama_uv, panorama_dx, panorama_dy)"));
+        assert!(stars.contains("textureGrad(star_panorama, panorama_uv + erosion * vec2(1.0, 1.0), panorama_dx, panorama_dy)"));
         assert!(!stars.contains("texture(star_panorama,"));
     }
 
@@ -5586,21 +6414,26 @@ mod tests {
         assert!(earth_width < earth_discard, "earth fwidth must precede the atmosphere discard");
         let textured = include_str!("../shaders/earth_textured.frag");
         let map_dx = textured.find("vec2 map_dx = dFdx(map_uv)").unwrap();
-        let tex_discard = textured.find("if (atmosphere_distance < 0.0 && (frame.material_state.z < 0.5 ||").unwrap();
+        let tex_discard = textured.find("if (!in_air && (frame.material_state.z < 0.5 ||").unwrap();
         assert!(map_dx < tex_discard, "earth_textured map gradients must precede discard");
-        let cov = textured.find("float atmosphere_coverage_width = max(fwidth(atmosphere_discriminant), 1.0e-5);").unwrap();
-        assert!(cov < tex_discard, "atmosphere fwidth must precede discard");
     }
 
     #[test]
-    fn nasa_clouds_and_stars_are_independent_of_weather() {
+    fn clouds_come_from_imagery_and_stars_are_independent_of_weather() {
         let earth = include_str!("../shaders/earth_textured.frag");
         let cloud_start = earth.find("float sample_cloud_density(").unwrap();
         let cloud_end = earth[cloud_start..].find("float city_signal_at(").unwrap() + cloud_start;
-        // Weather fields drive lightning only; they never reshape the cloud map.
+        // Model weather fields drive lightning only; clouds come from observed
+        // imagery (NOAA GMGSI) when the feed provides it, else the NASA map.
         assert!(!earth[cloud_start..cloud_end].contains("frame.material_state"));
         assert!(!earth[cloud_start..cloud_end].contains("weather_fields"));
-        assert!(earth.contains("return nasa_cloud_opacity(mesh_uv0);"));
+        assert!(earth.contains(
+            "return live_clouds() ? live_cloud_opacity(mesh_uv0, cloud_normal) : nasa_cloud_opacity(mesh_uv0);"));
+        let noise_start = earth.find("float cloud_noise(").unwrap();
+        let noise_end = earth[noise_start..].find("float cloud_detail(").unwrap() + noise_start;
+        // Cloud detail is projected from the sphere, never sheared lat/lon.
+        assert!(earth[noise_start..noise_end].contains("vec3 n"));
+        assert!(!earth[noise_start..noise_end].contains("cos_lat"));
         assert!(earth.contains("binding = 4) uniform sampler2D clouds_a"));
         assert!(earth.contains("binding = 11) uniform sampler2D weather_fields"));
         assert!(!earth.contains("texture(clouds_a, cell_center_uv)"));
@@ -5651,53 +6484,33 @@ mod tests {
     }
 
     #[test]
-    fn textured_earth_composites_front_atmosphere_before_opaque_output() {
+    fn textured_earth_marches_a_physical_atmosphere() {
         let shader = include_str!("../shaders/earth_textured.frag");
-        assert!(shader.contains("density_column_km(dot(normal, -direction))"));
-        assert!(shader.contains("atmosphere_radius - surface_radius"));
-        // Rayleigh ratios from Bodhaine et al. optical depths, folded offline.
-        assert!(shader.contains("const vec3 rayleigh = vec3(0.421976, 1.0, 2.499406);"));
-        assert!(shader.contains("rayleigh_per_km"));
-        assert!(shader.contains("exp(-optical_depth * rayleigh)"));
-        // Aerosols: climatological optical depth, normalised HG phase,
-        // grey scattering, and extinction of the surface beneath.
-        assert!(shader.contains("vertical_aerosol_optical_depth"));
-        assert!(shader.contains("aerosol_g"));
-        assert!(shader.contains("view_sun_cosine"));
-        assert!(shader.contains("* aerosol_transmittance"));
-        assert!(shader.contains("mie_scatter * daylight * sun_path"));
+        // Precomputed Bruneton/Hillaire tables from sky.rs, not an analytic glow.
+        assert!(shader.contains("binding = 17) uniform sampler2D sky_transmittance"));
+        assert!(shader.contains("binding = 18) uniform sampler2D sky_multiscatter"));
+        assert!(shader.contains("binding = 19) uniform sampler2D sky_irradiance"));
+        assert!(shader.contains("void march("));
+        assert!(shader.contains("multiscatter("));
+        assert!(shader.contains("sky_irradiance_at("));
         assert!(shader.contains("rayleigh_phase"));
-        assert!(shader.contains("civil_twilight_sine"));
-        assert!(shader.contains("geometric_sunlight"));
-        assert!(shader.contains("night_visibility"));
-        // Physical solar disk and geometric daylight gate.
-        assert!(shader.contains("solar_penumbra"));
-        assert!(shader.contains("surface_day"));
-        assert!(shader.contains("float graze = "));
-        // The front shell takes the surface sun height and unifies on the
-        // tighter night gate, so entry-point daylight cannot paint a blue
-        // fringe onto the night side past the terminator.
-        assert!(shader.contains("surface_sun_height"));
-        assert!(shader.contains("daylight = min(daylight, surface_gate)"));
-        // Molecular density, rather than an arbitrary extended glow shell.
-        assert!(shader.contains("exp(-altitude_km / 8.5)"));
-        // Night-side phenomena: thunderstorm lightning, city-light underglow,
-        // and NOAA-guided aurora emission layers.
-        assert!(shader.contains("lightning"));
+        assert!(shader.contains("aerosol_phase"));
+        assert!(shader.contains("OZONE"));
+        // Scene unit: white Lambertian under the zenith Sun at 1 AU is 1, so
+        // in-scattered radiance (per steradian) carries the factor pi.
+        assert!(shader.contains("PI * sun_irradiance"));
+        assert!(shader.contains("solar_visibility"));
+        // Per-channel transmittance leaves through the second blend source.
+        assert!(shader.contains("layout(location = 0, index = 1) out vec4 out_transmittance"));
+        // Night side: lightning, city underglow, OVATION aurora, airglow.
         assert!(shader.contains("storm_random(strike_cell, uint(phase))"));
         assert!(!shader.contains("phase * 5.31"));
         assert!(shader.contains("city_signal_cloud"));
-        assert!(shader.contains("city_signal_at"));
-        assert!(shader.contains("city_halo * night_visibility"));
         assert!(shader.contains("cloud_shadow"));
-        // Statistical (Cox-Munk) sunglint, no visible sine-train waves.
         assert!(shader.contains("cox_munk_glint"));
         assert!(!shader.contains("wave_slope"));
-        assert!(shader.contains("sun_path_factor"));
-        assert!(shader.contains("solar_visibility"));
         assert!(shader.contains("aurora_emission"));
         assert!(shader.contains("OVATION"));
-        // Volumetric 90-320 km march with altitude emission profiles.
         assert!(shader.contains("aurora_top_radius"));
         assert!(shader.contains("557.7 nm"));
         assert!(shader.contains("textureLod(weather_fields, uv, 3.0).a"));
@@ -5705,12 +6518,13 @@ mod tests {
         assert!(shader.contains("moonlight_scale()"));
         assert!(!shader.contains("aurora_oval"));
 
-        let cloud_composite = shader.find("colour = mix(colour, cloud_colour, cloud_opacity);").unwrap();
-        let atmosphere_composite = shader.find("colour = composite_front_atmosphere(").unwrap();
-        let opaque_output = shader[atmosphere_composite..].find("alpha = 1.0;").unwrap()
-            + atmosphere_composite;
-        assert!(cloud_composite < atmosphere_composite);
-        assert!(atmosphere_composite < opaque_output);
+        // Cloud over ground, then the air in front of both; the surface is
+        // opaque (transmittance zero) so stars cannot show through.
+        let cloud_composite = shader.find("under = mix(under, cloud_colour, cloud_opacity);").unwrap();
+        let air_composite = shader.find("radiance = above_radiance + above_transmittance * under;").unwrap();
+        let opaque = shader[air_composite..].find("transmittance = vec3(0.0);").unwrap() + air_composite;
+        assert!(cloud_composite < air_composite);
+        assert!(air_composite < opaque);
     }
 
     #[test]

@@ -216,6 +216,8 @@ pub enum BlockFormat {
     Bc1,
     Bc3,
     Bc4,
+    /// Two-channel (relief normals).
+    Bc5,
 }
 
 impl BlockFormat {
@@ -224,6 +226,7 @@ impl BlockFormat {
             "bc1" => Some(Self::Bc1),
             "bc3" => Some(Self::Bc3),
             "bc4" => Some(Self::Bc4),
+            "bc5" => Some(Self::Bc5),
             _ => None,
         }
     }
@@ -231,7 +234,7 @@ impl BlockFormat {
     pub const fn bytes_per_block(self) -> u64 {
         match self {
             Self::Bc1 | Self::Bc4 => 8,
-            Self::Bc3 => 16,
+            Self::Bc3 | Self::Bc5 => 16,
         }
     }
 }

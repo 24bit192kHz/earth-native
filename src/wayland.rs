@@ -34,8 +34,10 @@ use crate::{
         MOON_RADIUS_KM, SUN_RADIUS_KM,
     },
     camera::{
-        DesktopLayout, GlobalProjection, LogicalRect as CameraRect, OrbitCamera, OutputGeometry,
-        OutputTransform, PixelSize, ProjectionParameters, Vec2, Vec3, SCENE_EARTH_RADIUS,
+        horizon_dip_degrees, pov_pose, CameraPose, DesktopLayout, GlobalProjection,
+        LogicalRect as CameraRect, OrbitCamera, OutputGeometry, OutputTransform, PixelSize,
+        PovLook, ProjectionParameters, Vec2, Vec3, POV_MAX_FOV_DEGREES, POV_MIN_FOV_DEGREES,
+        SCENE_EARTH_RADIUS,
     },
     debug_scenes::{self, DebugScene},
     ipc,
@@ -46,6 +48,13 @@ use crate::{
 pub mod x11;
 
 const IDLE_FRAME_RATE: u32 = 15;
+// Riding the ISS the ground moves continuously (~16 px/s near the frame
+// bottom on a 3440 px monitor); 30 fps keeps that motion smooth.
+const ONBOARD_FRAME_RATE: u32 = 30;
+/// Control-mode look-around from the window, at the default 78 degree lens
+/// (scaled with the field of view so zoomed-in views turn finer).
+const POV_DRAG_DEGREES_PER_PIXEL: f32 = 0.05;
+const POV_KEY_DEGREES_PER_SECOND: f32 = 30.0;
 const INTERACTIVE_FRAME_RATE: u32 = 30;
 const DEBUG_FRAME_RATE: u32 = 10;
 const INTERACTIVE_GRACE: Duration = Duration::from_secs(2);
@@ -159,6 +168,18 @@ struct PointerState {
     dragging: bool,
 }
 
+/// The live view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ViewMode {
+    /// A camera aboard the ISS (SGP4 position and flight direction), the
+    /// default: the Earth as the Earth Observation photographs show it.
+    Onboard,
+    /// The whole globe from far away, centred under the ISS.
+    Globe,
+    /// A fixed onboard-style viewpoint (tests and aimed captures).
+    FixedPov { latitude: f32, longitude: f32, altitude_km: f32 },
+}
+
 /// Cached [`GlobalProjection::parameters`] output plus the resolved focus point.
 /// Both derive from the desktop bounds, the focus-output name, and the debug
 /// flag, so they are recomputed only when those inputs change instead of once
@@ -169,6 +190,8 @@ struct CachedProjection {
     bounds: CameraRect,
     params: ProjectionParameters,
     focus: Vec2,
+    /// Logical size of the monitor the view is centred on.
+    focus_size: Vec2,
     focus_output_name: String,
     debug_mode: bool,
 }
@@ -190,6 +213,13 @@ pub struct NativeApp {
     layers: BTreeMap<u32, LayerState>,
     camera: OrbitCamera,
     fixed_camera: bool,
+    /// What the live view shows; `camera` over IPC switches it.
+    view_mode: ViewMode,
+    pov_look: PovLook,
+    /// Pitch the "auto" framing last chose, so looking around starts there.
+    pov_auto_pitch: f32,
+    /// Last onboard state, for status.
+    iss_state: Option<crate::orbit::IssState>,
     iss: IssTracker,
     desktop: Option<DesktopLayout>,
     pointer: PointerState,
@@ -281,6 +311,10 @@ impl NativeApp {
             layers: BTreeMap::new(),
             camera: OrbitCamera::new(SCENE_EARTH_RADIUS),
             fixed_camera: false,
+            view_mode: ViewMode::Onboard,
+            pov_look: PovLook::default(),
+            pov_auto_pitch: 0.0,
+            iss_state: None,
             iss: IssTracker::new(),
             desktop: None,
             pointer: PointerState::default(),
@@ -350,6 +384,8 @@ impl NativeApp {
             frame_interval(DEBUG_FRAME_RATE)
         } else if self.is_interactive(Instant::now()) {
             frame_interval(INTERACTIVE_FRAME_RATE)
+        } else if self.riding_iss() {
+            frame_interval(ONBOARD_FRAME_RATE)
         } else if self.fixed_unix_seconds.is_none() && self.renderer.has_weather_animation() {
             frame_interval(IDLE_FRAME_RATE)
         } else {
@@ -362,9 +398,82 @@ impl NativeApp {
             DEBUG_FRAME_RATE
         } else if self.is_interactive(Instant::now()) {
             INTERACTIVE_FRAME_RATE
+        } else if self.riding_iss() {
+            ONBOARD_FRAME_RATE
         } else {
             IDLE_FRAME_RATE
         }
+    }
+
+    fn riding_iss(&self) -> bool {
+        !self.debug_mode && !self.fixed_camera && self.view_mode == ViewMode::Onboard
+            && self.renderer.body() == crate::body::Body::Earth
+    }
+
+    fn pov_active(&self) -> bool {
+        !self.debug_mode && !self.fixed_camera && self.renderer.body() == crate::body::Body::Earth
+            && matches!(self.view_mode, ViewMode::Onboard | ViewMode::FixedPov { .. })
+    }
+
+    /// The onboard pose for this instant, or None to use the orbit camera.
+    fn onboard_pose(&mut self, seconds: i64, microseconds: i32, projection: &CachedProjection) -> Option<(CameraPose, f32)> {
+        if !self.pov_active() {
+            return None;
+        }
+        let (position, reference, altitude_km) = match self.view_mode {
+            ViewMode::Onboard => {
+                let state = self.iss.onboard_state(seconds, microseconds)?;
+                self.iss_state = Some(state);
+                (state.position, state.velocity, state.altitude_km)
+            }
+            ViewMode::FixedPov { latitude, longitude, altitude_km } => {
+                let direction = crate::orbit::scene_direction(f64::from(latitude).to_radians(), f64::from(longitude).to_radians());
+                let radius = f64::from(SCENE_EARTH_RADIUS) * (1.0 + f64::from(altitude_km) / EARTH_EQUATORIAL_RADIUS_KM);
+                let position = Vec3::new((direction[0] * radius) as f32, (direction[1] * radius) as f32, (direction[2] * radius) as f32);
+                // North in the mirrored frame.
+                let north = Vec3::new(
+                    (-f64::from(latitude).to_radians().sin() * f64::from(longitude).to_radians().cos()) as f32,
+                    (f64::from(latitude).to_radians().sin() * f64::from(longitude).to_radians().sin()) as f32,
+                    f64::from(latitude).to_radians().cos() as f32,
+                );
+                (position, north, f64::from(altitude_km))
+            }
+            ViewMode::Globe => return None,
+        };
+        let zoom = self.pov_zoom(projection);
+        let pitch = match self.pov_look.pitch_degrees {
+            Some(pitch) => pitch,
+            None => {
+                // Horizon ~20 % below the top of the focus monitor.
+                let tan_half_y = projection.params.tan_half_fov_y * zoom * projection.focus_size.y / projection.bounds.size.y;
+                self.pov_auto_pitch = horizon_dip_degrees(altitude_km) + (0.6 * tan_half_y).atan().to_degrees();
+                self.pov_auto_pitch
+            }
+        };
+        Some((pov_pose(position, reference, self.pov_look.heading_degrees, pitch), zoom))
+    }
+
+    /// Factor on the projection tangents that gives the onboard lens its
+    /// horizontal field of view across the focus monitor.
+    fn pov_zoom(&self, projection: &CachedProjection) -> f32 {
+        let focus_fraction = (projection.focus_size.x / projection.bounds.size.x).max(1.0e-3);
+        let wanted = (self.pov_look.fov_degrees.clamp(POV_MIN_FOV_DEGREES, POV_MAX_FOV_DEGREES).to_radians() * 0.5).tan();
+        wanted / (projection.params.tan_half_fov_x * focus_fraction).max(1.0e-6)
+    }
+
+    fn focus_rect(&self, bounds: CameraRect) -> CameraRect {
+        let named = self
+            .outputs
+            .values()
+            .find(|output| output.name.as_deref() == Some(self.focus_output_name.as_str()))
+            .and_then(OutputState::logical_rect);
+        let largest = || {
+            self.outputs
+                .values()
+                .filter_map(OutputState::logical_rect)
+                .max_by(|a, b| (a.size.x * a.size.y).total_cmp(&(b.size.x * b.size.y)))
+        };
+        named.or_else(largest).unwrap_or(bounds)
     }
 
     fn focus_point(&self, bounds: CameraRect) -> Vec2 {
@@ -401,10 +510,12 @@ impl NativeApp {
         let bounds = desktop.bounds;
         let params = GlobalProjection::new(desktop).parameters();
         let focus = self.focus_point(bounds);
+        let focus_size = self.focus_rect(bounds).size;
         self.cached_projection = Some(CachedProjection {
             bounds,
             params,
             focus,
+            focus_size,
             focus_output_name: self.focus_output_name.clone(),
             debug_mode: self.debug_mode,
         });
@@ -433,8 +544,13 @@ impl NativeApp {
         // idle that drift is usually sub-pixel: the motion gate below decides
         // whether it needs a present. Structural `dirty` is untouched.
         self.camera.tick(elapsed.as_secs_f32());
+        if self.pov_active() && (self.keyboard_yaw != 0.0 || self.keyboard_pitch != 0.0) {
+            let degrees = POV_KEY_DEGREES_PER_SECOND * self.pov_scale() * elapsed.as_secs_f32().min(0.1);
+            self.turn_pov(self.keyboard_yaw * degrees, -self.keyboard_pitch * degrees);
+        }
 
-        if !self.debug_mode && !self.fixed_camera && self.renderer.body() == crate::body::Body::Earth {
+        if !self.debug_mode && !self.fixed_camera && self.view_mode == ViewMode::Globe
+            && self.renderer.body() == crate::body::Body::Earth {
             if let Some(direction) = self
                 .iss
                 .update_unix_utc(active_seconds, active_microseconds)
@@ -457,6 +573,7 @@ impl NativeApp {
                 return Ok(());
             }
         } else if !self.dirty
+            && !self.riding_iss()
             && !(self.fixed_unix_seconds.is_none() && self.renderer.has_weather_animation())
             && !self.is_interactive(now)
             && self.renderer_clean
@@ -475,7 +592,6 @@ impl NativeApp {
         let Some(desktop) = self.desktop else {
             return Ok(());
         };
-        let pose = self.camera.pose();
         let celestial = self.celestial_state;
         // The debug scene pins the Sun for Earth regression views; every other
         // body gets its own currently correct Sun against the fixed stars.
@@ -538,19 +654,29 @@ impl NativeApp {
         if !cache_current {
             self.refresh_projection_cache();
         }
-        let Some(cached) = self.cached_projection.as_ref() else {
+        let Some(cached) = self.cached_projection.clone() else {
             return Ok(());
         };
-        let projection = cached.params;
         let focus = cached.focus;
+        let (pose, projection) = match self.onboard_pose(active_seconds, active_microseconds, &cached) {
+            Some((pose, zoom)) => (pose, ProjectionParameters {
+                tan_half_fov_x: cached.params.tan_half_fov_x * zoom,
+                tan_half_fov_y: cached.params.tan_half_fov_y * zoom,
+            }),
+            None => (self.camera.pose(), cached.params),
+        };
+        let camera_distance = pose.position.length();
         let uniforms = FrameUniforms {
             unix_seconds: active_seconds,
             nasa_materials: false,
             nasa_clouds: false,
             weather_valid_unix_utc: 0,
             aurora_valid_unix_utc: 0,
+            live_clouds: false,
+            live_aerosol: false,
+            live_sea_ice: false,
             camera_position: [pose.position.x, pose.position.y, pose.position.z],
-            camera_distance: self.camera.distance(),
+            camera_distance,
             forward: [pose.forward.x, pose.forward.y, pose.forward.z],
             right: [pose.right.x, pose.right.y, pose.right.z],
             up: [pose.up.x, pose.up.y, pose.up.z],
@@ -580,6 +706,8 @@ impl NativeApp {
             tan_half_fov_y: projection.tan_half_fov_y,
             focus_x: focus.x,
             focus_y: focus.y,
+            star_eqj_to_world: celestial.eqj_to_world,
+            star_aberration: celestial.earth_velocity_over_c,
         };
         let render_started = Instant::now();
         let still_dirty = self.renderer.render(uniforms)?;
@@ -758,6 +886,7 @@ impl NativeApp {
                 }
                 if self.debug_mode { return "error camera setter requires normal mode".into(); }
                 self.fixed_camera = true;
+                self.renderer.snap_exposure();
                 self.camera.set_base_orbit_direction(Vec3::X);
                 self.camera.set_orbit_angles(values[0], values[1]);
                 self.camera.set_distance_scale_immediate(values[2]);
@@ -766,8 +895,64 @@ impl NativeApp {
             }
             ipc::Request::CameraLive => {
                 self.fixed_camera = false;
+                self.view_mode = ViewMode::Onboard;
+                self.pov_look = PovLook::default();
+                self.renderer.snap_exposure();
                 self.dirty = true;
-                "ok camera=live".into()
+                "ok camera=live view=iss".into()
+            }
+            ipc::Request::CameraGlobe => {
+                self.fixed_camera = false;
+                self.view_mode = ViewMode::Globe;
+                self.renderer.snap_exposure();
+                self.dirty = true;
+                "ok camera=live view=globe".into()
+            }
+            ipc::Request::CameraNext => {
+                let view = self.cycle_view();
+                format!("ok camera=live view={view}")
+            }
+            ipc::Request::CameraZoom { steps } => {
+                if self.control_zoom(steps as f32) {
+                    self.mark_interactive();
+                }
+                format!("ok fov_degrees={:.1}", self.pov_look.fov_degrees)
+            }
+            ipc::Request::CameraReset => {
+                self.reset_look();
+                "ok camera=reset".into()
+            }
+            ipc::Request::CameraAurora => self.aim_at_aurora(),
+            ipc::Request::CameraIss { heading, pitch, fov } => match parse_look(&heading, &pitch, &fov) {
+                Ok(look) => {
+                    if self.debug_mode { return "error camera setter requires normal mode".into(); }
+                    self.fixed_camera = false;
+                    self.view_mode = ViewMode::Onboard;
+                    self.pov_look = look;
+                    self.renderer.snap_exposure();
+                    self.dirty = true;
+                    "ok camera=live view=iss".into()
+                }
+                Err(error) => format!("error {error}"),
+            },
+            ipc::Request::CameraPov { latitude, longitude, altitude, heading, pitch, fov } => {
+                let place = [latitude, longitude, altitude].map(|value| value.parse::<f32>().unwrap_or(f32::NAN));
+                if !place.iter().all(|value| value.is_finite()) || !(-90.0..=90.0).contains(&place[0])
+                    || !(150.0..=40000.0).contains(&place[2]) {
+                    return "error pov needs latitude [-90,90], longitude, altitude 150-40000 km".into();
+                }
+                match parse_look(&heading, &pitch, &fov) {
+                    Ok(look) => {
+                        if self.debug_mode { return "error camera setter requires normal mode".into(); }
+                        self.fixed_camera = false;
+                        self.view_mode = ViewMode::FixedPov { latitude: place[0], longitude: place[1], altitude_km: place[2] };
+                        self.pov_look = look;
+                        self.renderer.snap_exposure();
+                        self.dirty = true;
+                        "ok camera=pov".into()
+                    }
+                    Err(error) => format!("error {error}"),
+                }
             }
             ipc::Request::CaptureFrame => match self.renderer.capture_frame() {
                 Ok(mut ticket) => {
@@ -854,6 +1039,7 @@ impl NativeApp {
     }
 
     fn set_fixed_time(&mut self, seconds: i64) {
+        self.renderer.snap_exposure();
         self.fixed_unix_seconds = Some(seconds);
         self.active_unix_seconds = seconds;
         self.update_celestial_state(seconds);
@@ -999,11 +1185,27 @@ impl NativeApp {
             .iss
             .tle_age_seconds(self.active_unix_seconds)
             .map_or(f64::NAN, |seconds| seconds as f64 / 3600.0);
+        let view = if self.fixed_camera {
+            "fixed".to_owned()
+        } else {
+            match self.view_mode {
+                ViewMode::Onboard => match self.iss_state {
+                    Some(state) => format!("iss iss_altitude_km={:.1} iss_ground_speed_km_s={:.2} heading={:.1} fov={:.0}",
+                        state.altitude_km, state.ground_speed_km_s, self.pov_look.heading_degrees, self.pov_look.fov_degrees),
+                    None => "iss".to_owned(),
+                },
+                ViewMode::Globe => "globe".to_owned(),
+                ViewMode::FixedPov { latitude, longitude, altitude_km } =>
+                    format!("pov pov_lat={latitude:.3} pov_lon={longitude:.3} pov_altitude_km={altitude_km:.1}"),
+            }
+        };
         format!(
-            "ok running outputs={} configured={} control={} iss={} iss_tle_epoch={} iss_tle_age_hours={:.1} fps={} measured_fps={} frame_ms={:.2} {} {}",
+            "ok running outputs={} configured={} control={} view={} exposure_ev={:.2} iss={} iss_tle_epoch={} iss_tle_age_hours={:.1} fps={} measured_fps={} frame_ms={:.2} {} {}",
             self.outputs.len(),
             self.x11.as_ref().map_or(self.layers.len(), x11::X11Parts::window_count),
             control,
+            view,
+            self.renderer.exposure_ev(),
             iss,
             iss_tle_epoch,
             iss_tle_age_hours,
@@ -1530,7 +1732,7 @@ impl Dispatch<WlPointer, ()> for NativeApp {
                             surface_x - previous_x,
                             surface_y - previous_y,
                         );
-                        if state.camera.orbit_mouse(orbit_x, orbit_y) {
+                        if state.control_drag(orbit_x, orbit_y) {
                             state.mark_interactive();
                         }
                     }
@@ -1552,7 +1754,7 @@ impl Dispatch<WlPointer, ()> for NativeApp {
             wl_pointer::Event::AxisDiscrete { axis, discrete } => {
                 if state.pointer.output_id == state.controlled_output
                     && matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll))
-                    && state.camera.zoom_steps(-(discrete as f32))
+                    && state.control_zoom(-(discrete as f32))
                 {
                     state.mark_interactive();
                 }
@@ -1592,9 +1794,115 @@ impl Dispatch<WlKeyboard, ()> for NativeApp {
 }
 
 impl NativeApp {
+    /// Switch between the ISS window and the globe (from any fixed or
+    /// planetary view, back to the ISS window over Earth).
+    fn cycle_view(&mut self) -> &'static str {
+        let to_globe = !self.fixed_camera && self.view_mode == ViewMode::Onboard
+            && self.renderer.body() == crate::body::Body::Earth;
+        if self.renderer.body() != crate::body::Body::Earth {
+            self.renderer.set_body(crate::body::Body::Earth);
+        }
+        self.fixed_camera = false;
+        self.view_mode = if to_globe { ViewMode::Globe } else { ViewMode::Onboard };
+        self.renderer.snap_exposure();
+        self.mark_interactive();
+        if to_globe { "globe" } else { "iss" }
+    }
+
+    /// Hover at ISS altitude ~6 degrees (670 km) from the strongest aurora
+    /// in the dark and face it, from the side whose horizon is darkest: its
+    /// 110-250 km curtains then stand just above the horizon against black
+    /// sky, as in ISS window photographs.
+    fn aim_at_aurora(&mut self) -> String {
+        if self.debug_mode {
+            return "error camera setter requires normal mode".into();
+        }
+        let Some(weather) = self.renderer.weather_state() else {
+            return "error no NOAA aurora data yet (is earth-native-weather running?)".into();
+        };
+        let (path, width, height) = (weather.texture.clone(), weather.width as usize, weather.height as usize);
+        let fields = match std::fs::read(&path) {
+            Ok(fields) => fields,
+            Err(error) => return format!("error reading {}: {error}", path.display()),
+        };
+        let Some((latitude, longitude, probability)) =
+            crate::weather::strongest_dark_aurora(&fields, width, height, self.celestial_state.sun_direction)
+        else {
+            return "error no dark auroral zone right now".into();
+        };
+        let (camera_latitude, camera_longitude, heading) =
+            crate::weather::aurora_vantage(latitude, longitude, 6.0, self.celestial_state.sun_direction);
+        self.fixed_camera = false;
+        if self.renderer.body() != crate::body::Body::Earth {
+            self.renderer.set_body(crate::body::Body::Earth);
+        }
+        self.view_mode = ViewMode::FixedPov { latitude: camera_latitude, longitude: camera_longitude, altitude_km: 420.0 };
+        self.pov_look = PovLook { heading_degrees: heading, pitch_degrees: Some(15.0), fov_degrees: PovLook::default().fov_degrees };
+        self.renderer.snap_exposure();
+        self.mark_interactive();
+        format!("ok camera=aurora aurora_lat={latitude:.1} aurora_lon={longitude:.1} probability={:.0}% camera_lat={camera_latitude:.1} camera_lon={camera_longitude:.1} heading={heading:.0}{}",
+            probability * 100.0,
+            if probability < 0.05 { " (quiet oval: faint)" } else { "" })
+    }
+
+    /// Look ahead again with the default lens (the view mode stays).
+    fn reset_look(&mut self) {
+        let heading = match self.view_mode {
+            ViewMode::FixedPov { .. } => self.pov_look.heading_degrees,
+            _ => PovLook::default().heading_degrees,
+        };
+        self.pov_look = PovLook { heading_degrees: heading, ..PovLook::default() };
+        self.renderer.snap_exposure();
+        self.mark_interactive();
+    }
+
+    /// Field-of-view scale for look-around rates (1 at the default lens).
+    fn pov_scale(&self) -> f32 {
+        self.pov_look.fov_degrees / PovLook::default().fov_degrees
+    }
+
+    /// Turn the window view: heading to the right, pitch further down.
+    fn turn_pov(&mut self, heading_degrees: f32, pitch_down_degrees: f32) -> bool {
+        if heading_degrees == 0.0 && pitch_down_degrees == 0.0 {
+            return false;
+        }
+        let pitch = self.pov_look.pitch_degrees.unwrap_or(self.pov_auto_pitch);
+        self.pov_look.heading_degrees = (self.pov_look.heading_degrees + heading_degrees).rem_euclid(360.0);
+        self.pov_look.pitch_degrees = Some((pitch + pitch_down_degrees).clamp(-89.0, 89.0));
+        self.dirty = true;
+        true
+    }
+
+    /// Control-mode drag (camera convention: x right, y up). From the ISS or
+    /// a fixed viewpoint it grabs the view and turns the camera; otherwise it
+    /// orbits the globe.
+    fn control_drag(&mut self, delta_x: f32, delta_y: f32) -> bool {
+        if !self.pov_active() {
+            return self.camera.orbit_mouse(delta_x, delta_y);
+        }
+        let degrees = POV_DRAG_DEGREES_PER_PIXEL * self.pov_scale();
+        self.turn_pov(-delta_x * degrees, delta_y * degrees)
+    }
+
+    /// Control-mode zoom, positive steps in: the window lens's field of view
+    /// (8-120 degrees) from the ISS or a fixed viewpoint, else the orbit.
+    fn control_zoom(&mut self, steps: f32) -> bool {
+        if !self.pov_active() {
+            return self.camera.zoom_steps(steps);
+        }
+        let fov = (self.pov_look.fov_degrees * 0.84_f32.powf(steps)).clamp(POV_MIN_FOV_DEGREES, POV_MAX_FOV_DEGREES);
+        if fov == self.pov_look.fov_degrees {
+            return false;
+        }
+        self.pov_look.fov_degrees = fov;
+        self.dirty = true;
+        true
+    }
+
     /// Keyboard control shared by the Wayland and Xorg frontends (Linux
-    /// evdev key codes): arrows orbit, Q/E zoom, Esc releases control, and
-    /// Ctrl+Left/Right tours the bodies.
+    /// evdev key codes): arrows orbit (or look around from the ISS), Q/E
+    /// zoom, C switches ISS window/globe, R resets the look, Esc releases
+    /// control, and Ctrl+Left/Right tours the bodies.
     fn handle_evdev_key(&mut self, key: u32, pressed: bool, ctrl_held: bool) {
         if self.controlled_output.is_none() {
             return;
@@ -1615,17 +1923,26 @@ impl NativeApp {
         }
         match key {
             1 if pressed => self.release_control(),
+            // C: ISS window <-> globe; R: look ahead with the default lens.
+            46 if pressed => {
+                self.cycle_view();
+                return;
+            }
+            19 if pressed => {
+                self.reset_look();
+                return;
+            }
             105 => self.keyboard_yaw = if pressed { -1.0 } else { 0.0 },
             106 => self.keyboard_yaw = if pressed { 1.0 } else { 0.0 },
             103 => self.keyboard_pitch = if pressed { 1.0 } else { 0.0 },
             108 => self.keyboard_pitch = if pressed { -1.0 } else { 0.0 },
             16 if pressed => {
-                if self.camera.zoom_steps(-1.0) {
+                if self.control_zoom(-1.0) {
                     self.mark_interactive();
                 }
             }
             18 if pressed => {
-                if self.camera.zoom_steps(1.0) {
+                if self.control_zoom(1.0) {
                     self.mark_interactive();
                 }
             }
@@ -1641,6 +1958,22 @@ impl NativeApp {
 delegate_noop!(NativeApp: ignore WlCompositor);
 delegate_noop!(NativeApp: ignore WlSurface);
 delegate_noop!(NativeApp: ignore WlRegion);
+
+fn parse_look(heading: &str, pitch: &str, fov: &str) -> Result<PovLook, &'static str> {
+    let heading = heading.parse::<f32>().map_err(|_| "heading must be degrees")?;
+    let pitch = if pitch == "auto" {
+        None
+    } else {
+        Some(pitch.parse::<f32>().ok().filter(|p| (-89.0..=89.0).contains(p)).ok_or("pitch must be auto or degrees in [-89,89]")?)
+    };
+    let fov = fov.parse::<f32>().ok()
+        .filter(|f| (POV_MIN_FOV_DEGREES..=POV_MAX_FOV_DEGREES).contains(f))
+        .ok_or("field of view must be 8-120 degrees")?;
+    if !heading.is_finite() {
+        return Err("heading must be finite");
+    }
+    Ok(PovLook { heading_degrees: heading, pitch_degrees: pitch, fov_degrees: fov })
+}
 
 fn celestial_direction(yaw: &str, pitch: &str) -> Result<[f32; 3], &'static str> {
     let yaw = yaw

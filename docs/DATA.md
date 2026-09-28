@@ -28,6 +28,30 @@ Earth view needs about 270 MiB of VRAM. Equirectangular rows are low-passed
 along longitude by 1/cos(latitude) (`polar_resample`) so the poles do not
 pinwheel.
 
+## High-resolution Earth (500 m)
+
+When present, these replace the 8K Earth maps (`src/data_dir.rs` finds them
+in the data directory). They are baked offline by `tools/earth-bake`
+(Rust, ISPC BC7/BC4/BC5 encoders):
+
+| File | Format | Source |
+| --- | --- | --- |
+| `vt/earth-day-MM.earthvt` | BC7 virtual texture, 65536×32768, 256 px pages + 4 px gutters, water mask in alpha, ≈ 3 GB per month | NASA Blue Marble NG 500 m monthly "world" (2004, no baked relief), 8 tiles of 21600², water from GEBCO 2026 |
+| `textures/night.bc4` | BC4 32768×16384, 13 mips | NASA Black Marble 2016 500 m grayscale |
+| `textures/clouds.bc4` | BC4 32768×16384 | NASA Blue Marble cloud composite (1 km) |
+| `textures/relief.bc5` | BC5 normals 32768×16384 | GEBCO 2026 15″ grid |
+
+```sh
+cargo build --release --manifest-path tools/earth-bake/Cargo.toml
+earth-bake day-vt --bmng DIR --month 200409 --gebco DIR --out earth-day-09.earthvt
+earth-bake gray-bc4 --tiles A1,B1,C1,D1,A2,B2,C2,D2 --grid 4x2 --width 32768 \
+    --color-space srgb --name NASA/night --out night.bc4
+earth-bake relief-bc5 --gebco DIR --width 32768 --out relief.bc5
+```
+
+The renderer loads the current month's virtual texture, else the nearest
+baked month.
+
 ## Rebuilding the pack
 
 ```sh
@@ -38,15 +62,32 @@ python3 pipeline/data_pipeline.py build          # downloads ~600 MB of sources 
 
 Sources are cached in `<data dir>/sources` and re-verified by SHA-256.
 
-## Live weather and aurora
+## Live weather, clouds, aerosol, sea ice and aurora
 
 `pipeline/data_pipeline.py watch` (the `earth-native-weather` service)
 refreshes every 30 minutes:
 
 - **NOAA GFS 0.25° analysis** (only the needed GRIB2 messages are fetched by
-  byte range): cloud fraction × cloud water, CAPE and precipitation, which
-  drive where lightning flashes.
+  byte range): cloud fraction × cloud water, CAPE and precipitation (where
+  lightning flashes), and low cloud.
+- **NOAA GMGSI** hourly geostationary mosaics (visible and 10.7 µm infrared)
+  for observed cloud cover, against clear-sky composites kept in
+  `weather/clearsky.npz`.
+- **NOAA GEFS-Aerosols analysis** (GOCART, 0.25°): aerosol optical depth at
+  440, 550 and 645 nm.
+- **EUMETSAT OSI SAF** daily sea-ice concentration (OSI-401, 10 km polar
+  stereographic grids, both hemispheres, via MET Norway THREDDS).
 - **NOAA SWPC OVATION** aurora probability, which places the auroral oval.
 
-It writes a checksummed 1440×720 field texture and tells the renderer to
-reload it. Without the feed, aurora and lightning simply stay off.
+It writes two checksummed textures and tells the renderer to reload them:
+`fields.bgra` (1440×720: R cloud, G CAPE, B precipitation, A aurora) and
+`clouds.bgra` (4096×2048: R cloud cover, G sea-ice concentration,
+B (Ångström exponent + 0.5)/3, A √(τ₅₅₀/4)). Each source is optional: without
+it the renderer falls back to the NASA cloud map, the climatological haze or
+open oceans, and aurora and lightning stay off.
+
+`data_pipeline.py aurora-preview --kp 7` swaps tonight's OVATION oval for a
+synthetic storm of that Kp (Feldstein-Starkov-style boundaries in magnetic
+latitude and local time), labelled `SYNTHETIC` in the manifest, to review the
+aurora rendering when the real oval is quiet. The next feed update (at most
+30 minutes) or `data_pipeline.py weather` restores the observation.

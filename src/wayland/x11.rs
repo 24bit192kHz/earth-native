@@ -365,12 +365,12 @@ impl NativeApp {
                         self.mark_interactive();
                     }
                     button if button == u8::from(ButtonIndex::M4) => {
-                        if self.camera.zoom_steps(-1.0) {
+                        if self.control_zoom(-1.0) {
                             self.mark_interactive();
                         }
                     }
                     button if button == u8::from(ButtonIndex::M5) => {
-                        if self.camera.zoom_steps(1.0) {
+                        if self.control_zoom(1.0) {
                             self.mark_interactive();
                         }
                     }
@@ -387,7 +387,7 @@ impl NativeApp {
                     if let Some((previous_x, previous_y)) = previous {
                         let (orbit_x, orbit_y) =
                             super::orbit_delta_from_surface_motion(position.0 - previous_x, position.1 - previous_y);
-                        if self.camera.orbit_mouse(orbit_x, orbit_y) {
+                        if self.control_drag(orbit_x, orbit_y) {
                             self.mark_interactive();
                         }
                     }

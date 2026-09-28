@@ -11,6 +11,8 @@ mod earthvt;
 mod ipc;
 mod orbit;
 mod sgp4;
+mod sky;
+mod star_catalog;
 mod star_panorama;
 mod vt_feedback;
 #[allow(dead_code)]
@@ -88,16 +90,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "camera" => {
-            let yaw = args.next().ok_or("usage: earth-native camera {YAW PITCH DISTANCE|live}")?;
-            let request = if yaw == "live" {
-                Request::CameraLive
-            } else {
-                Request::Camera { yaw,
-                    pitch: args.next().ok_or("camera needs pitch in degrees")?,
-                    distance: args.next().ok_or("camera needs distance in body radii")?,
-                }
-            };
-            if args.next().is_some() { return usage(); }
+            let rest = args.collect::<Vec<_>>();
+            if rest.is_empty() {
+                return Err("usage: earth-native camera {live|globe|next|aurora|zoom in|zoom out|reset|iss HEADING PITCH|auto FOV|pov LAT LON ALT_KM HEADING PITCH|auto [FOV]|YAW PITCH DISTANCE}".into());
+            }
+            let mut fields = rest.clone();
+            // The field of view is optional on the command line.
+            if fields[0] == "pov" && fields.len() == 6 {
+                fields.push("78".to_owned());
+            }
+            if fields[0] == "iss" && fields.len() == 3 {
+                fields.push("78".to_owned());
+            }
+            let request = Request::parse(&format!("camera {}", fields.join(" ")))?;
             let response = ipc::request(request)?;
             if response.starts_with("error") { return Err(response.into()); }
             println!("{response}");

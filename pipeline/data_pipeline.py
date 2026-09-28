@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pillow>=11", "numpy>=2", "eccodes>=2.38", "OpenEXR>=3.3"]
+# dependencies = ["pillow>=11", "numpy>=2", "eccodes>=2.38", "OpenEXR>=3.3", "h5py>=3.11"]
 # ///
 """NASA texture preparation and bounded NOAA GFS weather updates.
 
@@ -26,6 +26,7 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+import warnings
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -366,6 +367,7 @@ def select_ranges(index):
     rows = [line.split(":") for line in index.splitlines() if line]
     wanted = {("TCDC", "entire atmosphere"): "cloud", ("CAPE", "surface"): "cape", ("PRATE", "surface"): "rain"}
     wanted[("CWAT", "entire atmosphere (considered as a single layer)")] = "water"
+    wanted[("LCDC", "low cloud layer")] = "low"
     found = {}
     for row, following in zip(rows, rows[1:]):
         name = wanted.get(tuple(row[3:5]))
@@ -423,6 +425,314 @@ def aurora_field():
     return np.round(field * 255).astype(np.uint8), forecast
 
 
+def storm_oval(now, kp):
+    """A synthetic auroral oval for previewing a geomagnetic storm of the
+    given Kp tonight: OVATION-style probabilities between Feldstein-Starkov
+    type boundaries in geomagnetic latitude and magnetic local time (IGRF
+    2025 dipole), strongest near magnetic midnight. Not an observation."""
+    height, width = 720, 1440
+    lat = np.radians(90.0 - (np.arange(height) + 0.5) * 0.25)[:, None]
+    lon = np.radians(-180.0 + (np.arange(width) + 0.5) * 0.25)[None, :]
+    point = np.stack(np.broadcast_arrays(np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)), axis=-1)
+    pole_lat, pole_lon = math.radians(80.8), math.radians(-72.6)
+    pole = np.array([math.cos(pole_lat) * math.cos(pole_lon), math.cos(pole_lat) * math.sin(pole_lon), math.sin(pole_lat)])
+    day = now.timetuple().tm_yday
+    hours = now.hour + now.minute / 60 + now.second / 3600
+    gamma = 2 * math.pi / 365 * (day - 1 + (hours - 12) / 24)
+    declination = (0.006918 - 0.399912 * math.cos(gamma) + 0.070257 * math.sin(gamma)
+                   - 0.006758 * math.cos(2 * gamma) + 0.000907 * math.sin(2 * gamma))
+    equation = 229.18 * (0.000075 + 0.001868 * math.cos(gamma) - 0.032077 * math.sin(gamma)
+                         - 0.014615 * math.cos(2 * gamma) - 0.040849 * math.sin(2 * gamma))
+    sub_lon = math.radians(-15.0 * (hours - 12.0 + equation / 60.0))
+    sun = np.array([math.cos(declination) * math.cos(sub_lon), math.cos(declination) * math.sin(sub_lon), math.sin(declination)])
+    noon = sun - sun.dot(pole) * pole
+    noon /= np.linalg.norm(noon)
+    east = np.cross(pole, noon)
+    magnetic_lat = np.degrees(np.arcsin(np.clip(point @ pole, -1.0, 1.0)))
+    from_midnight = np.arctan2(point @ east, point @ noon) + math.pi   # 0 at magnetic midnight
+    night = np.cos(from_midnight)                                          # 1 midnight, -1 noon
+    equatorward = 66.0 - 1.8 * kp - 4.0 * night
+    poleward = 73.0 - 0.8 * kp - 3.5 * night
+    x = (np.abs(magnetic_lat) - equatorward) / np.maximum(poleward - equatorward, 1.0)
+    peak = min(0.9, 0.15 + 0.1 * kp)
+    probability = peak * (0.55 + 0.45 * night) * np.exp(-((x - 0.45) / 0.32) ** 2)
+    return np.round(np.clip(probability, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def aurora_preview(kp):
+    """Swap tonight's NOAA OVATION oval for a synthetic storm of this Kp in
+    the live manifest, labelled as such. The feed's next update (at most 30
+    minutes) or `data_pipeline.py weather` restores the observation."""
+    now = datetime.now(timezone.utc)
+    manifest_path = DATA / "weather" / "current.json"
+    manifest = json.loads(manifest_path.read_text())
+    fields = np.frombuffer(Path(manifest["texture"]).read_bytes(), np.uint8).reshape(720, 1440, 4)
+    rgb = fields[:, :, 2::-1].copy()
+    generation = DATA / "weather" / f"preview-kp{kp:g}-{int(now.timestamp())}"
+    asset = preview(generation, "fields", rgb, alpha=storm_oval(now, kp))
+    manifest.update({"texture": str(generation / asset["file"]), "sha256": asset["sha256"],
+                     "aurora_unix_utc": int(now.timestamp()),
+                     "aurora_source": f"SYNTHETIC storm preview Kp {kp:g} (not an observation)"})
+    atomic_json(manifest_path, manifest)
+    print(f"Aurora preview: synthetic Kp {kp:g} oval until the next weather update", flush=True)
+
+
+def aerosol_field(now):
+    """Live aerosol from the NOAA GEFS-Aerosols analysis (GOCART, 0.25 deg):
+    total aerosol optical depth at 550 nm and the 440-645 nm Angstrom
+    exponent (dust ~0.2, smoke and pollution ~1.5), 1440x720 pixel centres.
+    Desert dust is what turns the horizon haze over Arabia and the Sahara
+    white; a single global optical depth left it Rayleigh-lavender.
+    """
+    cycle = now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0)
+    wanted = {"4.3e-07": "aod440", "5.45e-07": "aod550", "6.2e-07": "aod645"}
+    last_error = None
+    for offset in range(6):
+        candidate = cycle - timedelta(hours=6 * offset)
+        base = (f"https://noaa-gefs-pds.s3.amazonaws.com/gefs.{candidate:%Y%m%d}/{candidate:%H}/chem/pgrb2ap25/"
+                f"gefs.chem.t{candidate:%H}z.a2d_0p25.f000.grib2")
+        try:
+            rows = [line.split(":") for line in download(base + ".idx", limit=200_000).decode().splitlines() if line]
+            found = {}
+            for row, following in zip(rows, rows[1:]):
+                if len(row) > 8 and row[3] == "AOTK" and row[6] == "aerosol=Total aerosol":
+                    low = row[8].split(",")[0].removeprefix("aerosol_wavelength >=")
+                    if low in wanted:
+                        found[wanted[low]] = (int(row[1]), int(following[1]) - 1)
+            if set(found) != set(wanted.values()):
+                raise ValueError("GEFS-Aerosols cycle is missing an optical depth")
+            fields = {name: decode_grib(download(base, limit=10_000_000, byte_range=span), candidate)
+                      for name, span in found.items()}
+        except (HTTPError, OSError, ValueError) as error:
+            last_error = error
+            continue
+        aod = np.clip(fields["aod550"], 0.0, 4.0)
+        angstrom = -np.log(np.maximum(fields["aod440"], 1e-4) / np.maximum(fields["aod645"], 1e-4)) / math.log(440 / 645)
+        return aod, np.clip(angstrom, -0.5, 2.5), int(candidate.timestamp())
+    raise ValueError(f"no recent GEFS-Aerosols analysis: {last_error}")
+
+
+OSISAF = "https://thredds.met.no/thredds/fileServer/osisaf/met.no/ice/conc"
+
+
+def _polar_stereographic(lat, lon, proj):
+    """Snyder (1987) eq. 21-33/21-34, ellipsoidal polar stereographic in km
+    for an OSI SAF proj4 string (matches the files' own lat/lon to 3 m)."""
+    p = dict(re.findall(r"\+(\w+)=([-\d.]+)", proj))
+    a, b = float(p["a"]) / 1000, float(p["b"]) / 1000
+    e = math.sqrt(1 - (b / a) ** 2)
+    sign = -1.0 if float(p["lat_0"]) < 0 else 1.0
+    phi = np.radians(lat) * sign
+    lam = np.radians(lon - float(p["lon_0"])) * sign
+    def t_of(q):
+        s = np.sin(q)
+        return np.tan(np.pi / 4 - q / 2) / ((1 - e * s) / (1 + e * s)) ** (e / 2)
+    pc = math.radians(abs(float(p["lat_ts"])))
+    mc = math.cos(pc) / math.sqrt(1 - (e * math.sin(pc)) ** 2)
+    rho = a * mc * t_of(phi) / t_of(pc)
+    return sign * rho * np.sin(lam), -sign * rho * np.cos(lam)
+
+
+def sea_ice_field(now):
+    """Daily sea-ice concentration (EUMETSAT OSI SAF SSMIS, 10 km, both
+    hemispheres) on the cloud grid. Blue Marble has no sea ice: its oceans
+    are open water all year, so the winter pack (the Weddell Sea at its
+    September maximum) rendered as dark sea."""
+    import h5py
+    width, height = CLOUD_SIZE
+    lat = 90.0 - (np.arange(height) + 0.5) * 180.0 / height
+    lon = -180.0 + (np.arange(width) + 0.5) * 360.0 / width
+    ice = np.zeros((height, width), np.float32)
+    newest = None
+    for hemisphere, rows in (("nh", lat > 35), ("sh", lat < -35)):
+        for back in range(1, 5):
+            day = now - timedelta(days=back)
+            url = f"{OSISAF}/{day:%Y/%m}/ice_conc_{hemisphere}_polstere-100_multi_{day:%Y%m%d}1200.nc"
+            try:
+                payload = download(url, limit=30_000_000)
+                break
+            except (HTTPError, OSError):
+                continue
+        else:
+            raise ValueError(f"no recent OSI SAF {hemisphere} sea ice")
+        with h5py.File(io.BytesIO(payload)) as f:
+            proj = f["Polar_Stereographic_Grid"].attrs["proj4_string"].decode()
+            xc, yc = f["xc"][:], f["yc"][:]
+            concentration = f["ice_conc"][0].astype(np.float32)
+        concentration = np.where(concentration < 0, np.nan, concentration / 10000.0)
+        # Land and coast are unflagged fill: extend the pack a few cells so
+        # it meets the shore instead of leaving a ring of open water.
+        for _ in range(4):
+            padded = np.pad(concentration, 1, constant_values=np.nan)
+            neighbours = np.stack([padded[:-2, 1:-1], padded[2:, 1:-1], padded[1:-1, :-2], padded[1:-1, 2:]])
+            with np.errstate(invalid="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                fill = np.nanmean(neighbours, axis=0)
+            concentration = np.where(np.isnan(concentration), fill, concentration)
+        concentration = np.nan_to_num(concentration)
+        grid_lat, grid_lon = np.meshgrid(lat[rows], lon, indexing="ij")
+        x, y = _polar_stereographic(grid_lat, grid_lon, proj)
+        i = np.round((x - xc[0]) / (xc[1] - xc[0])).astype(np.int64)
+        j = np.round((y - yc[0]) / (yc[1] - yc[0])).astype(np.int64)
+        inside = (i >= 0) & (i < len(xc)) & (j >= 0) & (j < len(yc))
+        ice[rows] = np.where(inside, concentration[np.clip(j, 0, len(yc) - 1), np.clip(i, 0, len(xc) - 1)], 0.0)
+        newest = day if newest is None else min(newest, day)
+    return np.clip(ice, 0.0, 1.0), int(newest.replace(hour=12, minute=0, second=0, microsecond=0).timestamp())
+
+
+GMGSI = "https://noaa-gmgsi-pds.s3.amazonaws.com"
+CLOUD_SIZE = (4096, 2048)
+
+
+def gmgsi_latest(product, now):
+    """Newest hourly NOAA GMGSI (Global Mosaic of Geostationary Satellite
+    Imagery: GOES-East/West, Meteosat, Himawari) file of a channel."""
+    for back in range(8):
+        hour = (now - timedelta(hours=back)).replace(minute=0, second=0, microsecond=0)
+        listing = download(f"{GMGSI}/?list-type=2&prefix=GMGSI_{product}/{hour:%Y/%m/%d/%H}/", limit=500_000).decode()
+        keys = re.findall(r"<Key>([^<]+\.nc)</Key>", listing)
+        if keys:
+            return f"{GMGSI}/{keys[-1]}", hour
+    raise ValueError(f"no recent GMGSI {product} image")
+
+
+def gmgsi_equirect(payload, size=CLOUD_SIZE):
+    """GMGSI 0-255 counts (Mercator, +-72.7 deg) resampled bilinearly to an
+    equirectangular grid; NaN outside the mosaic or where data are missing."""
+    import h5py
+    with h5py.File(io.BytesIO(payload), "r") as stream:
+        data = stream["data"][0].astype(np.float32)
+        lat = stream["lat"][:, 0].astype(np.float64)
+        lon = stream["lon"][0, :].astype(np.float64)
+    data[~np.isfinite(data) | (data < 0) | (data > 255)] = np.nan
+    lon = np.where(lon > 179.95, lon - 360.0, lon)
+    if np.any(np.diff(lon) <= 0) or np.any(np.diff(lat) >= 0):
+        raise ValueError("unexpected GMGSI grid ordering")
+    width, height = size
+    target_lat = 90.0 - (np.arange(height) + 0.5) * 180.0 / height
+    target_lon = -180.0 + (np.arange(width) + 0.5) * 360.0 / width
+    rows = np.interp(-target_lat, -lat, np.arange(len(lat)), left=np.nan, right=np.nan)
+    cols = np.interp(target_lon, lon, np.arange(len(lon)), left=0.0, right=len(lon) - 1.0)
+    valid_rows = np.isfinite(rows)
+    r = np.where(valid_rows, rows, 0.0)
+    r0 = np.clip(np.floor(r).astype(int), 0, len(lat) - 2)
+    c0 = np.clip(np.floor(cols).astype(int), 0, len(lon) - 2)
+    fr = (r - r0)[:, None]
+    fc = (cols - c0)[None, :]
+    a = data[r0][:, c0] * (1 - fc) + data[r0][:, c0 + 1] * fc
+    b = data[r0 + 1][:, c0] * (1 - fc) + data[r0 + 1][:, c0 + 1] * fc
+    out = a * (1 - fr) + b * fr
+    out[~valid_rows] = np.nan
+    return out
+
+
+def solar_cosine(when, size=CLOUD_SIZE):
+    """Cosine of the solar zenith angle on the grid (NOAA low-precision
+    formulae, ~0.1 degree): enough to normalise visible brightness."""
+    width, height = size
+    day = when.timetuple().tm_yday
+    hours = when.hour + when.minute / 60 + when.second / 3600
+    gamma = 2 * math.pi / 365 * (day - 1 + (hours - 12) / 24)
+    declination = (0.006918 - 0.399912 * math.cos(gamma) + 0.070257 * math.sin(gamma)
+                   - 0.006758 * math.cos(2 * gamma) + 0.000907 * math.sin(2 * gamma)
+                   - 0.002697 * math.cos(3 * gamma) + 0.00148 * math.sin(3 * gamma))
+    equation = 229.18 * (0.000075 + 0.001868 * math.cos(gamma) - 0.032077 * math.sin(gamma)
+                         - 0.014615 * math.cos(2 * gamma) - 0.040849 * math.sin(2 * gamma))
+    lat = np.radians(90.0 - (np.arange(height) + 0.5) * 180.0 / height)[:, None]
+    lon = -180.0 + (np.arange(width) + 0.5) * 360.0 / width
+    hour_angle = np.radians((hours * 60 + equation + 4 * lon) / 4 - 180)[None, :]
+    return np.sin(lat) * math.sin(declination) + np.cos(lat) * math.cos(declination) * np.cos(hour_angle)
+
+
+def smoothstep(edge0, edge1, x):
+    t = np.clip((x - edge0) / (edge1 - edge0), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def _npy(array):
+    stream = io.BytesIO()
+    np.save(stream, array)
+    return stream.getvalue()
+
+
+def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
+    """Observed global cloud cover for right now from NOAA GMGSI.
+
+    Visible (daytime) and 10.7 um infrared counts are compared with decaying
+    clear-sky composites kept on disk (the darkest visible albedo and the
+    warmest infrared recently seen at each place), so deserts, snow and ice
+    stay clear and clouds are departures from the surface. Day: visible,
+    backed by cold infrared; night: infrared, plus the GFS model's cloud
+    where warm low cloud is invisible to infrared; beyond the mosaic (the
+    poles) GFS. Returns RGBA uint8 (R cover; G sea-ice concentration when
+    `sea_ice` is given, else cloud-top coldness; B and A the aerosol when
+    `aerosol` is given, else observed fraction and 1) and the observation
+    time.
+    """
+    vis_url, vis_hour = gmgsi_latest("VIS", now)
+    ir_url, ir_hour = gmgsi_latest("LW", now)
+    vis = gmgsi_equirect(download(vis_url, limit=40_000_000))
+    ir = gmgsi_equirect(download(ir_url, limit=40_000_000))
+    observed = datetime.fromtimestamp(min(vis_hour.timestamp(), ir_hour.timestamp()), timezone.utc) + timedelta(minutes=5)
+    cosine = solar_cosine(vis_hour + timedelta(minutes=5))
+    # Counts are ~255 sqrt(reflectance); normalise by the solar cosine.
+    albedo = (vis / 255.0) ** 2 / np.maximum(cosine, 0.12)
+    albedo[cosine < 0.1] = np.nan
+    state = DATA / "weather" / "clearsky.npz"
+    nan = np.full(albedo.shape, np.nan, np.float32)
+    try:
+        stored = np.load(state)
+        vis_clear = stored["vis"].astype(np.float32)
+        ir_day, ir_night = stored["ir_day"].astype(np.float32), stored["ir_night"].astype(np.float32)
+        hours = min(max((now.timestamp() - float(stored["time"])) / 3600, 0), 72)
+    except (OSError, KeyError, ValueError):
+        vis_clear, ir_day, ir_night, hours = nan.copy(), nan.copy(), nan.copy(), 0
+    # Composites relax upward (brighter / colder) over ~2 days unless
+    # re-observed clear, so snowfall or a wet season is followed. Infrared
+    # keeps day and night composites: clear deserts are ~30 counts warmer
+    # in the afternoon than before dawn.
+    vis_clear = np.fmin(vis_clear + 0.004 * hours, albedo)
+    is_day = cosine > 0.1
+    ir_day = np.fmin(ir_day + 0.6 * hours, np.where(is_day, ir, np.nan))
+    ir_night = np.fmin(ir_night + 0.6 * hours, np.where(is_day, np.nan, ir))
+    state.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=state.parent, prefix=".incoming-", suffix=".npz", delete=False) as stream:
+        np.savez_compressed(stream, vis=vis_clear.astype(np.float16), ir_day=ir_day.astype(np.float16),
+                            ir_night=ir_night.astype(np.float16), time=now.timestamp())
+        temporary = Path(stream.name)
+    os.replace(temporary, state)
+    # Until a composite exists, fall back to fixed surface guesses.
+    vis_surface = np.where(np.isfinite(vis_clear), np.minimum(vis_clear, 0.45), 0.12)
+    lat = 90.0 - (np.arange(CLOUD_SIZE[1]) + 0.5) * 180.0 / CLOUD_SIZE[1]
+    ir_fallback = np.broadcast_to((65 + 60 * (np.abs(lat) / 72.0) ** 2)[:, None], albedo.shape)
+    ir_clear = np.where(is_day, ir_day, ir_night)
+    ir_surface = np.where(np.isfinite(ir_clear), ir_clear, ir_fallback)
+    vis_cloud = smoothstep(0.02, 0.45, albedo - vis_surface)
+    ir_cloud = smoothstep(16.0, 60.0, ir - ir_surface)
+    day = smoothstep(0.10, 0.34, cosine)
+    def upsample(field):
+        return np.asarray(Image.fromarray(np.round(np.clip(field, 0, 1) * 255).astype(np.uint8))
+                          .resize(CLOUD_SIZE, Image.Resampling.BICUBIC)) / 255.0
+    gfs, low = upsample(gfs_cloud), upsample(gfs_low)
+    # Infrared cannot see warm low cloud: at night the model's low layer
+    # stands in for it (never its high cloud, which infrared observes).
+    cover = np.where(np.isfinite(vis_cloud), day * np.fmax(vis_cloud, 0.85 * np.nan_to_num(ir_cloud)), 0.0) \
+        + (1 - day) * np.fmax(np.nan_to_num(ir_cloud), 0.8 * low)
+    missing = ~np.isfinite(ir)
+    cover = np.where(missing, gfs, np.nan_to_num(cover))
+    height = np.where(missing, 0.3 * gfs, smoothstep(90.0, 215.0, np.nan_to_num(ir)))
+    # Blend the mosaic edge (+-72.7 deg) into the model over ~2 degrees.
+    edge = smoothstep(72.7, 70.5, np.abs(lat))[:, None]
+    cover = edge * cover + (1 - edge) * gfs
+    if aerosol is None:
+        extra = [1.0 - missing.astype(np.float32), np.ones_like(cover)]
+    else:
+        aod, angstrom = aerosol
+        extra = [upsample((angstrom + 0.5) / 3.0), upsample(np.sqrt(aod / 4.0))]
+    rgba = np.stack([cover, height if sea_ice is None else sea_ice, *extra], axis=-1)
+    return np.round(np.clip(rgba, 0, 1) * 255).astype(np.uint8), int(observed.timestamp())
+
+
 def weather():
     now = datetime.now(timezone.utc)
     cycle = now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0)
@@ -435,7 +745,7 @@ def weather():
         try:
             index = download(base + ".idx", limit=200_000).decode()
             ranges = select_ranges(index)
-            if existing.get("valid_unix_utc") == int(candidate.timestamp()) and existing.get("packing_version") == 3:
+            if existing.get("valid_unix_utc") == int(candidate.timestamp()) and existing.get("packing_version") == 4 and (DATA / "weather" / "gfs-low-cloud.npy").exists():
                 old = Path(existing["texture"]).read_bytes()
                 if hashlib.sha256(old).hexdigest() != existing["sha256"]:
                     raise ValueError("cached weather checksum mismatch")
@@ -451,6 +761,8 @@ def weather():
                 cape = np.clip(fields["cape"] / 4000, 0, 1)
                 rain = np.clip(np.log1p(np.maximum(fields["rain"], 0) * 3600) / math.log(51), 0, 1)
                 packed = np.round(np.stack((cloud, cape, rain), axis=-1) * 255).astype(np.uint8)
+                low_cloud = np.clip(fields["low"] / 100, 0, 1)
+                atomic_bytes(DATA / "weather" / "gfs-low-cloud.npy", _npy(low_cloud.astype(np.float16)))
             try:
                 aurora, aurora_utc = aurora_field()
             except (OSError, ValueError, KeyError) as error:
@@ -458,19 +770,52 @@ def weather():
                 aurora, aurora_utc = np.zeros((720, 1440), dtype=np.uint8), 0
             generation = DATA / "weather" / f"{candidate:%Y%m%dT%H}-{int(now.timestamp())}"
             asset = preview(generation, "fields", packed, alpha=aurora)
-            metadata = {"schema_version": 1, "packing_version": 3, "source": "NOAA-GFS", "kind": "model-analysis", "url": base,
+            clouds_meta = {}
+            try:
+                try:
+                    low_cloud = np.load(DATA / "weather" / "gfs-low-cloud.npy").astype(np.float32)
+                except (OSError, ValueError):
+                    low_cloud = packed[:, :, 0] / 255.0
+                try:
+                    aod, angstrom, aerosol_utc = aerosol_field(now)
+                    aerosol = (aod, angstrom)
+                except (HTTPError, OSError, ValueError, KeyError) as error:
+                    print(f"GEFS-Aerosols unavailable, climatological haze stays: {error}", file=sys.stderr, flush=True)
+                    aerosol, aerosol_utc = None, 0
+                try:
+                    sea_ice, sea_ice_utc = sea_ice_field(now)
+                except (HTTPError, OSError, ValueError, KeyError) as error:
+                    print(f"OSI SAF sea ice unavailable, oceans stay open: {error}", file=sys.stderr, flush=True)
+                    sea_ice, sea_ice_utc = None, 0
+                clouds, clouds_utc = live_clouds(now, packed[:, :, 0] / 255.0, low_cloud, aerosol, sea_ice)
+                clouds_asset = preview(generation, "clouds", clouds[:, :, :3], alpha=clouds[:, :, 3])
+                clouds_meta = {"clouds_texture": str(generation / clouds_asset["file"]), "clouds_sha256": clouds_asset["sha256"],
+                               "clouds_unix_utc": clouds_utc, "clouds_source": "NOAA-NESDIS-GMGSI-VIS-LW+GFS",
+                               "clouds_width": CLOUD_SIZE[0], "clouds_height": CLOUD_SIZE[1],
+                               "aerosol_unix_utc": aerosol_utc, "aerosol_source": "NOAA-GEFS-Aerosols-analysis",
+                               "sea_ice_unix_utc": sea_ice_utc, "sea_ice_source": "EUMETSAT-OSI-SAF-OSI-401",
+                               "clouds_channels": {"r": "cloud cover",
+                                                   "g": "sea-ice concentration" if sea_ice is not None else "cloud-top coldness",
+                                                   "b": "(Angstrom exponent 440-645 nm + 0.5) / 3" if aerosol else "observed fraction",
+                                                   "a": "sqrt(aerosol optical depth 550 nm / 4)" if aerosol else "1"}}
+            except (HTTPError, OSError, ValueError, KeyError, ImportError) as error:
+                print(f"GMGSI clouds unavailable, static clouds stay: {error}", file=sys.stderr, flush=True)
+            metadata = {"schema_version": 1, "packing_version": 4, "source": "NOAA-GFS", "kind": "model-analysis", "url": base,
                         "valid_unix_utc": int(candidate.timestamp()), "downloaded_unix_utc": int(now.timestamp()),
                         "aurora_unix_utc": aurora_utc, "aurora_source": "NOAA-SWPC-OVATION-forecast",
                         "texture": str(generation / asset["file"]), "sha256": asset["sha256"],
                         "width": 1440, "height": 720, "lightning": "simulated-from-CAPE-and-precipitation",
-                        "channels": {"r": "cloud fraction * (1-exp(-75 * column cloud water kg/m2))", "g": "CAPE / 4000 J/kg", "b": "log1p(precipitation mm/h) / log(51)", "a": "OVATION aurora probability / 100 percent"}}
+                        "channels": {"r": "cloud fraction * (1-exp(-75 * column cloud water kg/m2))", "g": "CAPE / 4000 J/kg", "b": "log1p(precipitation mm/h) / log(51)", "a": "OVATION aurora probability / 100 percent"},
+                        **clouds_meta}
             atomic_json(existing_path, metadata)
             snapshots = sorted(path for path in existing_path.parent.iterdir()
                                if path.is_dir() and re.fullmatch(r"\d{8}T\d{2}-\d{10}", path.name))
+            owned = {"fields.bgra", "fields.bgra.json", "clouds.bgra", "clouds.bgra.json"}
             for obsolete in snapshots[:-8]:
-                if {path.name for path in obsolete.iterdir()} == {"fields.bgra", "fields.bgra.json"}:
-                    (obsolete / "fields.bgra").unlink()
-                    (obsolete / "fields.bgra.json").unlink()
+                names = {path.name for path in obsolete.iterdir()}
+                if {"fields.bgra", "fields.bgra.json"} <= names <= owned:
+                    for name in names:
+                        (obsolete / name).unlink()
                     obsolete.rmdir()
             print(f"Weather ready: NOAA GFS {candidate.isoformat()}", flush=True)
             return metadata
@@ -494,8 +839,9 @@ def notify_renderer():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["fetch", "build", "weather", "watch", "test", "verify"])
+    parser.add_argument("command", choices=["fetch", "build", "weather", "watch", "test", "verify", "aurora-preview"])
     parser.add_argument("--width", type=int, choices=[4096, 8192], default=8192)
+    parser.add_argument("--kp", type=float, default=7.0, help="storm strength for aurora-preview (0-9)")
     args = parser.parse_args()
     if args.command == "verify":
         from weather_verify import verify
@@ -511,6 +857,9 @@ def main():
         build(args.width)
     elif args.command == "weather":
         weather()
+    elif args.command == "aurora-preview":
+        aurora_preview(min(max(args.kp, 0.0), 9.0))
+        notify_renderer()
     else:
         while True:
             try:

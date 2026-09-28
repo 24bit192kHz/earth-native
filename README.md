@@ -19,21 +19,25 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 - **The sky, right now.** Sun, Moon and planets come from Astronomy Engine and
   match JPL Horizons to the arc-minute; day and night, the terminator, lunar
   phase, and even **solar eclipse shadows** are where they really are.
-- **NASA imagery.** Blue Marble Next Generation surface, Black Marble city
-  lights, the Blue Marble cloud map, LRO Moon, and a **16K Hipparcos/Tycho/Gaia
-  star map** — calibrated against real DSCOVR/EPIC photos of Earth.
-- **Real atmosphere.** Rayleigh scattering with published optical depths,
-  aerosols, orange twilight at the terminator, a thin blue limb, Cox–Munk
-  sunglint on the oceans, moonlit clouds and night-side airglow.
-- **Live space weather.** A volumetric **aurora** placed by NOAA's OVATION
-  forecast, with green and red emission layers and moving curtains; lightning
-  flashes where NOAA GFS reports thunderstorms.
+- **NASA imagery at 500 m.** Blue Marble Next Generation for the current
+  month, streamed as a 65536×32768 virtual texture, Black Marble city lights,
+  GEBCO 2026 relief, LRO Moon, and Hipparcos stars drawn one by one.
+- **Real atmosphere.** Multiple scattering with published Rayleigh, ozone and
+  aerosol constants in true sRGB colour bands: a blue limb, cyan haze, orange
+  twilight, Cox–Munk sunglint, moonlit clouds and night-side airglow.
+- **Live Earth.** Today's clouds from NOAA's geostationary mosaic, today's
+  dust and smoke haze from NOAA GEFS-Aerosols, today's sea ice from EUMETSAT
+  OSI SAF, a volumetric **aurora** placed by NOAA's OVATION forecast, and
+  lightning where NOAA GFS reports thunderstorms.
+- **The view from the ISS.** A camera riding the real ISS orbit with a
+  window-camera look: auto exposure, sun glare and starburst, bloom,
+  vignetting and grain.
 - **Every planet.** Mercury, Venus, Mars, Jupiter, Saturn (with rings),
   Uranus and Neptune plus the Moon — each with its IAU axis and rotation,
   real flattening and its own limb-darkening law.
-- **Built to sit in the background.** ~270 MiB VRAM (block-compressed maps),
-  ~0.3 ms of GPU time per frame, motion-gated redraws at 15 fps, idle CPU
-  priority, one analytic fullscreen triangle per pass.
+- **Built to sit in the background.** Block-compressed maps and a streamed
+  virtual texture, a few ms of GPU time per frame, motion-gated redraws
+  (30 fps while riding the ISS), idle CPU priority.
 - **Native everywhere.** Wayland via wlr-layer-shell (Hyprland, Sway, KDE
   Plasma, niri, river, labwc, Wayfire…) and Xorg via an EWMH desktop window on
   every monitor. Multi-monitor desktops share one continuous camera.
@@ -101,13 +105,23 @@ earth-native status                  # one-line state: outputs, fps, GPU time, d
 earth-native body saturn             # earth moon mercury venus mars jupiter saturn uranus neptune
 earth-native control                 # take the monitor under the cursor for interaction
 earth-native time unix 1712600280    # jump to a moment (here: the 2024 eclipse); `time live` to return
-earth-native camera 180 20 8         # fixed yaw/pitch/distance; `camera live` to follow the ISS
+earth-native camera live             # ride the ISS: the view from its window (default)
+earth-native camera iss 90 auto 78   # from the ISS: heading, pitch below level ("auto"), lens FOV
+earth-native camera pov 23 45 420 90 auto   # from any lat/lon/altitude (km), heading, pitch
+earth-native camera globe            # the whole Earth, following the ISS
+earth-native camera next             # switch between the ISS window and the globe
+earth-native camera aurora           # hover near tonight's strongest aurora and face it
+earth-native camera zoom in          # or `zoom out`: the lens from the ISS, the distance on the globe
+earth-native camera reset            # look ahead again with the default 78° lens
+earth-native camera 180 20 8         # fixed yaw/pitch/distance
 earth-native capture_frame           # write JPEG + JSON readbacks of every output
 earth-native stop
 ```
 
-In control mode: drag to orbit, scroll or Q/E to zoom, arrow keys to orbit,
-**Ctrl+←/→** to tour the planets, Esc to hand the desktop back.
+In control mode: drag (or the arrow keys) to look around from the ISS or to
+orbit the globe, scroll or Q/E to zoom, **C** to switch ISS window/globe,
+**R** to reset the look, **Ctrl+←/→** to tour the planets, Esc to hand the
+desktop back.
 
 | Variable | Effect |
 | --- | --- |
@@ -121,7 +135,7 @@ In control mode: drag to orbit, scroll or Q/E to zoom, arrow keys to orbit,
 A single Rust binary renders straight to each monitor's swapchain: stars
 first, then the body as one fullscreen triangle whose fragment shader
 ray-intersects the exact ellipsoid and evaluates the lighting. The physics,
-constants and the verification against JPL Horizons and DSCOVR/EPIC are in
+constants and the verification against JPL Horizons and ISS footage are in
 [docs/PHYSICS.md](docs/PHYSICS.md); the data sources and the texture
 pipeline are in [docs/DATA.md](docs/DATA.md).
 

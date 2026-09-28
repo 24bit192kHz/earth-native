@@ -5,9 +5,14 @@ screenshot), and crop it 1:1 around that feature.
 
 usage: earth-native-aim TAG UNIX CAM_LAT CAM_LON DIST [TGT_LAT TGT_LON]
                         [--crop WxH] [--output NAME]
+       earth-native-aim TAG UNIX --pov LAT LON ALT_KM HEADING PITCH|auto [FOV]
+                        [--crop WxH] [--output NAME]
   UNIX     : UTC to pin (e.g. `date +%s` for now)
   CAM_*    : geographic point under the camera; DIST: `camera` distance argument
   TGT_*    : point to crop around (default: the sub-camera point)
+  --pov    : ISS-style window view from LAT LON at ALT_KM, looking HEADING
+             degrees from north, PITCH below level ("auto" puts the horizon
+             ~20% from the top); saved uncropped unless --crop is given
   --output : Wayland output to read back (default: the widest one)
 Writes $EARTH_NATIVE_AIM_DIR/TAG.jpg (default /tmp/earth-native-aim), prints
 the pose/pixel JSON, and restores live camera and time.
@@ -72,6 +77,8 @@ def main():
     crop = "1100x700"
     if "--crop" in a:
         i = a.index("--crop"); crop = a[i + 1]; del a[i:i + 2]
+    if "--pov" in a:
+        return pov(a, crop if "--crop" in sys.argv else None)
     tag, unix, clat, clon, dist = a[0], a[1], float(a[2]), float(a[3]), a[4]
     tlat, tlon = (float(a[5]), float(a[6])) if len(a) >= 7 else (clat, clon)
     run("time", "unix", unix)
@@ -99,6 +106,30 @@ def main():
     print(json.dumps({"out": out, "target_px": [round(px), round(py)], "yaw": round(yaw, 2), "pitch": round(pitch, 2),
                       "cam_az_el": [round(got[0], 2), round(got[1], 2)], "want_az_el": [round(want_az, 2), round(want_el, 2)],
                       "alt_km": round(fr["camera_altitude_km"]), "mean": round(cap["mean_channel"], 2)}))
+    run("camera", "live"); run("time", "live")
+
+
+def pov(a, crop):
+    i = a.index("--pov")
+    tag, unix, view = a[0], a[1], a[i + 1:]
+    run("time", "unix", unix)
+    run("camera", "pov", *view)
+    # Cuts snap the exposure, but the virtual texture streams its fine pages
+    # over the next frames: let both settle before reading back.
+    time.sleep(4.0)
+    cap = capture()
+    out = os.path.join(S, f"{tag}.jpg")
+    geometry = []
+    if crop:
+        w, h = map(int, crop.split("x"))
+        geometry = ["-gravity", "center", "-crop", f"{w}x{h}+0+0", "+repage"]
+    subprocess.run(["magick", cap["image"], *geometry, "-quality", "95", out], check=True)
+    for q in (cap["image"], cap["image"].rsplit(".", 1)[0] + ".json"):
+        if os.path.exists(q):
+            os.remove(q)
+    fr = cap["frame"]
+    print(json.dumps({"out": out, "pov": view, "alt_km": round(fr["camera_altitude_km"]),
+                      "mean": round(cap["mean_channel"], 2)}))
     run("camera", "live"); run("time", "live")
 
 

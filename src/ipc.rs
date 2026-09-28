@@ -18,6 +18,22 @@ pub enum Request {
     WeatherReload,
     Camera { yaw: String, pitch: String, distance: String },
     CameraLive,
+    /// The far globe view centred under the ISS.
+    CameraGlobe,
+    /// Switch between the ISS window view and the globe view.
+    CameraNext,
+    /// Zoom in (positive) or out by lens/orbit steps.
+    CameraZoom { steps: i32 },
+    /// Look straight ahead again with the default lens.
+    CameraReset,
+    /// Face the strongest aurora in the dark right now, from ISS altitude.
+    CameraAurora,
+    /// Onboard view: heading from the flight direction, pitch below the
+    /// horizontal ("auto" frames the horizon), horizontal field of view.
+    CameraIss { heading: String, pitch: String, fov: String },
+    /// Fixed onboard-style view over a point: latitude, longitude, altitude
+    /// km, heading from north, pitch ("auto" allowed), field of view.
+    CameraPov { latitude: String, longitude: String, altitude: String, heading: String, pitch: String, fov: String },
     Stop,
     Control { monitor: String },
     Body { body: String },
@@ -39,6 +55,14 @@ impl Request {
             Self::WeatherReload => "weather reload\n".to_owned(),
             Self::Camera { yaw, pitch, distance } => format!("camera {yaw} {pitch} {distance}\n"),
             Self::CameraLive => "camera live\n".to_owned(),
+            Self::CameraGlobe => "camera globe\n".to_owned(),
+            Self::CameraNext => "camera next\n".to_owned(),
+            Self::CameraZoom { steps } => format!("camera zoom {}\n", if *steps > 0 { "in" } else { "out" }),
+            Self::CameraReset => "camera reset\n".to_owned(),
+            Self::CameraAurora => "camera aurora\n".to_owned(),
+            Self::CameraIss { heading, pitch, fov } => format!("camera iss {heading} {pitch} {fov}\n"),
+            Self::CameraPov { latitude, longitude, altitude, heading, pitch, fov } =>
+                format!("camera pov {latitude} {longitude} {altitude} {heading} {pitch} {fov}\n"),
             Self::Stop => "stop\n".to_owned(),
             Self::Control { monitor } => format!("control {monitor}\n"),
             Self::Body { body } => format!("body {body}\n"),
@@ -60,6 +84,19 @@ impl Request {
             ["capture_frame"] => Ok(Self::CaptureFrame),
             ["weather", "reload"] => Ok(Self::WeatherReload),
             ["camera", "live"] => Ok(Self::CameraLive),
+            ["camera", "globe"] => Ok(Self::CameraGlobe),
+            ["camera", "next"] => Ok(Self::CameraNext),
+            ["camera", "zoom", "in"] => Ok(Self::CameraZoom { steps: 1 }),
+            ["camera", "zoom", "out"] => Ok(Self::CameraZoom { steps: -1 }),
+            ["camera", "reset"] => Ok(Self::CameraReset),
+            ["camera", "aurora"] => Ok(Self::CameraAurora),
+            ["camera", "iss", heading, pitch, fov] => Ok(Self::CameraIss {
+                heading: (*heading).to_owned(), pitch: (*pitch).to_owned(), fov: (*fov).to_owned(),
+            }),
+            ["camera", "pov", latitude, longitude, altitude, heading, pitch, fov] => Ok(Self::CameraPov {
+                latitude: (*latitude).to_owned(), longitude: (*longitude).to_owned(), altitude: (*altitude).to_owned(),
+                heading: (*heading).to_owned(), pitch: (*pitch).to_owned(), fov: (*fov).to_owned(),
+            }),
             ["camera", yaw, pitch, distance] => Ok(Self::Camera {
                 yaw: (*yaw).to_owned(), pitch: (*pitch).to_owned(), distance: (*distance).to_owned(),
             }),
@@ -86,7 +123,7 @@ impl Request {
                 seconds: seconds.parse().map_err(|_| "Unix seconds must be an i64")?,
             }),
             ["time", "live"] => Ok(Self::TimeLive),
-            _ => Err("expected: status | stop | capture_frame | camera {YAW PITCH DISTANCE|live} | control <monitor> | body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune} | celestial {show|freeze|sun|moon|live} | time {show|unix SECONDS|live}"),
+            _ => Err("expected: status | stop | capture_frame | camera {live|globe|next|aurora|zoom in|zoom out|reset|iss HEADING PITCH FOV|pov LAT LON ALT_KM HEADING PITCH FOV|YAW PITCH DISTANCE} | control <monitor> | body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune} | celestial {show|freeze|sun|moon|live} | time {show|unix SECONDS|live}"),
         }
     }
 }
@@ -278,6 +315,18 @@ mod tests {
         assert!(Request::parse("celestial moon 1 2 extra").is_err());
         assert!(Request::parse("time unix nope").is_err());
         assert!(Request::parse("time unix 1 extra").is_err());
+    }
+
+    #[test]
+    fn camera_view_requests_round_trip() {
+        for request in [Request::CameraNext, Request::CameraReset, Request::CameraAurora,
+            Request::CameraZoom { steps: 1 }, Request::CameraZoom { steps: -1 }] {
+            assert_eq!(Request::parse(&request.encode()), Ok(request));
+        }
+        assert_eq!(Request::parse("camera zoom in"), Ok(Request::CameraZoom { steps: 1 }));
+        assert!(Request::parse("camera zoom").is_err());
+        assert!(Request::parse("camera zoom sideways").is_err());
+        assert!(Request::parse("camera next extra").is_err());
     }
 
     #[test]

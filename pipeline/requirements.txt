@@ -2,3 +2,4 @@ numpy>=2
 pillow>=11
 eccodes>=2.38
 OpenEXR>=3.3
+h5py>=3.11

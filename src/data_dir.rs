@@ -21,6 +21,7 @@ const MAPS: &[(&str, &str, &[&str])] = &[
     ("EARTH_NATIVE_SURFACE_NORMAL_EAST", "normal-east", &["bgra"]),
     ("EARTH_NATIVE_SURFACE_NORMAL_WEST", "normal-west", &["bgra"]),
     ("EARTH_NATIVE_HEIGHT", "height", &["bc4", "bgra"]),
+    ("EARTH_NATIVE_RELIEF", "relief", &["bc5"]),
     ("EARTH_NATIVE_MOON", "moon", &["bc1", "bgra"]),
     ("EARTH_NATIVE_MERCURY", "mercury", &["bc1", "bgra"]),
     ("EARTH_NATIVE_VENUS", "venus", &["bc1", "bgra"]),
@@ -103,10 +104,65 @@ pub fn configure_environment() -> Option<PathBuf> {
             env::set_var(variable, path);
         }
     }
+    // The 500 m Blue Marble virtual texture: the month's own composite
+    // (snow, vegetation and sea ice follow the season) if baked, else the
+    // nearest baked month, else any.
+    if env::var_os("EARTH_NATIVE_EARTHVT").is_none() {
+        let mut names: Vec<String> = months_nearest_first(current_month())
+            .map(|month| format!("earth-day-{month:02}.earthvt"))
+            .collect();
+        names.push("earth-day.earthvt".to_owned());
+        if let Some(path) = names.iter().flat_map(|name| [textures.join(name), data_dir.join("vt").join(name)])
+            .find(|path| path.is_file())
+        {
+            env::set_var("EARTH_NATIVE_EARTHVT", path);
+        }
+    }
     // Point at the weather feed's manifest even before it exists, so a feed
     // started later is picked up by `earth-native weather reload`.
     if env::var_os("EARTH_NATIVE_WEATHER_MANIFEST").is_none() {
         env::set_var("EARTH_NATIVE_WEATHER_MANIFEST", data_dir.join("weather/current.json"));
     }
     Some(textures)
+}
+
+/// UTC calendar month (1-12) of the system clock.
+fn current_month() -> u32 {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() / 86_400) as i64;
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    (if mp < 10 { mp + 3 } else { mp - 9 }) as u32
+}
+
+/// All twelve months ordered by seasonal distance from `month`: the month
+/// itself, the next, the previous, two ahead, two back, and so on.
+fn months_nearest_first(month: u32) -> impl Iterator<Item = u32> {
+    (0..12i32).map(move |step| {
+        let offset = if step % 2 == 1 { (step + 1) / 2 } else { -(step / 2) };
+        (month as i32 - 1 + offset).rem_euclid(12) as u32 + 1
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn month_is_in_range() {
+        assert!((1..=12).contains(&super::current_month()));
+    }
+
+    #[test]
+    fn months_are_tried_nearest_first() {
+        let order: Vec<u32> = super::months_nearest_first(1).collect();
+        assert_eq!(order, [1, 2, 12, 3, 11, 4, 10, 5, 9, 6, 8, 7]);
+        let mut sorted = super::months_nearest_first(9).collect::<Vec<_>>();
+        sorted.sort();
+        assert_eq!(sorted, (1..=12).collect::<Vec<_>>());
+    }
 }

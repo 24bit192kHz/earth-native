@@ -36,42 +36,72 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
 
 ## Earth
 
-- **Atmosphere:** single scattering on a 100 km shell with a precomputed
-  molecular column table (512×1, exact integration of an 8.5 km scale height,
-  < 0.05 % error at grazing angles). Rayleigh optical depths follow Bodhaine
-  et al. (1999) at 680/550/440 nm (0.041/0.097/0.243). Sunlight reaching the
-  scattering air is attenuated along its own path with the single-scattering
-  average of sun- and view-path extinction, which gives the orange twilight
-  band at the terminator while the full-disk rim stays blue.
-- **Aerosols:** optical depth 0.05 (clean marine), Henyey–Greenstein g = 0.72
-  + 15 % isotropic, single-scattering albedo 0.95; they also dim the surface.
+- **Atmosphere:** physically based multiple scattering. `src/sky.rs` bakes
+  the Bruneton & Neyret (2008) transmittance table (256×64), Hillaire's
+  (2020) multiple-scattering table (32²) and a ground/cloud-top sky
+  irradiance table (64×16) at startup; the shader marches every view ray
+  through the 100 km shell, lighting each sample by the Sun and (at night)
+  the Moon. Air: Rayleigh scattering (Bodhaine et al. 1999 dispersion,
+  13.6e-3 km⁻¹ at 550 nm, 8 km scale height). Ozone: Chappuis absorption
+  (Serdyuchenko/Gorshelev 2013 cross sections at 223 K) in a 25 km layer of
+  ~300 DU. Aerosol: Cornette–Shanks g = 0.68, single-scattering albedo 0.94,
+  1.8 km scale height. Units: a white Lambertian surface under a zenith Sun at
+  1 AU is 1.
+- **Colour bands, not wavelengths:** every coefficient is its spectrum
+  averaged over one sRGB colour-matching function (CIE 1931 via the
+  Wyman–Sloan–Shirley fit and the sRGB matrix) under a 5778 K Sun, which is
+  exact for thin paths. With single wavelengths (650/550/450 nm) ozone
+  absorbed green more than red, although the red band spans the 603 nm
+  Chappuis peak, and long grazing paths turned magenta. With bands, a ray
+  grazing 20 km up transmits blue > green > red (the blue ozone band above the
+  orange sunset layer; Hulburt 1953), and the far haze turns from lavender to
+  blue. Over the open ocean in the reference ISS video (linear red/green of
+  the haze 0.53), the render went from 0.70 to 0.46.
+- **Aerosol, live:** the NOAA GEFS-Aerosols analysis (GOCART, 0.25°, every
+  6 h) gives the 550 nm optical depth and the 440–645 nm Ångström exponent
+  (dust ≈ 0.2, smoke and pollution ≈ 1.5). Each ray takes the load where it
+  meets the haze layer (its ground point, or the tangent point at the limb).
+  Sunlight at the ground is dimmed and reddened by the local excess over the
+  tables' climatology (τ = 0.18, α = 0.5), and what that excess scatters goes
+  into the diffuse sky. Without the feed, the climatology is used.
 - **Solar eclipses:** the exact area overlap of the solar and lunar discs as
   seen from every surface/cloud point dims direct light and skylight.
-- **Surface:** NASA Blue Marble NG albedo (saturation × 0.72, calibrated
-  against DSCOVR/EPIC true colour), relief normals from GEBCO, Beer–Lambert
-  reddening of sunlight, Cox–Munk sunglint (7 m/s wind slope variance).
-- **Clouds:** NASA Blue Marble cloud composite on a 5.5 km shell (global mean
-  cloud-top height). Opacity saturates with brightness (thick decks opaque,
-  thin cirrus translucent), with sun-traced cloud shadows.
-- **Night:** VIIRS Black Marble lights coloured from intensity (sodium to
-  white), moonlight from Allen's lunar phase law and distance with a
-  night-adaptation gain (like a dark-adapted eye or an ISS night photo),
-  airglow at 95 km integrated over the pixel footprint.
-- **Aurora:** a 12-step volumetric march from 90 to 320 km. NOAA OVATION
-  probabilities place the oval; arcs follow its contours; green 557.7 nm
-  (peak ~110 km), red 630 nm (~240 km) and N₂⁺ violet profiles; rays and
-  folds animate on seconds-to-minutes scales.
+- **Surface:** NASA Blue Marble Next Generation at 500 m, the current
+  month's composite (snow and vegetation follow the season; the nearest
+  baked month stands in), streamed as a 65536×32768 BC7 virtual texture
+  (256 px pages, GPU feedback). Relief is shaded from GEBCO 2026 15″ normals
+  (BC5, 32768×16384) and exaggerated with distance (2.5 × 1.3^mip), as the
+  eye reads it from orbit. The open ocean uses Case-1 water-leaving
+  reflectance plus Cox–Munk sunglint and Fresnel sky reflection. Blue Marble
+  has no sea ice, so the daily EUMETSAT OSI SAF concentration (10 km, both
+  poles) lays pack ice over open water (albedo 0.70/0.75/0.80, no glint).
+- **Clouds, live:** hourly NOAA GMGSI geostationary mosaics (visible by day,
+  10.7 µm infrared by night, ~10 km). Each is compared with a decaying
+  clear-sky composite of the same place, so deserts, snow and sea ice are
+  not mistaken for cloud. GFS low cloud fills in warm low cloud at night, and
+  GFS covers the poles beyond the mosaic. Sub-grid structure comes from a
+  fractal projected triplanar from the sphere (isotropic, no lat/lon shear),
+  mixed with the 1 km texture of the NASA cloud composite. The shell is at
+  5.5 km with Sun-traced shadows. Without the feed, the NASA composite is
+  shown as it is.
+- **Night:** VIIRS Black Marble 2016 lights at 500 m (stored 32768×16384),
+  coloured from intensity (sodium to white), city glow under low cloud,
+  moonlight from Allen's lunar phase law and distance, and O(¹S) airglow
+  integrated as limb columns at 95 km.
+- **Aurora:** a volumetric march from 90 to 320 km (~25 km steps, 10-40).
+  NOAA OVATION probabilities place the oval and set its activity. As in
+  DMSP/VIIRS and ISS imagery, a patchy diffuse glow fills the equatorward
+  half, and discrete arcs sit on the poleward flank at fixed probability
+  contours (4.5-60 %), so quiet ovals show one or two and storms up to six.
+  Brightness follows the local activity: diffuse ~1 kR, arcs from ~20 kR
+  (IBC II) to ~130 kR (IBC III-IV) in storms, which seen along the limb
+  outshine moonlit cloud, as in storm-time ISS footage. Each
+  arc folds, breaks into segments and fades on its own, so they are not
+  closed rings. Green 557.7 nm (peak ~110 km), red 630 nm (~240 km) and N₂⁺
+  violet profiles; field-aligned rays make curtains at the limb. Emission
+  fades out through nautical twilight at the emission point.
 - **Lightning:** flashes cluster where NOAA GFS reports convective energy,
   precipitation and cloud water.
-
-Calibration against a real DSCOVR/EPIC frame (2026-09-25 16:34:46 UTC, same
-sub-observer point, area-weighted disk statistics):
-
-| Statistic | EPIC | earth-native |
-| --- | --- | --- |
-| Clear-ocean sRGB | 39, 53, 70 | 47, 60, 78 |
-| White-cloud area (L > 170) | 7.0 % | 6.6 % |
-| Disk mean colour | 96, 101, 107 | within ~3 % |
 
 ## Moon and planets
 
@@ -85,19 +115,65 @@ Exposure adapts to each body (as a camera would).
 
 ## Stars
 
-NASA SVS Deep Star Maps 2020 (Hipparcos-2, Tycho-2, Gaia DR2), 16K HDR,
-tone-mapped so the brightest 0.002 % of texels reach white, BC1 with a full
-mip chain, sampled in the J2000 frame rotated by the current sidereal time.
+Stars are geometry, not an image: every Hipparcos star with V ≤ 8.0
+(41 394 stars, `assets/stars/`) is its own quad in a Vulkan draw
+(`shaders/stars_points.vert/.frag`), shaded as a Gaussian point-spread
+function. Each frame the vertex shader places every star for the current
+UTC: Hipparcos proper motion from epoch J1991.25, then one J2000-to-world
+matrix from Astronomy Engine (precession, nutation, apparent sidereal time,
+the same frame as the Sun and Moon), then annual aberration from Earth's
+barycentric velocity. Checked against the 2026-08-23 Sun–Regulus
+conjunction: Regulus renders 0.55° from the Sun's centre, the true value.
+Brightness steps 1.8× per magnitude (the eye's and a photograph's
+compressive response), the PSF widens for bright stars, and colour follows
+B−V through blackbody chromaticities; saturation acts on luminance so hues
+survive.
 
-## Presentation
+NASA SVS Deep Star Maps 2020 (16K HDR, BC1) supplies only the unresolved
+background: a 4-tap minimum filter removes its point stars, and it is shown
+colourless (the eye sees the Milky Way with rods; the map's photographic
+H-alpha red is not visible). It is rotated by sidereal time plus precession
+in right ascension, within ~0.1° of the catalogue stars.
 
-A filmic curve (small toe, exponential shoulder above 0.72) maps linear
-radiance to the SDR swapchain. The Earth pass is scissored to the atmosphere
-(or aurora) shell; presents are motion-gated so an idle desktop re-renders
-only when the scene moves by at least half a pixel.
+## Camera
+
+The scene renders to an HDR (RGBA16F) target, then passes through a model of
+a full-frame camera behind an ISS window (`shaders/post.frag`):
+
+- **Point of view:** `camera live` rides the ISS (SGP4 position and velocity,
+  level local-horizontal attitude), 78° horizontal lens, pitched so the
+  horizon sits ~20 % from the top, 30 fps while riding.
+- **Auto exposure:** metered on a 64 px mip: the 85th-percentile Earth
+  luminance, or a highlight rule when a bright source dominates. Daylight
+  keeps a "sunny 16" exposure; at night the camera opens up for moonlight,
+  city lights and aurora and holds 1.6 stops under the meter for a night
+  look. The Sun's lens glare is added after metering, so it is metered
+  separately over the whole frame: the exposure keeps the mean glare under
+  8 % and 92 % of the frame under half white, and an open Sun in frame caps
+  it at daylight. Cuts snap the exposure.
+- **The Moon in the sky:** Lunar-Lambert photometry (bright to the limb at
+  full Moon), the SVS map (stretched to a mean albedo of ~0.5) scaled to the
+  real normal albedo of 0.12, and local adaptation: a single night exposure
+  would clip the Moon ~13 stops over into a flat white disc, so the disc is
+  compressed as the eye or an HDR merge sees it, with the maria readable, and
+  its glare is scaled to match. This is the one presentation choice that
+  departs from a single photographic exposure.
+- **Optics:** bloom from the mip pyramid, an analytic veiling-glare point
+  spread and an 18-ray diffraction starburst for the Sun and the Moon (with a
+  lens-acceptance cut-off off-frame), ghosts, and 60 %-corrected vignetting.
+- **Development:** log-space contrast around mid-grey, a ×1.3 saturation
+  (the "vivid" picture style of processed Earth-observation frames), a filmic
+  curve with a long shoulder, gain-dependent sensor grain and dithered 8-bit
+  output.
+
+Presents are motion-gated, so an idle desktop re-renders only when the scene
+moves by at least half a pixel, or while the virtual texture is streaming.
 
 ## Remaining approximations
 
 Spherical Earth surface (WGS84 equatorial radius), UTC ≈ UT1 (< 0.9 s),
-single scattering, static historical NASA cloud map, empirical aurora
-structure, planet texture longitude origins as published by the source.
+three colour bands (exact only for thin paths), aerosol sampled once per ray
+(the Sun's path uses the tables' climatology), a 2004 surface composite
+(seasonal but not today's snow or vegetation), clouds as one 5.5 km shell,
+empirical aurora structure, and camera colour rendering (the video's haze is
+still more cyan than ours: blue/green 1.59 against 2.2).

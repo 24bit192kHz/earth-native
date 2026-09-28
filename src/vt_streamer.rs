@@ -200,6 +200,13 @@ impl VirtualTextureStreamer {
             .find(|layer| layer.channel == channel)
     }
 
+    /// True while requested pages are queued, being read, or awaiting
+    /// upload: the renderer keeps drawing frames until the view is resident
+    /// (a static view is otherwise motion-gated and would stall streaming).
+    pub fn busy(&self) -> bool {
+        self.pending.len() > 0 || !self.in_flight.is_empty()
+    }
+
     pub fn residency(&self) -> &ResidencyTracker {
         &self.residency
     }
