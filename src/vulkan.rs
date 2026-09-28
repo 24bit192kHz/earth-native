@@ -73,6 +73,12 @@ const VT_ATLAS_FORMAT: vk::Format = vk::Format::BC7_SRGB_BLOCK;
 const VT_PAGE_TABLE_FORMAT: vk::Format = vk::Format::R32_UINT;
 const VT_ENV: &str = "EARTH_NATIVE_EARTHVT";
 const VT_BUDGET_ENV: &str = "EARTH_NATIVE_EARTHVT_BUDGET_MB";
+/// Atlas budgets. A view needs ~70-100 day tiles and ~20-60 static tiles
+/// (about one texel per pixel over 3440x1440 + 2560x1080); the budgets hold
+/// several times that as cache, and batched streaming refills the rest in a
+/// few frames. 256 MB (capped at 2048 slots, 143 MB) and 96 MB were reserved.
+const VT_DEFAULT_BUDGET_MB: u32 = 48;
+const STATIC_VT_DEFAULT_BUDGET_MB: u64 = 40;
 const STATIC_VT_ENV: &str = "EARTH_NATIVE_STATIC_VT";
 const STATIC_VT_BUDGET_ENV: &str = "EARTH_NATIVE_STATIC_VT_BUDGET_MB";
 const VT_ATLAS_SIZE: u32 = PADDED_TILE_SIZE;
@@ -519,6 +525,8 @@ pub struct Renderer {
     static_vt_config: Option<(LayerDescriptor, u32)>,
     static_streamer: Option<VirtualTextureStreamer>,
     static_pending_jobs: Vec<UploadJob>,
+    /// Tiles the last feedback pass wanted (working sets, for `status`).
+    vt_wanted_tiles: (usize, usize),
     vt_feedback: Feedback,
     vt_frame: u64,
     /// Tiles of the upload batch in flight.
@@ -1730,7 +1738,7 @@ impl Renderer {
                 let budget_mb = env::var(VT_BUDGET_ENV)
                     .ok()
                     .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or(256);
+                    .unwrap_or(VT_DEFAULT_BUDGET_MB);
                 let budget_bytes = u64::from(budget_mb)
                     .checked_mul(1024 * 1024)
                     .ok_or("virtual-texture budget is too large")?;
@@ -1743,7 +1751,7 @@ impl Renderer {
                 let budget_mb = env::var(VT_BUDGET_ENV)
                     .ok()
                     .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or(256);
+                    .unwrap_or(VT_DEFAULT_BUDGET_MB);
                 let budget_bytes = u64::from(budget_mb) * 1024 * 1024;
                 let tile_bytes = PixelFormat::Bc7.encoded_tile_bytes();
                 let slots = (budget_bytes / tile_bytes).clamp(1, u64::from(u32::MAX)) as u32;
@@ -1753,7 +1761,7 @@ impl Renderer {
         // The static layers stream their three finest levels; their tails
         // (data_dir.rs points the night, cloud and relief maps at them) stay
         // resident and stand in until a tile arrives.
-        let static_budget_mb = env::var(STATIC_VT_BUDGET_ENV).ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(96);
+        let static_budget_mb = env::var(STATIC_VT_BUDGET_ENV).ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(STATIC_VT_DEFAULT_BUDGET_MB);
         let static_streamer = env::var_os(STATIC_VT_ENV).and_then(|path| {
             VirtualTextureStreamer::spawn_kind(path, static_budget_mb * 1024 * 1024, StreamKind::Static)
                 .map_err(|error| eprintln!("earth-native: static virtual texture disabled: {error}"))
@@ -1838,6 +1846,7 @@ impl Renderer {
             static_vt_config,
             static_streamer,
             static_pending_jobs: Vec::new(),
+            vt_wanted_tiles: (0, 0),
             vt_feedback: Feedback::default(),
             vt_frame: 0,
             vt_pending_jobs: Vec::new(),
@@ -1920,7 +1929,7 @@ impl Renderer {
             Some(state) if state.live_clouds(now).is_some() && state.live_sea_ice(now) => "OSI-SAF",
             _ => "none",
         };
-        format!("body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2})", self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
+        format!("vt_tiles={} static_tiles={} body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2})", self.vt_wanted_tiles.0, self.vt_wanted_tiles.1, self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
     }
 
     pub unsafe fn configure_output(
@@ -2384,6 +2393,7 @@ impl Renderer {
                     self.vt_frame, day_requests.len(), mips, streamer.residency().resident_bytes(), self.vt_pending_jobs.len());
             }
             if day_layer.is_some() {
+                self.vt_wanted_tiles.0 = day_requests.len();
                 let visible: std::collections::HashSet<TileKey> = day_requests.iter().map(|request| request.key).collect();
                 texture.allocator.touch_visible(&visible);
                 streamer.submit_feedback(self.vt_frame, day_requests, false);
@@ -2403,6 +2413,7 @@ impl Renderer {
             }
             let mut static_requests: Vec<_> = wanted.into_values().collect();
             static_requests.sort_by(|left, right| right.priority.cmp(&left.priority).then_with(|| left.key.cmp(&right.key)));
+            self.vt_wanted_tiles.1 = static_requests.len();
             let visible: std::collections::HashSet<TileKey> = static_requests.iter().map(|request| request.key).collect();
             texture.allocator.touch_visible(&visible);
             streamer.submit_feedback(self.vt_frame, static_requests, false);
