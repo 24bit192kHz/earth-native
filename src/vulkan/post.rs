@@ -162,8 +162,6 @@ pub(super) struct MeterReading {
     pub log2_luminance: f32,
     /// Fraction of the frame the Earth and its air cover.
     pub coverage: f32,
-    /// No Earth in frame: the key is the starfield's.
-    pub starfield: bool,
 }
 
 pub(super) struct HdrTarget {
@@ -538,9 +536,8 @@ impl HdrTarget {
         let highlight = if p97 > 2.0e-3 { p97 / 8.0 } else { 0.0 };
         let total: f32 = samples.iter().map(|(_, w)| w).sum();
         if total < 0.02 * (width * height) as f32 {
-            let starfield = highlight <= 1.0e-3;
-            let log2_luminance = if starfield { STARFIELD_LOG2_LUMINANCE } else { highlight.log2() };
-            return Some(MeterReading { log2_luminance, coverage, starfield });
+            let log2_luminance = if highlight > 1.0e-3 { highlight.log2() } else { STARFIELD_LOG2_LUMINANCE };
+            return Some(MeterReading { log2_luminance, coverage });
         }
         samples.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut accumulated = 0.0;
@@ -555,6 +552,6 @@ impl HdrTarget {
         if std::env::var_os("EARTH_NATIVE_METER_DEBUG").is_some() {
             eprintln!("meter: pre={preexposure:.3e} key={key:.3e} p97={p97:.3e} highlight={highlight:.3e} earth_weight={total:.1} texels={}", width * height);
         }
-        Some(MeterReading { log2_luminance: key.max(highlight).log2(), coverage, starfield: false })
+        Some(MeterReading { log2_luminance: key.max(highlight).log2(), coverage })
     }
 }

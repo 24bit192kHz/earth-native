@@ -134,7 +134,6 @@ earth-native camera aurora           # hover near tonight's strongest aurora and
 earth-native camera zoom in          # or `zoom out`: the lens from the ISS, the distance on the globe
 earth-native camera reset            # look ahead again with the default 78° lens
 earth-native camera 180 20 8         # fixed yaw/pitch/distance
-earth-native look cinematic          # Milky Way and stars always shown, soft Sun; `look realistic`: one physical camera
 earth-native capture_frame           # write JPEG + JSON readbacks of every output
 earth-native stop
 ```
@@ -150,7 +149,6 @@ desktop back.
 | `EARTH_NATIVE_BODY` | body at startup |
 | `EARTH_NATIVE_FOCUS_OUTPUT` | monitor the globe is centred on (default: the largest) |
 | `EARTH_NATIVE_DATA_DIR` | texture pack location |
-| `EARTH_NATIVE_LOOK` | `realistic` or `cinematic` at startup (default: the last `earth-native look`, else realistic) |
 
 ## How it works
 

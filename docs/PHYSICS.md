@@ -153,33 +153,16 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
 - **Point of view:** `camera live` rides the ISS (SGP4 position and velocity,
   level local-horizontal attitude), 78° horizontal lens, pitched so the
   horizon sits ~20 % from the top, 30 fps while riding.
-- **Two looks** (`earth-native look realistic|cinematic`, remembered across
-  restarts, or `EARTH_NATIVE_LOOK`). *Realistic* is one physical camera: a
-  single exposure for the whole frame, so a Sun in frame (or the daylit
-  Earth) hides the stars, and the Sun carries its full lens glare.
-  *Cinematic* shows what the adapted eye would like on a desktop: the Milky
-  Way and the catalogue stars keep a fixed night-series brightness (EV 17)
-  whatever the exposure, so they show next to the daylit Earth and the Sun,
-  and the Sun is a soft glow with faint rays (its glare capped at 3 % of the
-  daylight glare, disc compressed like the Moon's).
-- **Milky Way (cinematic):** baked at startup (`src/milky_way.rs`, ~0.7 s)
-  from the star panorama: a ~0.09° mip is decoded, its point stars removed by
-  a 3 × 3 morphological opening and the result blurred; its colour is not
-  used (BC1's 565 endpoints turn dark regions green and magenta), the glow
-  is tinted from bluish in the faint arms to warm in the bright band. The
-  sky's median glow is its black point (only the band shows, empty sky
-  stays black) and the band's 99.5th percentile sits at 0.05 linear through
-  a contrast curve (power 1.6): a subtle glow behind the Earth, not a fog.
 - **Auto exposure:** metered on a 64 px mip: the 85th-percentile Earth
   luminance, or a highlight rule when bright sunlit sky covers more than 3 %
   of the frame (the sunrise band seen from the ISS). Daylight keeps a "sunny
   16" exposure; at night the camera opens up for moonlight, city lights,
   aurora and stars and holds 1.6 stops under the meter for a night look. A
-  thin lit limb around a night globe saturates like city lights. Realistic:
-  the Sun's glare is metered over the whole frame (mean glare under 8 %,
-  92 % of the frame under half white) and an open Sun in frame caps the
-  exposure at daylight; a frame without the Earth is exposed as a starfield.
-  Cinematic: a frame without the Earth keeps the current exposure. Light
+  thin lit limb around a night globe saturates like city lights. The Sun's
+  glare is metered over the whole frame (mean glare under 8 %, 92 % of the
+  frame under half white) and an open Sun in frame caps the exposure at
+  daylight, so it hides the stars as it would for a camera; a frame without
+  the Earth is exposed as a starfield. Light
   adaptation is fast (0.12 s, at most 1.5 stops over on the first frames),
   dark adaptation slow (0.9 s), so panning from the night sky back to the
   daylit Earth does not flash white. Cuts snap the exposure.

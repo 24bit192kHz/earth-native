@@ -675,7 +675,6 @@ impl NativeApp {
             live_clouds: false,
             live_aerosol: false,
             live_sea_ice: false,
-            cinematic: false,
             camera_position: [pose.position.x, pose.position.y, pose.position.z],
             camera_distance,
             forward: [pose.forward.x, pose.forward.y, pose.forward.z],
@@ -1036,17 +1035,6 @@ impl NativeApp {
                 self.restore_live_time();
                 self.time_status()
             }
-            ipc::Request::Look { look } => match crate::look::Look::parse(&look) {
-                Some(look) => {
-                    self.renderer.set_look(look);
-                    self.dirty = true;
-                    match look.save() {
-                        Ok(()) => format!("ok look {}", look.name()),
-                        Err(error) => format!("ok look {} (not saved: {error})", look.name()),
-                    }
-                }
-                None => "error look must be realistic or cinematic".to_owned(),
-            },
         }
     }
 

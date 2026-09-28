@@ -45,8 +45,6 @@ pub enum Request {
     TimeShow,
     TimeUnix { seconds: i64 },
     TimeLive,
-    /// Presentation look: realistic or cinematic (see look.rs).
-    Look { look: String },
 }
 
 impl Request {
@@ -76,7 +74,6 @@ impl Request {
             Self::TimeShow => "time show\n".to_owned(),
             Self::TimeUnix { seconds } => format!("time unix {seconds}\n"),
             Self::TimeLive => "time live\n".to_owned(),
-            Self::Look { look } => format!("look {look}\n"),
         }
     }
 
@@ -126,10 +123,7 @@ impl Request {
                 seconds: seconds.parse().map_err(|_| "Unix seconds must be an i64")?,
             }),
             ["time", "live"] => Ok(Self::TimeLive),
-            ["look", look] if crate::look::Look::parse(look).is_some() => Ok(Self::Look {
-                look: look.to_ascii_lowercase(),
-            }),
-            _ => Err("expected: status | stop | capture_frame | camera {live|globe|next|aurora|zoom in|zoom out|reset|iss HEADING PITCH FOV|pov LAT LON ALT_KM HEADING PITCH FOV|YAW PITCH DISTANCE} | control <monitor> | body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune} | celestial {show|freeze|sun|moon|live} | time {show|unix SECONDS|live} | look {realistic|cinematic}"),
+            _ => Err("expected: status | stop | capture_frame | camera {live|globe|next|aurora|zoom in|zoom out|reset|iss HEADING PITCH FOV|pov LAT LON ALT_KM HEADING PITCH FOV|YAW PITCH DISTANCE} | control <monitor> | body {earth|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune} | celestial {show|freeze|sun|moon|live} | time {show|unix SECONDS|live}"),
         }
     }
 }
@@ -343,14 +337,5 @@ mod tests {
             format!("time unix {}\n", i64::MIN)
         );
         assert_eq!(Request::TimeLive.encode(), "time live\n");
-    }
-
-    #[test]
-    fn look_requests_round_trip() {
-        let request = Request::Look { look: "cinematic".to_owned() };
-        assert_eq!(Request::parse(&request.encode()), Ok(request));
-        assert_eq!(Request::parse("look Realistic"), Ok(Request::Look { look: "realistic".to_owned() }));
-        assert!(Request::parse("look pretty").is_err());
-        assert!(Request::parse("look").is_err());
     }
 }
