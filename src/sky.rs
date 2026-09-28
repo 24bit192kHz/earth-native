@@ -371,36 +371,51 @@ pub fn irradiance_uv(r: f64, mu_s: f64) -> (f64, f64) {
     )
 }
 
+/// `f(0..count)` on all cores in contiguous chunks (texels are
+/// independent); the same values as a serial map, in order.
+fn parallel_map<T: Send + Default + Clone, F: Fn(usize) -> T + Sync>(count: usize, f: F) -> Vec<T> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(count.max(1));
+    let chunk = count.div_ceil(threads);
+    let mut out = vec![T::default(); count];
+    std::thread::scope(|scope| {
+        for (index, slice) in out.chunks_mut(chunk).enumerate() {
+            let f = &f;
+            scope.spawn(move || {
+                for (offset, value) in slice.iter_mut().enumerate() {
+                    *value = f(index * chunk + offset);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The three tables, each spread over all cores (367 ms serially at
+/// startup, the largest share of the time to the first frame).
 pub fn bake() -> Tables {
-    let transmittance: Vec<[f32; 3]> = (0..TRANSMITTANCE_HEIGHT)
-        .flat_map(|y| (0..TRANSMITTANCE_WIDTH).map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let (r, mu) = transmittance_r_mu(
-                (x as f64 + 0.5) / TRANSMITTANCE_WIDTH as f64,
-                (y as f64 + 0.5) / TRANSMITTANCE_HEIGHT as f64,
-            );
-            integrate_transmittance(r, mu).map(|v| v as f32)
-        })
-        .collect();
+    let transmittance: Vec<[f32; 3]> = parallel_map(TRANSMITTANCE_WIDTH * TRANSMITTANCE_HEIGHT, |index| {
+        let (x, y) = (index % TRANSMITTANCE_WIDTH, index / TRANSMITTANCE_WIDTH);
+        let (r, mu) = transmittance_r_mu(
+            (x as f64 + 0.5) / TRANSMITTANCE_WIDTH as f64,
+            (y as f64 + 0.5) / TRANSMITTANCE_HEIGHT as f64,
+        );
+        integrate_transmittance(r, mu).map(|v| v as f32)
+    });
     let table = TransmittanceTable(&transmittance);
-    let multiscatter: Vec<[f32; 3]> = (0..MULTISCATTER_SIZE)
-        .flat_map(|y| (0..MULTISCATTER_SIZE).map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let (r, mu_s) = multiscatter_uv_to_r_mu(
-                (x as f64 + 0.5) / MULTISCATTER_SIZE as f64,
-                (y as f64 + 0.5) / MULTISCATTER_SIZE as f64,
-            );
-            multiscatter_texel(&table, r, mu_s).map(|v| v as f32)
-        })
-        .collect();
-    let irradiance: Vec<[f32; 3]> = (0..IRRADIANCE_HEIGHT)
-        .flat_map(|y| (0..IRRADIANCE_WIDTH).map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let mu_s = texel_to_unit((x as f64 + 0.5) / IRRADIANCE_WIDTH as f64, IRRADIANCE_WIDTH) * 2.0 - 1.0;
-            let h = texel_to_unit((y as f64 + 0.5) / IRRADIANCE_HEIGHT as f64, IRRADIANCE_HEIGHT) * IRRADIANCE_TOP_KM;
-            irradiance_texel(&table, &multiscatter, GROUND_KM + h.max(0.0), mu_s).map(|v| v as f32)
-        })
-        .collect();
+    let multiscatter: Vec<[f32; 3]> = parallel_map(MULTISCATTER_SIZE * MULTISCATTER_SIZE, |index| {
+        let (x, y) = (index % MULTISCATTER_SIZE, index / MULTISCATTER_SIZE);
+        let (r, mu_s) = multiscatter_uv_to_r_mu(
+            (x as f64 + 0.5) / MULTISCATTER_SIZE as f64,
+            (y as f64 + 0.5) / MULTISCATTER_SIZE as f64,
+        );
+        multiscatter_texel(&table, r, mu_s).map(|v| v as f32)
+    });
+    let irradiance: Vec<[f32; 3]> = parallel_map(IRRADIANCE_WIDTH * IRRADIANCE_HEIGHT, |index| {
+        let (x, y) = (index % IRRADIANCE_WIDTH, index / IRRADIANCE_WIDTH);
+        let mu_s = texel_to_unit((x as f64 + 0.5) / IRRADIANCE_WIDTH as f64, IRRADIANCE_WIDTH) * 2.0 - 1.0;
+        let h = texel_to_unit((y as f64 + 0.5) / IRRADIANCE_HEIGHT as f64, IRRADIANCE_HEIGHT) * IRRADIANCE_TOP_KM;
+        irradiance_texel(&table, &multiscatter, GROUND_KM + h.max(0.0), mu_s).map(|v| v as f32)
+    });
     Tables { transmittance, multiscatter, irradiance }
 }
 
