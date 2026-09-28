@@ -514,7 +514,11 @@ pub struct Renderer {
     vt_streamer: Option<VirtualTextureStreamer>,
     vt_feedback: Feedback,
     vt_frame: u64,
-    vt_pending_job: Option<UploadJob>,
+    /// Tiles of the upload batch in flight.
+    vt_pending_jobs: Vec<UploadJob>,
+    /// Frame and view of the last CPU feedback pass (see `VT_FEEDBACK_INTERVAL`).
+    vt_feedback_frame: u64,
+    vt_feedback_view: Option<[f32; 7]>,
     debug_screenshots: bool,
     debug_scene_name: String,
     weather: Option<crate::weather::WeatherState>,
@@ -939,8 +943,19 @@ struct VtUploadStaging {
     capacity: vk::DeviceSize,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
-    pending: Option<VtPendingUpload>,
+    /// Tiles of the batch in flight (empty when the staging is free).
+    pending: Vec<VtPendingUpload>,
 }
+
+/// Tiles uploaded per batch (one command buffer, one fence). One tile per
+/// frame capped streaming at 30 tiles/s (15 on the globe), so a new view
+/// visibly sharpened chunk by chunk for seconds; 48 x 70 KB is 3.3 MB.
+const VT_UPLOAD_BATCH: usize = 48;
+/// Frames between CPU feedback passes when the view moves smoothly.
+const VT_FEEDBACK_INTERVAL: u64 = 6;
+/// Staging bytes per tile: the BC7 payload plus the page-table words
+/// (new slot, eviction marker), keeping each payload 16-byte aligned.
+const VT_STAGING_STRIDE: u64 = 264 * 264 + 16;
 
 #[derive(Clone, Copy, Debug)]
 struct VtPendingUpload {
@@ -1073,7 +1088,7 @@ impl VirtualTexture {
                 device,
                 memory_properties,
                 command_pool,
-                PixelFormat::Bc7.encoded_tile_bytes() + 8,
+                VT_STAGING_STRIDE * VT_UPLOAD_BATCH as u64,
             )?
         });
         Ok(Self { atlas, atlas_view, atlas_sampler, page_table, page_table_view, page_table_sampler, params_buffer, params_memory, descriptor_set, params, layer, allocator: VtSlotAllocator::new(slot_budget)?, staging, memory_properties })
@@ -1095,126 +1110,121 @@ impl VirtualTexture {
         (u32::from(base), u32::from(end - base) + 1)
     }
 
-    /// Submit one already-encoded 264x264 BC7 tile. A second upload is rejected
+    /// Submit up to `VT_UPLOAD_BATCH` already-encoded 264x264 BC7 tiles in one
+    /// command buffer. Returns the indices of `tiles` that were admitted (a
+    /// key that already owns a slot is skipped). Another batch is rejected
     /// until `poll_upload` observes the fence, bounding staging and residency.
-    unsafe fn submit_tile(&mut self, device: &Device, queue: vk::Queue, command_pool: vk::CommandPool, key: TileKey, payload: &[u8]) -> RendererResult<u32> {
+    unsafe fn submit_tiles(&mut self, device: &Device, queue: vk::Queue, tiles: &[(TileKey, &[u8])]) -> RendererResult<Vec<usize>> {
         let Some(layer) = self.layer else { return Err("day-colour VT is disabled".into()); };
-        if !layer.contains_key(key) || payload.len() as u64 != PixelFormat::Bc7.encoded_tile_bytes() {
+        let tile_bytes = PixelFormat::Bc7.encoded_tile_bytes();
+        if tiles.len() > VT_UPLOAD_BATCH {
+            return Err("VT upload batch is larger than its staging".into());
+        }
+        if tiles.iter().any(|(key, payload)| !layer.contains_key(*key) || payload.len() as u64 != tile_bytes) {
             return Err("VT tile key or BC7 payload size is invalid".into());
         }
-        if self.staging.as_ref().is_some_and(|staging| staging.pending.is_some()) {
+        let Some(mut staging) = self.staging.take() else {
+            return Err("VT staging must be initialized by the renderer integration hook".into());
+        };
+        if !staging.pending.is_empty() {
+            self.staging = Some(staging);
             return Err("VT upload staging is busy".into());
         }
-        let allocation = self.allocator.request(key).ok_or("no VT atlas slot is available")?;
-        let capacity = payload.len() as vk::DeviceSize;
-        let mut staging = match self.staging.take() {
-            Some(staging) if staging.capacity >= capacity => staging,
-            Some(staging) => {
-                device.unmap_memory(staging.memory); device.destroy_fence(staging.fence, None); device.free_command_buffers(command_pool, &[staging.command_buffer]); device.destroy_buffer(staging.buffer, None); device.free_memory(staging.memory, None);
-                create_vt_staging(device, self.memory_properties, command_pool, capacity + 8)?
+        let mut admitted = Vec::new();
+        let mut uploads = Vec::new();
+        for (index, (key, payload)) in tiles.iter().enumerate() {
+            let Some(allocation) = self.allocator.request(*key) else { continue };
+            let offset = VT_STAGING_STRIDE * uploads.len() as u64;
+            ptr::copy_nonoverlapping(payload.as_ptr(), staging.mapped.add(offset as usize), payload.len());
+            ptr::copy_nonoverlapping(u32::MAX.to_ne_bytes().as_ptr(), staging.mapped.add((offset + tile_bytes) as usize), 4);
+            ptr::copy_nonoverlapping(allocation.slot.to_ne_bytes().as_ptr(), staging.mapped.add((offset + tile_bytes + 4) as usize), 4);
+            uploads.push((VtPendingUpload { key: *key, slot: allocation.slot, evicted: allocation.evicted }, offset));
+            admitted.push(index);
+        }
+        if uploads.is_empty() {
+            self.staging = Some(staging);
+            return Ok(admitted);
+        }
+        let result = (|| -> RendererResult<()> {
+            device.reset_fences(&[staging.fence])?;
+            device.reset_command_buffer(staging.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(staging.command_buffer, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            let color = |base_layer: u32, layer_count: u32| vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).base_array_layer(base_layer).layer_count(layer_count);
+            let page_layers = u32::from(layer.mip_count);
+            let barrier = |image: vk::Image, range: vk::ImageSubresourceRange, to_transfer: bool| {
+                let (old, new, src, dst) = if to_transfer {
+                    (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE)
+                } else {
+                    (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ)
+                };
+                vk::ImageMemoryBarrier::default().old_layout(old).new_layout(new).src_access_mask(src).dst_access_mask(dst).image(image).subresource_range(range)
+            };
+            let mut barriers: Vec<_> = uploads.iter().map(|(upload, _)| barrier(self.atlas.image, color(upload.slot, 1), true)).collect();
+            barriers.push(barrier(self.page_table.image, color(0, page_layers), true));
+            device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &barriers);
+            let page_copy = |offset: u64, mip: u16, x: u32, y: u32| vk::BufferImageCopy::default()
+                .buffer_offset(offset)
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(u32::from(mip)).layer_count(1))
+                .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: 0 })
+                .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 });
+            for (upload, offset) in &uploads {
+                // Invalidate the evicted tile's page before this tile claims
+                // its slot; a later tile in the batch never takes a pending slot.
+                if let Some(evicted) = upload.evicted {
+                    let (old_x, old_y) = key_page(layer, evicted);
+                    device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.page_table.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[page_copy(offset + tile_bytes, evicted.mip, old_x, old_y)]);
+                }
+                let copy = vk::BufferImageCopy::default().buffer_offset(*offset)
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(upload.slot).layer_count(1))
+                    .image_extent(vk::Extent3D { width: VT_ATLAS_SIZE, height: VT_ATLAS_SIZE, depth: 1 });
+                device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.atlas.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+                let (page_x, page_y) = key_page(layer, upload.key);
+                device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.page_table.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[page_copy(offset + tile_bytes + 4, upload.key.mip, page_x, page_y)]);
             }
-            None => return Err("VT staging must be initialized by the renderer integration hook".into()),
-        };
-        ptr::copy_nonoverlapping(payload.as_ptr(), staging.mapped, payload.len());
-        device.reset_fences(&[staging.fence])?;
-        device.reset_command_buffer(staging.command_buffer, vk::CommandBufferResetFlags::empty())?;
-        device.begin_command_buffer(staging.command_buffer, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-        let (page_x, page_y) = key_page(layer, key);
-        let page_word = allocation.slot;
-        ptr::copy_nonoverlapping(
-            page_word.to_ne_bytes().as_ptr(),
-            staging.mapped.add(payload.len() + 4),
-            4,
-        );
-        let invalid_word = u32::MAX;
-        if allocation.evicted.is_some() {
-            ptr::copy_nonoverlapping(
-                invalid_word.to_ne_bytes().as_ptr(),
-                staging.mapped.add(payload.len()),
-                4,
-            );
+            let mut barriers: Vec<_> = uploads.iter().map(|(upload, _)| barrier(self.atlas.image, color(upload.slot, 1), false)).collect();
+            barriers.push(barrier(self.page_table.image, color(0, page_layers), false));
+            device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &barriers);
+            device.end_command_buffer(staging.command_buffer)?;
+            let command_buffers = [staging.command_buffer];
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&command_buffers)], staging.fence)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for (upload, _) in &uploads {
+                self.allocator.cancel_pending(upload.slot, upload.key, upload.evicted);
+            }
+            self.staging = Some(staging);
+            return Err(error);
         }
-        let (page_base_layer, page_layer_count) =
-            Self::page_table_upload_layers(key.mip, allocation.evicted.map(|evicted| evicted.mip));
-        // The eviction invalidate recorded below lands on the evicted mip's
-        // layer, which is inside this span by construction, so every
-        // page-table copy that follows executes inside TRANSFER_DST_OPTIMAL.
-        // (Previously the invalidate copy was recorded before this barrier
-        // while the image was still SHADER_READ_ONLY_OPTIMAL.)
-        let page_to_transfer = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).src_access_mask(vk::AccessFlags::SHADER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).image(self.page_table.image).subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).base_array_layer(page_base_layer).layer_count(page_layer_count));
-        let to_transfer = [
-            vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).src_access_mask(vk::AccessFlags::SHADER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).image(self.atlas.image).subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).base_array_layer(allocation.slot).layer_count(1)),
-            page_to_transfer,
-        ];
-        device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_transfer);
-        if let Some(evicted) = allocation.evicted {
-            let (old_x, old_y) = key_page(layer, evicted);
-            let invalid_offset = payload.len();
-            let invalidate_copy = vk::BufferImageCopy::default()
-                .buffer_offset(invalid_offset as u64)
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(evicted.mip as u32)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D {
-                    x: old_x as i32,
-                    y: old_y as i32,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: 1,
-                    height: 1,
-                    depth: 1,
-                });
-            device.cmd_copy_buffer_to_image(
-                staging.command_buffer,
-                staging.buffer,
-                self.page_table.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[invalidate_copy],
-            );
-        }
-        let copy = vk::BufferImageCopy::default().buffer_offset(0).image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(allocation.slot).layer_count(1)).image_extent(vk::Extent3D { width: VT_ATLAS_SIZE, height: VT_ATLAS_SIZE, depth: 1 });
-        device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.atlas.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
-        let page_copy = vk::BufferImageCopy::default().buffer_offset((payload.len() + 4) as u64).image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(key.mip as u32).layer_count(1)).image_offset(vk::Offset3D { x: page_x as i32, y: page_y as i32, z: 0 }).image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 });
-        device.cmd_copy_buffer_to_image(staging.command_buffer, staging.buffer, self.page_table.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[page_copy]);
-        let page_to_sampled = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ).image(self.page_table.image).subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).base_array_layer(page_base_layer).layer_count(page_layer_count));
-        let to_sampled = [
-            vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ).image(self.atlas.image).subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).base_array_layer(allocation.slot).layer_count(1)),
-            page_to_sampled,
-        ];
-        device.cmd_pipeline_barrier(staging.command_buffer, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_sampled);
-        device.end_command_buffer(staging.command_buffer)?;
-        let command_buffers = [staging.command_buffer];
-        device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&command_buffers)], staging.fence)?;
-        staging.pending = Some(VtPendingUpload {
-            key,
-            slot: allocation.slot,
-            evicted: allocation.evicted,
-        });
+        staging.pending = uploads.into_iter().map(|(upload, _)| upload).collect();
         self.staging = Some(staging);
-        Ok(allocation.slot)
+        Ok(admitted)
     }
 
-    /// Poll the bounded upload fence. Returns the committed upload when ready.
-    unsafe fn poll_upload(&mut self, device: &Device) -> RendererResult<Option<VtPendingUpload>> {
+    /// Poll the batch fence. Returns the committed uploads when ready.
+    unsafe fn poll_upload(&mut self, device: &Device) -> RendererResult<Option<Vec<VtPendingUpload>>> {
         let Some(staging) = self.staging.as_mut() else { return Ok(None); };
-        let Some(pending) = staging.pending else { return Ok(None); };
+        if staging.pending.is_empty() {
+            return Ok(None);
+        }
         match device.get_fence_status(staging.fence) {
             Ok(true) => {
-                if !self.allocator.mark_resident(pending.slot, pending.key) {
-                    return Err("VT upload fence completed for an unexpected allocator state".into());
+                let pending = std::mem::take(&mut staging.pending);
+                for upload in &pending {
+                    if !self.allocator.mark_resident(upload.slot, upload.key) {
+                        return Err("VT upload fence completed for an unexpected allocator state".into());
+                    }
                 }
-                staging.pending = None;
                 Ok(Some(pending))
             }
             Ok(false) | Err(vk::Result::NOT_READY) => Ok(None),
             Err(error) => {
-                self.allocator.cancel_pending(pending.slot, pending.key, pending.evicted);
-                staging.pending = None;
+                for upload in std::mem::take(&mut staging.pending) {
+                    self.allocator.cancel_pending(upload.slot, upload.key, upload.evicted);
+                }
                 Err(error.into())
             }
         }
@@ -1268,7 +1278,7 @@ unsafe fn create_vt_staging(
         Ok(fence) => fence,
         Err(error) => { device.unmap_memory(memory); device.free_command_buffers(command_pool, &[command_buffer]); device.free_memory(memory, None); device.destroy_buffer(buffer, None); return Err(error.into()); }
     };
-    Ok(VtUploadStaging { buffer, memory, mapped, capacity, command_buffer, fence, pending: None })
+    Ok(VtUploadStaging { buffer, memory, mapped, capacity, command_buffer, fence, pending: Vec::new() })
 }
 
 fn create_image_view(device: &Device, image: vk::Image, format: vk::Format, view_type: vk::ImageViewType, layers: u32) -> RendererResult<vk::ImageView> {
@@ -1467,10 +1477,9 @@ impl DebugCapture {
             )?
         };
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let memory_type = match find_memory_type(
+        let memory_type = match find_readback_memory_type(
             memory_properties,
             requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         ) {
             Ok(memory_type) => memory_type,
             Err(error) => {
@@ -1717,7 +1726,9 @@ impl Renderer {
             vt_streamer,
             vt_feedback: Feedback::default(),
             vt_frame: 0,
-            vt_pending_job: None,
+            vt_pending_jobs: Vec::new(),
+            vt_feedback_frame: 0,
+            vt_feedback_view: None,
             star_panorama,
             day_color,
             surface_normals,
@@ -1861,20 +1872,21 @@ impl Renderer {
     }
 
     /// Queue one encoded BC7 tile for the configured day-colour VT.
-    pub fn submit_day_color_tile(&mut self, key: TileKey, payload: &[u8]) -> RendererResult<u32> {
+    pub fn submit_day_color_tile(&mut self, key: TileKey, payload: &[u8]) -> RendererResult<bool> {
         let device = self.device.as_mut().ok_or("Vulkan device is not initialized")?;
         let virtual_texture = device.virtual_texture.as_mut().ok_or("VT resources are not initialized")?;
-        unsafe { virtual_texture.submit_tile(&device.device, device.queue, device.command_pool, key, payload) }
+        unsafe { Ok(!virtual_texture.submit_tiles(&device.device, device.queue, &[(key, payload)])?.is_empty()) }
     }
 
-    /// Poll the asynchronous VT upload fence and commit a ready tile.
-    pub fn poll_day_color_upload(&mut self) -> RendererResult<Option<TileKey>> {
+    /// Poll the asynchronous VT upload fence and commit the ready tiles.
+    pub fn poll_day_color_upload(&mut self) -> RendererResult<Vec<TileKey>> {
         let device = self.device.as_mut().ok_or("Vulkan device is not initialized")?;
         let virtual_texture = device.virtual_texture.as_mut().ok_or("VT resources are not initialized")?;
         unsafe {
             Ok(virtual_texture
                 .poll_upload(&device.device)?
-                .map(|upload| upload.key))
+                .map(|uploads| uploads.iter().map(|upload| upload.key).collect())
+                .unwrap_or_default())
         }
     }
 
@@ -2120,7 +2132,7 @@ impl Renderer {
             return Ok(false);
         };
         let mut needs_redraw = self.pending_weather.is_some()
-            || self.vt_pending_job.is_some()
+            || !self.vt_pending_jobs.is_empty()
             || self.vt_streamer.as_ref().is_some_and(VirtualTextureStreamer::busy);
         // Integer body id carried in `sun_direction.w` (0=Earth, 1=Jupiter,
         // 2=Mercury, 3=Mars, 4=Saturn) so the shared push-constant layout
@@ -2192,43 +2204,59 @@ impl Renderer {
 
         streamer.dispatch_feedback(self.vt_frame)?;
         if let Some(completed) = unsafe { virtual_texture.poll_upload(&device.device)? } {
-            let job = self
-                .vt_pending_job
-                .take()
-                .ok_or("VT upload completed without a pending job")?;
-            if job.key != completed.key {
-                return Err("VT upload completed for the wrong tile".into());
+            let jobs = std::mem::take(&mut self.vt_pending_jobs);
+            if jobs.len() != completed.len() || jobs.iter().zip(&completed).any(|(job, upload)| job.key != upload.key) {
+                return Err("VT upload batch completed for the wrong tiles".into());
             }
-            if let Some(evicted) = completed.evicted {
-                streamer.residency_mut().remove(evicted);
+            let now = std::time::Instant::now();
+            for (job, upload) in jobs.iter().zip(&completed) {
+                if let Some(evicted) = upload.evicted {
+                    streamer.residency_mut().remove(evicted);
+                }
+                streamer.mark_uploaded(job, self.vt_frame, now)?;
             }
-            streamer.mark_uploaded(&job, self.vt_frame, std::time::Instant::now())?;
         }
 
-        if self.vt_pending_job.is_none() {
+        if self.vt_pending_jobs.is_empty() {
             // A tile can be requested again while its first upload is still
             // on the GPU; drop such duplicates instead of failing the frame.
-            let mut next = streamer.poll_one()?;
-            while let Some(job) = next.as_ref() {
-                if !virtual_texture.allocator.holds(job.key) {
-                    break;
+            let mut batch = Vec::new();
+            while batch.len() < VT_UPLOAD_BATCH {
+                let Some(job) = streamer.poll_one()? else { break };
+                if !virtual_texture.allocator.holds(job.key) && !batch.iter().any(|queued: &UploadJob| queued.key == job.key) {
+                    batch.push(job);
                 }
-                next = streamer.poll_one()?;
             }
-            if let Some(job) = next {
-                unsafe {
-                    virtual_texture.submit_tile(
-                        &device.device,
-                        device.queue,
-                        device.command_pool,
-                        job.key,
-                        &job.payload,
-                    )?;
-                }
-                self.vt_pending_job = Some(job);
+            if !batch.is_empty() {
+                let tiles: Vec<(TileKey, &[u8])> = batch.iter().map(|job| (job.key, job.payload.as_slice())).collect();
+                let admitted = unsafe { virtual_texture.submit_tiles(&device.device, device.queue, &tiles)? };
+                drop(tiles);
+                let mut admitted = admitted.into_iter().peekable();
+                self.vt_pending_jobs = batch.into_iter().enumerate()
+                    .filter_map(|(index, job)| (admitted.next_if_eq(&index).is_some()).then_some(job))
+                    .collect();
             }
         }
 
+        // The visible tile set changes slowly (from the ISS the camera moves
+        // ~0.06 % of its altitude per frame), so the CPU feedback, ~100k ray
+        // casts and the largest share of the renderer's CPU, runs every
+        // `VT_FEEDBACK_INTERVAL` frames, and at once when the view jumps.
+        let view = [uniforms.camera_position[0], uniforms.camera_position[1], uniforms.camera_position[2],
+            uniforms.forward[0], uniforms.forward[1], uniforms.forward[2], uniforms.tan_half_fov_x];
+        let jumped = self.vt_feedback_view.is_none_or(|last| {
+            let distance = |v: &[f32]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            let moved = distance(&[view[0] - last[0], view[1] - last[1], view[2] - last[2]]);
+            let altitude = (distance(&view[..3]) - crate::camera::SCENE_EARTH_RADIUS).max(1.0e-3);
+            let turned = view[3] * last[3] + view[4] * last[4] + view[5] * last[5];
+            moved > 0.01 * altitude || turned < 0.99996 || (view[6] / last[6] - 1.0).abs() > 0.01
+        });
+        if !jumped && self.vt_frame.wrapping_sub(self.vt_feedback_frame) < VT_FEEDBACK_INTERVAL {
+            self.vt_frame = self.vt_frame.wrapping_add(1);
+            return Ok(());
+        }
+        self.vt_feedback_frame = self.vt_frame;
+        self.vt_feedback_view = Some(view);
         let outputs = self
             .outputs
             .iter()
@@ -2250,7 +2278,7 @@ impl Renderer {
             let mut mips = std::collections::BTreeMap::<u16, usize>::new();
             for request in &requests { *mips.entry(request.key.mip).or_default() += 1; }
             eprintln!("vt-debug frame={} requests={} by_mip={:?} resident_bytes={} pending_job={}",
-                self.vt_frame, requests.len(), mips, streamer.residency().resident_bytes(), self.vt_pending_job.is_some());
+                self.vt_frame, requests.len(), mips, streamer.residency().resident_bytes(), self.vt_pending_jobs.len());
         }
         let visible: std::collections::HashSet<TileKey> = requests.iter().map(|request| request.key).collect();
         virtual_texture.allocator.touch_visible(&visible);
@@ -5427,6 +5455,28 @@ unsafe fn upload_staging_mip_image(
     }
     device.free_command_buffers(command_pool, &[command_buffer]);
     upload
+}
+
+/// Memory for buffers the CPU reads back (the exposure meter, frame
+/// captures). HOST_VISIBLE | HOST_COHERENT alone picked the first such type,
+/// which with resizable BAR is device-local VRAM mapped over PCIe: every CPU
+/// read was an uncached bus round trip, and the per-frame meter conversion
+/// alone took ~20 % of the renderer's CPU. Prefer cached system memory.
+pub(super) fn find_readback_memory_type(
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    compatible_types: u32,
+) -> RendererResult<u32> {
+    let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED;
+    let pick = |required: vk::MemoryPropertyFlags, avoid_device_local: bool| (0..memory_properties.memory_type_count).find(|&index| {
+        let properties = memory_properties.memory_types[index as usize].property_flags;
+        compatible_types & (1 << index) != 0 && properties.contains(required)
+            && !(avoid_device_local && properties.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+    });
+    pick(wanted, true)
+        .or_else(|| pick(wanted, false))
+        .or_else(|| pick(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT, true))
+        .map_or_else(|| find_memory_type(memory_properties, compatible_types,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT), Ok)
 }
 
 fn find_memory_type(

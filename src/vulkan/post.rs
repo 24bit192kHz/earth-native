@@ -7,7 +7,7 @@ use std::{io::Cursor, mem::size_of};
 
 use ash::{util::read_spv, vk, Device};
 
-use super::{find_memory_type, RendererResult};
+use super::{find_memory_type, find_readback_memory_type, RendererResult};
 
 pub(super) const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Exposure metering reads the first pyramid level at most this wide.
@@ -311,10 +311,9 @@ impl HdrTarget {
                 }
             };
             let buffer_requirements = device.get_buffer_memory_requirements(meter_buffer);
-            let meter_memory = match find_memory_type(
+            let meter_memory = match find_readback_memory_type(
                 memory_properties,
                 buffer_requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
             .and_then(|index| Ok(device.allocate_memory(
                 &vk::MemoryAllocateInfo::default().allocation_size(buffer_requirements.size).memory_type_index(index), None)?))
