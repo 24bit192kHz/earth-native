@@ -39,6 +39,8 @@ pub(super) struct PostPipeline {
     pool: vk::DescriptorPool,
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
+    /// Half-resolution near-field glare (bloom.frag) into the HDR format.
+    pub bloom_pipeline: vk::Pipeline,
     sampler: vk::Sampler,
 }
 
@@ -46,21 +48,24 @@ impl PostPipeline {
     pub fn create(device: &Device, swapchain_format: vk::Format) -> RendererResult<Self> {
         let vertex_code = read_spv(&mut Cursor::new(include_bytes!(concat!(env!("OUT_DIR"), "/earth.vert.spv"))))?;
         let fragment_code = read_spv(&mut Cursor::new(include_bytes!(concat!(env!("OUT_DIR"), "/post.frag.spv"))))?;
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
+        let bloom_code = read_spv(&mut Cursor::new(include_bytes!(concat!(env!("OUT_DIR"), "/bloom.frag.spv"))))?;
+        // 0: the HDR pyramid, 1: the half-resolution bloom.
+        let bindings = [0, 1].map(|binding| vk::DescriptorSetLayoutBinding::default()
+            .binding(binding)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT));
         unsafe {
             let set_layout = device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?;
+            // Two sets per target (camera pass, bloom pass), two images each.
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(MAX_TARGETS)];
+                .descriptor_count(MAX_TARGETS * 4)];
             let pool = match device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                    .max_sets(MAX_TARGETS)
+                    .max_sets(MAX_TARGETS * 2)
                     .pool_sizes(&sizes),
                 None,
             ) {
@@ -126,15 +131,29 @@ impl PostPipeline {
                     return Err(error.into());
                 }
             };
+            let bloom_fragment = match device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&bloom_code), None) {
+                Ok(module) => module,
+                Err(error) => {
+                    device.destroy_shader_module(fragment, None);
+                    device.destroy_shader_module(vertex, None);
+                    destroy_all(device);
+                    return Err(error.into());
+                }
+            };
             let pipeline = super::create_graphics_pipeline(
                 device, vertex, fragment, layout, swapchain_format, super::Blend::Opaque);
+            let bloom_pipeline = super::create_graphics_pipeline(
+                device, vertex, bloom_fragment, layout, HDR_FORMAT, super::Blend::Opaque);
             device.destroy_shader_module(vertex, None);
             device.destroy_shader_module(fragment, None);
-            match pipeline {
-                Ok(pipeline) => Ok(Self { set_layout, pool, layout, pipeline, sampler }),
-                Err(error) => {
+            device.destroy_shader_module(bloom_fragment, None);
+            match (pipeline, bloom_pipeline) {
+                (Ok(pipeline), Ok(bloom_pipeline)) => Ok(Self { set_layout, pool, layout, pipeline, bloom_pipeline, sampler }),
+                (pipeline, bloom_pipeline) => {
+                    if let Ok(pipeline) = pipeline { device.destroy_pipeline(pipeline, None); }
+                    if let Ok(pipeline) = bloom_pipeline { device.destroy_pipeline(pipeline, None); }
                     destroy_all(device);
-                    Err(error)
+                    Err("could not create the camera-stage pipelines".into())
                 }
             }
         }
@@ -142,6 +161,7 @@ impl PostPipeline {
 
     pub unsafe fn destroy(&self, device: &Device) {
         device.destroy_pipeline(self.pipeline, None);
+        device.destroy_pipeline(self.bloom_pipeline, None);
         device.destroy_sampler(self.sampler, None);
         device.destroy_pipeline_layout(self.layout, None);
         device.destroy_descriptor_pool(self.pool, None);
@@ -173,6 +193,12 @@ pub(super) struct HdrTarget {
     pub descriptor_set: vk::DescriptorSet,
     pub extent: vk::Extent2D,
     mip_levels: u32,
+    /// Half-resolution bloom (bloom.frag) and the set its pass samples with.
+    bloom_image: vk::Image,
+    bloom_memory: vk::DeviceMemory,
+    bloom_view: vk::ImageView,
+    bloom_extent: vk::Extent2D,
+    bloom_set: vk::DescriptorSet,
     meter_level: u32,
     meter_extent: vk::Extent2D,
     meter_buffer: vk::Buffer,
@@ -337,7 +363,7 @@ impl HdrTarget {
                     return Err(error.into());
                 }
             };
-            Ok(Self {
+            let mut target = Self {
                 pool: post.pool,
                 image,
                 memory,
@@ -353,11 +379,115 @@ impl HdrTarget {
                 meter_ptr,
                 meter_preexposure: None,
                 pending_preexposure: None,
-            })
+                bloom_image: vk::Image::null(),
+                bloom_memory: vk::DeviceMemory::null(),
+                bloom_view: vk::ImageView::null(),
+                bloom_extent: vk::Extent2D { width: extent.width.div_ceil(2).max(1), height: extent.height.div_ceil(2).max(1) },
+                bloom_set: vk::DescriptorSet::null(),
+            };
+            if let Err(error) = target.create_bloom(device, memory_properties, post) {
+                target.destroy(device);
+                return Err(error);
+            }
+            Ok(target)
         }
     }
 
+    unsafe fn create_bloom(&mut self, device: &Device, memory_properties: vk::PhysicalDeviceMemoryProperties, post: &PostPipeline) -> RendererResult<()> {
+        self.bloom_image = device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(HDR_FORMAT)
+                .extent(vk::Extent3D { width: self.bloom_extent.width, height: self.bloom_extent.height, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )?;
+        let requirements = device.get_image_memory_requirements(self.bloom_image);
+        let index = find_memory_type(memory_properties, requirements.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        self.bloom_memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(index), None)?;
+        device.bind_image_memory(self.bloom_image, self.bloom_memory, 0)?;
+        self.bloom_view = device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(self.bloom_image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(HDR_FORMAT)
+                .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1)),
+            None,
+        )?;
+        let set_layouts = [post.set_layout];
+        self.bloom_set = device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default().descriptor_pool(post.pool).set_layouts(&set_layouts))?[0];
+        let info = |view| [vk::DescriptorImageInfo::default().sampler(post.sampler).image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let (scene, bloom) = (info(self.sampled_view), info(self.bloom_view));
+        fn write<'a>(set: vk::DescriptorSet, binding: u32, info: &'a [vk::DescriptorImageInfo; 1]) -> vk::WriteDescriptorSet<'a> {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set).dst_binding(binding).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(info)
+        }
+        // The bloom pass reads only the pyramid; its binding 1 repeats it
+        // (the bloom image is its render target).
+        device.update_descriptor_sets(&[
+            write(self.descriptor_set, 1, &bloom),
+            write(self.bloom_set, 0, &scene),
+            write(self.bloom_set, 1, &scene),
+        ], &[]);
+        Ok(())
+    }
+
+    /// The half-resolution bloom pass: after `record_resolve`, before the
+    /// camera pass samples it.
+    pub unsafe fn record_bloom(&self, device: &Device, command_buffer: vk::CommandBuffer, post: &PostPipeline) {
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let to_attachment = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(self.bloom_image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::DependencyFlags::empty(), &[], &[], &[to_attachment]);
+        let attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(self.bloom_view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let area = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: self.bloom_extent };
+        device.cmd_begin_rendering(command_buffer, &vk::RenderingInfo::default()
+            .render_area(area).layer_count(1).color_attachments(&attachment));
+        device.cmd_set_viewport(command_buffer, 0, &[vk::Viewport {
+            x: 0.0, y: 0.0, width: self.bloom_extent.width as f32, height: self.bloom_extent.height as f32,
+            min_depth: 0.0, max_depth: 1.0,
+        }]);
+        device.cmd_set_scissor(command_buffer, 0, &[area]);
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, post.bloom_pipeline);
+        device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, post.layout, 0, &[self.bloom_set], &[]);
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_end_rendering(command_buffer);
+        let to_sampled = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(self.bloom_image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[to_sampled]);
+    }
+
     pub unsafe fn destroy(&self, device: &Device) {
+        if self.bloom_set != vk::DescriptorSet::null() {
+            let _ = device.free_descriptor_sets(self.pool, &[self.bloom_set]);
+        }
+        device.destroy_image_view(self.bloom_view, None);
+        device.destroy_image(self.bloom_image, None);
+        device.free_memory(self.bloom_memory, None);
         device.unmap_memory(self.meter_memory);
         device.destroy_buffer(self.meter_buffer, None);
         device.free_memory(self.meter_memory, None);

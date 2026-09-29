@@ -86,7 +86,7 @@ const VT_DEFAULT_SLOT_BUDGET: u32 = 64;
 const DEBUG_CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
 // GPU frame timing: three timestamp queries per output (frame top, after the
 // star draw, after the Earth draw), addressed by output id in a shared pool.
-const TIMESTAMP_QUERIES_PER_OUTPUT: u32 = 3;
+const TIMESTAMP_QUERIES_PER_OUTPUT: u32 = 4;
 const TIMESTAMP_OUTPUT_SLOTS: u32 = 32;
 // GPU timing is a diagnostics side channel for the status line, sampled once
 // every N presented frames per output instead of every frame.
@@ -1524,7 +1524,8 @@ struct OutputTarget {
     query_base: u32,
     // Raw ticks from the last completed frame: [frame top, after star draw,
     // after Earth draw]. Multiply by DeviceState::timestamp_period_ns.
-    last_gpu_ticks: [u64; 3],
+    /// Frame top, after stars, after the Earth, after the camera stage.
+    last_gpu_ticks: [u64; 4],
     // Sample every N submissions, read after that submission's fence signals.
     query_clock: u32,
     query_pending: bool,
@@ -1887,29 +1888,25 @@ impl Renderer {
     pub fn status_fields(&self) -> String {
         let channels = self.channels_label.as_str();
         let vt_bytes = self.vt_streamer.as_ref().map(|streamer| streamer.residency().resident_bytes()).unwrap_or(0);
-        // Worst-output GPU frame timing from the timestamp queries:
-        // total = frame top -> after Earth draw, split at the star draw.
-        let (gpu_total_ms, gpu_star_ms, gpu_earth_ms) = match self.device.as_ref() {
+        // GPU frame timing from the timestamp queries, summed over outputs
+        // (each renders its own frame): stars, Earth, camera stage (mip
+        // pyramid, glare, tone curve).
+        let (gpu_total_ms, gpu_star_ms, gpu_earth_ms, gpu_post_ms) = match self.device.as_ref() {
             Some(device) => {
-                let mut total_ticks = 0u64;
-                let mut star_ticks = 0u64;
-                let mut earth_ticks = 0u64;
+                let mut ticks = [0u64; 3];
                 for target in self.outputs.values() {
-                    let [top, after_stars, after_earth] = target.last_gpu_ticks;
-                    if after_earth > top {
-                        total_ticks = total_ticks.max(after_earth - top);
-                        star_ticks = star_ticks.max(after_stars.saturating_sub(top));
-                        earth_ticks = earth_ticks.max(after_earth.saturating_sub(after_stars));
+                    let [top, after_stars, after_earth, after_post] = target.last_gpu_ticks;
+                    if after_post > after_earth && after_earth >= after_stars && after_stars >= top {
+                        ticks[0] += after_stars - top;
+                        ticks[1] += after_earth - after_stars;
+                        ticks[2] += after_post - after_earth;
                     }
                 }
                 let period = f64::from(device.timestamp_period_ns) / 1_000_000.0;
-                (
-                    total_ticks as f64 * period,
-                    star_ticks as f64 * period,
-                    earth_ticks as f64 * period,
-                )
+                let [star, earth, post] = ticks.map(|value| value as f64 * period);
+                (star + earth + post, star, earth, post)
             }
-            None => (0.0, 0.0, 0.0),
+            None => (0.0, 0.0, 0.0, 0.0),
         };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         let weather = self.weather.as_ref().map(|state| format!("{} weather_utc={} weather_age_hours={:.1} aurora=NOAA-OVATION aurora_utc={} lightning=simulated",
@@ -1929,7 +1926,7 @@ impl Renderer {
             Some(state) if state.live_clouds(now).is_some() && state.live_sea_ice(now) => "OSI-SAF",
             _ => "none",
         };
-        format!("vt_tiles={} static_tiles={} body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2})", self.vt_wanted_tiles.0, self.vt_wanted_tiles.1, self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
+        format!("vt_tiles={} static_tiles={} body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2},post={gpu_post_ms:.2})", self.vt_wanted_tiles.0, self.vt_wanted_tiles.1, self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
     }
 
     pub unsafe fn configure_output(
@@ -5864,7 +5861,7 @@ impl OutputTarget {
             output_name: debug_output_name.unwrap_or("output").to_owned(),
             capture_supported,
             query_base: 0,
-            last_gpu_ticks: [0; 3],
+            last_gpu_ticks: [0; 4],
             // Presented-frame counter; queries are written+read only when
             // `query_clock % TIMESTAMP_SAMPLE_EVERY == 0`, otherwise the last
             // sample is reused by status_fields.
@@ -5930,7 +5927,7 @@ impl OutputTarget {
             // GPU timing can be read back before this frame reuses the slots.
             // Sampled 1/N frames; in between the last sample stays put.
             let sample_gpu = self.query_clock % TIMESTAMP_SAMPLE_EVERY == 0;
-            let mut ticks = [0u64; 3];
+            let mut ticks = [0u64; TIMESTAMP_QUERIES_PER_OUTPUT as usize];
             if self.query_pending
                 && device
                 .device
@@ -6021,7 +6018,7 @@ impl OutputTarget {
                     command_buffer,
                     device.timestamp_pool,
                     self.query_base,
-                    3,
+                    TIMESTAMP_QUERIES_PER_OUTPUT,
                 );
                 device.device.cmd_write_timestamp(
                     command_buffer,
@@ -6197,7 +6194,16 @@ impl OutputTarget {
                 device.device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
             device.device.cmd_end_rendering(command_buffer);
+            if sample_gpu {
+                device.device.cmd_write_timestamp(
+                    command_buffer,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    device.timestamp_pool,
+                    self.query_base + 2,
+                );
+            }
             hdr.record_resolve(&device.device, command_buffer);
+            hdr.record_bloom(&device.device, command_buffer, &pipeline.post);
             let to_color = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
@@ -6256,7 +6262,7 @@ impl OutputTarget {
                     command_buffer,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     device.timestamp_pool,
-                    self.query_base + 2,
+                    self.query_base + 3,
                 );
             }
             if let Some(capture_buffer) = capture_buffer {

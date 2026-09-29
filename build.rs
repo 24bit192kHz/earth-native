@@ -32,6 +32,7 @@ fn main() {
         ("stars_points.vert", "stars_points.vert.spv"),
         ("stars_points.frag", "stars_points.frag.spv"),
         ("post.frag", "post.frag.spv"),
+        ("bloom.frag", "bloom.frag.spv"),
     ];
     // Fold the compiler identity into the cache key so a glslc upgrade
     // rebuilds even when every source is unchanged.

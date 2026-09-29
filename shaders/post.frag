@@ -20,6 +20,7 @@ layout(location = 0) noperspective in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D scene;
+layout(set = 0, binding = 1) uniform sampler2D bloom_map;
 
 layout(push_constant) uniform PostFrame {
     vec4 tone;        // x contrast, y mode (0 camera, 1 legacy), z seed, w noise
@@ -53,37 +54,6 @@ vec3 camera_curve(vec3 x) {
     const float knee = 0.55;
     vec3 shoulder = knee + (1.0 - knee) * (1.0 - exp(-(x - knee) / (1.0 - knee)));
     return mix(x, shoulder, step(knee, x));
-}
-
-vec4 cubic_weights(float v) {
-    vec4 n = vec4(1.0, 2.0, 3.0, 4.0) - v;
-    vec4 s = n * n * n;
-    float x = s.x;
-    float y = s.y - 4.0 * s.x;
-    float z = s.z - 4.0 * s.y + 6.0 * s.x;
-    float w = 6.0 - x - y - z;
-    return vec4(x, y, z, w) * (1.0 / 6.0);
-}
-
-// Cubic B-spline filtered read of one pyramid level (4 bilinear taps), which
-// turns the blocky box pyramid into smooth Gaussian-like blurs.
-vec3 smooth_level(float level, vec2 uv) {
-    vec2 size = vec2(textureSize(scene, int(level)));
-    vec2 texel = uv * size - 0.5;
-    vec2 f = fract(texel);
-    texel -= f;
-    vec4 xw = cubic_weights(f.x);
-    vec4 yw = cubic_weights(f.y);
-    vec4 c = texel.xxyy + vec2(-0.5, 1.5).xyxy;
-    vec4 s = vec4(xw.xz + xw.yw, yw.xz + yw.yw);
-    vec4 offset = (c + vec4(xw.yw, yw.yw) / s) / size.xxyy;
-    vec3 a = textureLod(scene, offset.xz, level).rgb;
-    vec3 b = textureLod(scene, offset.yz, level).rgb;
-    vec3 d = textureLod(scene, offset.xw, level).rgb;
-    vec3 e = textureLod(scene, offset.yw, level).rgb;
-    float sx = s.x / (s.x + s.y);
-    float sy = s.z / (s.z + s.w);
-    return mix(mix(e, d, sx), mix(b, a, sx), sy);
 }
 
 float hash13(vec3 p) {
@@ -174,25 +144,10 @@ void main() {
         return;
     }
 
-    // Near-field glare: a power-law mixture of blurred pyramid levels, each
-    // softly compressed above BLOOM_KNEE (local adaptation). A night exposure
-    // puts a thin sunlit limb ~2^10 over white; uncompressed, its bloom was
-    // a white fog, which is why the meter used to hold a daylight exposure
-    // for it and the night side and stars went black.
-    const float BLOOM_KNEE = 16.0;
-    vec3 blur = vec3(0.0);
-    float weight_sum = 0.0;
-    float weight = 1.0;
-    int top = min(textureQueryLevels(scene) - 1, 9);
-    for (int level = 1; level <= top; ++level) {
-        vec3 level_colour = smooth_level(float(level), uv);
-        level_colour /= 1.0 + max(level_colour.r, max(level_colour.g, level_colour.b)) / BLOOM_KNEE;
-        blur += level_colour * weight;
-        weight_sum += weight;
-        weight *= 0.78;
-    }
+    // Near-field glare: the pyramid mixture, precomputed at half resolution
+    // (bloom.frag).
     const float bloom = 0.012;
-    colour = mix(colour, min(blur / max(weight_sum, 1.0e-6), vec3(65000.0)), bloom);
+    colour = mix(colour, textureLod(bloom_map, uv, 0.0).rgb, bloom);
 
     vec2 global_xy = post.viewport.xy + uv * post.viewport.zw;
     vec2 ndc = vec2(
