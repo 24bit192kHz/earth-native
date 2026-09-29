@@ -4,9 +4,10 @@
 usage: tools/render-previews [OUTPUT_DIR]   (default docs/previews)
 Each shot pins UTC and the camera through tools/earth-native-aim, then the
 live state is restored. Planet cameras are placed from the body's real Sun
-direction so every globe shows a natural phase. The aurora shot uses tonight's
-oval (`camera aurora`); for a storm, run `data_pipeline.py aurora-preview --kp 7`
-first and `data_pipeline.py weather` after.
+direction so every globe shows a natural phase. The aurora shot looks at
+tonight's oval (found by `camera aurora`) from 1500 km, where its ribbons
+read; for a storm, run `data_pipeline.py aurora-preview --kp 7` first and
+`data_pipeline.py weather` after.
 """
 import json, math, os, shutil, subprocess, sys, tempfile, time
 
@@ -32,27 +33,21 @@ def aim(tag, unix, lat, lon, dist, target=None, crop="1600x1440"):
     return os.path.join(WORK, f"{tag}.jpg")
 
 
-def pov(tag, unix, lat, lon, alt_km, heading):
+def pov(tag, unix, lat, lon, alt_km, heading, pitch="auto"):
     env = dict(os.environ, EARTH_NATIVE_AIM_DIR=WORK)
-    subprocess.run([AIM, tag, str(unix), "--pov", str(lat), str(lon), str(alt_km), str(heading), "auto", "78"],
+    subprocess.run([AIM, tag, str(unix), "--pov", str(lat), str(lon), str(alt_km), str(heading), str(pitch), "78"],
                    check=True, env=env, capture_output=True)
     return os.path.join(WORK, f"{tag}.jpg")
 
 
 def aurora(tag):
-    """`camera aurora`: live UTC, near tonight's strongest aurora, facing it."""
+    """Live UTC: tonight's strongest aurora, seen from 1500 km, 13 degrees
+    equatorward of it and facing the pole."""
     cli("time", "live")
-    cli("camera", "aurora")
-    time.sleep(6.0)  # exposure and virtual-texture pages settle
-    frame = json.loads(cli("capture_frame"))
-    widest = max(frame["captures"], key=lambda capture: capture["width"])
-    out = os.path.join(WORK, f"{tag}.jpg")
-    shutil.copy(widest["image"], out)
-    for capture in frame["captures"]:
-        for path in (capture["image"], capture["image"].rsplit(".", 1)[0] + ".json"):
-            if os.path.exists(path):
-                os.remove(path)
-    return out
+    found = dict(field.split("=", 1) for field in cli("camera", "aurora").split() if "=" in field)
+    lat, lon = float(found["aurora_lat"]), float(found["aurora_lon"])
+    south = lat < 0
+    return pov(tag, int(time.time()), lat + (13 if south else -13), lon, 1500, 180 if south else 0, 35)
 
 
 def publish(source, name, width):
@@ -91,7 +86,9 @@ try:
     # The view from the ISS window (pinned UTC, 78 degree lens).
     publish(pov("iss-day", 1710936000, 24, 36, 420, 330), "iss-day.jpg", 1000)
     publish(pov("iss-himalaya", 1710925200, 24, 84, 420, 330), "iss-himalaya.jpg", 1000)
-    publish(pov("iss-night", 1710975600, 24, 32, 420, 350), "iss-night.jpg", 1000)
+    publish(pov("iss-clouds", 1710920000, 36, -4, 420, 100), "iss-clouds.jpg", 1000)
+    publish(pov("iss-sunrise", 1710948312, 20, 60, 420, 262), "iss-sunrise.jpg", 1000)
+    publish(pov("iss-night", 1710975600, 40, 5, 420, 40), "iss-night.jpg", 1000)
     publish(aurora("iss-aurora"), "iss-aurora.jpg", 1000)
     # Equinox, camera 90 degrees from the Sun: the terminator runs down the disk.
     publish(aim("earth-twilight", 1710936000, 15, 75, 8, crop="1600x1440"), "earth-twilight.jpg", 1000)

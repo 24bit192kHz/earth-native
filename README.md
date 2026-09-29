@@ -18,7 +18,8 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 
 - **The sky, right now.** Sun, Moon and planets come from Astronomy Engine and
   match JPL Horizons to the arc-minute; day and night, the terminator, lunar
-  phase, and even **solar eclipse shadows** are where they really are.
+  phase, and even **solar eclipse shadows** are where they really are. The
+  stars and the Milky Way stay visible beside the daylit Earth and the Sun.
 - **NASA imagery down to 500 m.** Blue Marble Next Generation, Black Marble
   city lights, GEBCO relief, the LRO Moon, and 41 394 Hipparcos stars drawn
   one by one. The release pack is 8K (~5 km); the optional 500 m set streams
@@ -26,13 +27,15 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
   ([baked locally](docs/DATA.md#high-resolution-earth-500-m), ~3 GB per month).
 - **Real atmosphere.** Multiple scattering with published Rayleigh, ozone and
   aerosol constants in true sRGB colour bands: a blue limb, cyan haze, orange
-  twilight, Cox–Munk sunglint, moonlit clouds and night-side airglow.
+  twilight, Cox–Munk sunglint, moonlit clouds and night-side airglow. City
+  lights, night clouds and aurora keep a night exposure of their own, so
+  they show beside the daylit globe and under a sunrise.
 - **Live Earth.** Today's clouds from NOAA's geostationary mosaic, today's
   dust and smoke haze from NOAA GEFS-Aerosols, today's sea ice from EUMETSAT
   OSI SAF, a volumetric **aurora** placed by NOAA's OVATION forecast, and
   lightning where NOAA GFS reports thunderstorms.
 - **The view from the ISS.** A camera riding the real ISS orbit with a
-  window-camera look: auto exposure, sun glare and starburst, bloom,
+  window-camera look: auto exposure, a glowing Sun, bloom,
   vignetting and grain.
 - **Every planet.** Mercury, Venus, Mars, Jupiter, Saturn (with rings),
   Uranus and Neptune plus the Moon — each with its IAU axis and rotation,
@@ -41,7 +44,7 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
   virtual textures, motion-gated redraws (20 fps while riding the ISS, 8 on
   the globe), idle CPU priority. On an RTX 3080 Ti driving 3440×1440 and
   2560×1080 monitors with the 500 m set: ~7 ms of GPU time per frame from
-  the ISS, ~560 MiB of VRAM, ~3 % of one CPU core, ~150 MB of RAM, first
+  the ISS, ~580 MiB of VRAM, ~3 % of one CPU core, ~150 MB of RAM, first
   frame 0.55 s after start; the weather feed holds 26 MB between updates.
 - **Native everywhere.** Wayland via wlr-layer-shell (Hyprland, Sway, KDE
   Plasma, niri, river, labwc, Wayfire…) and Xorg via an EWMH desktop window on
@@ -55,8 +58,10 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 |:-:|:-:|
 | ![From the ISS window: the Nile, Sinai and the eastern Mediterranean by day](docs/previews/iss-day.jpg) | ![From the ISS window: the Himalaya and the Tibetan Plateau](docs/previews/iss-himalaya.jpg) |
 | The Nile, Sinai and the Levant | The Himalaya and the Tibetan Plateau |
-| ![From the ISS window: the Nile and Cairo at night](docs/previews/iss-night.jpg) | ![From the ISS window: aurora australis on the horizon](docs/previews/iss-aurora.jpg) |
-| The same coast at night, under the green airglow layer | Aurora australis in a Kp 7 storm (synthetic oval, `aurora-preview`) |
+| ![From the ISS window: cloud over Spain and Morocco under a low Sun](docs/previews/iss-clouds.jpg) | ![From the ISS window: sunrise over the Arabian Sea](docs/previews/iss-sunrise.jpg) |
+| Cloud over Spain and Morocco under a low morning Sun | Sunrise: the twilight arc, the Sun and the city lights below |
+| ![From the ISS window: western Europe at night](docs/previews/iss-night.jpg) | ![Aurora from 1500 km](docs/previews/iss-aurora.jpg) |
+| Western Europe at night | Tonight's aurora from 1500 km (live NOAA OVATION oval) |
 
 **The globe**
 

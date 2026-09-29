@@ -136,6 +136,12 @@ vec3 planet_textured(vec3 normal, vec2 uv, vec2 planet_dx, vec2 planet_dy, vec3 
     // at the call site: dFdx/dFdy inside the disc branch below would be
     // undefined at silhouette quads (non-uniform participation). textureGrad
     // needs no derivatives itself, so fetching here stays well-defined.
+    // The ice giants are almost featureless: their maps' gradients are
+    // below what BC1 blocks can carry and show as streaks and squares, so
+    // Uranus is read four mips down and Neptune two.
+    float soften = body == 6 ? 16.0 : (body == 7 ? 4.0 : 1.0);
+    planet_dx *= soften;
+    planet_dy *= soften;
     vec3 albedo = textureGrad(planet_texture, uv, planet_dx, planet_dy).rgb;
 
     // Solar response with a finite angular solar disk at the terminator.

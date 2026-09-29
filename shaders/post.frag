@@ -10,8 +10,6 @@
 //    (scatter from glass, coatings and the window); near field comes from the
 //    mip pyramid, the far field from the bright sources analytically so it
 //    stays continuous across monitors;
-//  - diffraction by a nine-blade iris: an 18-ray starburst on the Sun;
-//  - internal reflections: faint coloured ghosts mirrored through the centre;
 //  - natural vignetting (cos^4, partly corrected as a camera profile does);
 //  - a filmic response, mild saturation and dithered 8-bit output with
 //    exposure-dependent sensor noise.
@@ -112,36 +110,31 @@ vec3 source_glare(vec3 ray, vec2 pixel_ndc, vec4 source, vec4 light, float starb
     return glare;
 }
 
-// Internal reflections: discs mirrored through the optical centre.
-vec3 ghosts(vec2 pixel_ndc, vec4 source, vec4 light, float px_per_rad) {
-    if (light.w < 0.5 || source.z <= 0.05) return vec3(0.0);
-    vec2 s = source.xy / source.z / post.projection.xy;
-    if (any(greaterThan(abs(s), vec2(1.6)))) return vec3(0.0);
-    vec3 energy = light.rgb;
-    const int count = 5;
-    const float along[count] = float[](-0.35, -0.72, -1.15, 0.42, -1.55);
-    const float radius[count] = float[](0.030, 0.085, 0.050, 0.022, 0.16);
-    const vec3 colour[count] = vec3[](vec3(0.45, 1.0, 0.55), vec3(0.75, 0.45, 1.0),
-        vec3(1.0, 0.75, 0.35), vec3(0.5, 0.8, 1.0), vec3(0.6, 1.0, 0.8));
-    vec3 sum = vec3(0.0);
-    float aspect = post.projection.x / post.projection.y;
-    for (int i = 0; i < count; ++i) {
-        vec2 centre = s * along[i];
-        vec2 d = (pixel_ndc - centre) * vec2(aspect, 1.0);
-        float r = length(d) / radius[i];
-        float disc = smoothstep(1.0, 0.82, r) * (0.55 + 0.45 * r * r);
-        sum += colour[i] * disc / (radius[i] * radius[i]);
-    }
-    return energy * sum * 2.5e-6;
-}
-
 void main() {
     vec2 uv = in_uv;
     vec3 colour = min(textureLod(scene, uv, 0.0).rgb, vec3(65000.0));
 
     if (post.tone.y > 0.5) {
-        out_color = vec4(legacy_filmic(colour), 1.0);
+        // Dithered like the camera path: the smooth limb darkening of a
+        // planet's disc banded in 8 bits.
+        vec3 legacy = clamp(legacy_filmic(colour), 0.0, 1.0);
+        vec3 encoded = mix(12.92 * legacy, 1.055 * pow(legacy, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, legacy));
+        vec3 seed = vec3(gl_FragCoord.xy, 0.0);
+        encoded = clamp(encoded + (hash13(seed + 3.7) + hash13(seed + 9.1) - 1.0) / 255.0, 0.0, 1.0);
+        out_color = vec4(mix(encoded / 12.92, pow((encoded + 0.055) / 1.055, vec3(2.4)), step(0.04045, encoded)), 1.0);
         return;
+    }
+
+    // Local adaptation, as for the Moon's disc: above 0.5 the luminance is
+    // compressed toward 1.2 with the hue kept. At a night exposure the
+    // twilight arc is 2^7 over white: uncompressed it was a featureless
+    // white band; now it keeps its orange, white and blue layers beside
+    // the city lights, which stay golden instead of clipping. The meter
+    // reads the scene before this.
+    float scene_luminance = dot(colour, vec3(0.2126, 0.7152, 0.0722));
+    if (scene_luminance > 0.5) {
+        float over = scene_luminance - 0.5;
+        colour *= (0.5 + over / (1.0 + over / 0.7)) / scene_luminance;
     }
 
     // Near-field glare: the pyramid mixture, precomputed at half resolution
@@ -156,13 +149,21 @@ void main() {
     vec3 ray = normalize(vec3(ndc * post.projection.xy, 1.0));
     float px_per_rad = post.canvas.w * 0.5 / post.projection.y;
 
-    colour += source_glare(ray, ndc, post.sun, post.sun_light, 1.0, px_per_rad);
-    colour += source_glare(ray, ndc, post.moon, post.moon_light, 0.15, px_per_rad);
-    colour += ghosts(ndc, post.sun, post.sun_light, px_per_rad);
+    // The Sun is a soft glowing disc: no diffraction rays, no ghosts.
+    colour += source_glare(ray, ndc, post.sun, post.sun_light, 0.0, px_per_rad);
+    colour += source_glare(ray, ndc, post.moon, post.moon_light, 0.0, px_per_rad);
 
     // Natural vignetting, 60 % corrected (a lens profile's residual).
     float cos_axis = ray.z;
     colour *= mix(1.0, cos_axis * cos_axis * cos_axis * cos_axis, 0.4);
+
+    // Camera colour rendering. The sensor's green channel reaches well into
+    // the blue (and its blue into the green), and the raw conversion only
+    // partly undoes it: Rayleigh blue comes out azure, open water teal.
+    // Rows sum to one, so greys stay grey. Calibrated on the footage: open
+    // ocean blue/green 2.3 -> 1.7 (footage 1.4-2.0), red/green 0.51 -> 0.40
+    // (0.26-0.36); land is left within 0.05.
+    colour = vec3(colour.r, mix(colour.g, colour.b, 0.2), mix(colour.b, colour.g, 0.1));
 
     // Photographic grade, as in the processed Earth Observation frames:
     // contrast in log space around mid-grey and a saturation boost (a raw
@@ -171,7 +172,11 @@ void main() {
     float contrast = post.tone.x;
     colour *= pow(min(scene_luma, 1.0e3) / 0.18, contrast - 1.0);
     scene_luma = max(dot(colour, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
-    colour = max(mix(vec3(scene_luma), colour, 1.3), vec3(0.0));
+    // Past clipping a sensor's channels saturate together: highlights run
+    // to white. Without this an overexposed twilight arc kept its hue and
+    // printed hard yellow and cyan lines where one channel was absent.
+    float saturation = 1.3 * (1.0 - smoothstep(1.0, 6.0, scene_luma));
+    colour = max(mix(vec3(scene_luma), colour, saturation), vec3(0.0));
     colour = camera_curve(colour);
     float luma = dot(colour, vec3(0.2126, 0.7152, 0.0722));
 

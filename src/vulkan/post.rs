@@ -170,10 +170,6 @@ impl PostPipeline {
     }
 }
 
-/// Metering key of a frame without the Earth: the exposure of an ISS night
-/// series (EV ~17), so a starfield shows its stars.
-const STARFIELD_LOG2_LUMINANCE: f32 = -21.4;
-
 /// Scene-referred luminance statistics from one completed frame.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MeterReading {
@@ -595,11 +591,14 @@ impl HdrTarget {
             .get(((whole_frame.len() as f32 * 0.97) as usize).min(whole_frame.len().saturating_sub(1)))
             .copied()
             .unwrap_or(0.0);
-        let highlight = if p97 > 2.0e-3 { p97 / 8.0 } else { 0.0 };
+        // The band keeps its colours (orange, white, blue) at ~1.5 stops
+        // over the key; at 3 stops over it was a featureless white arc.
+        let highlight = if p97 > 2.0e-3 { p97 / 3.0 } else { 0.0 };
         let total: f32 = samples.iter().map(|(_, w)| w).sum();
         if total < 0.02 * (width * height) as f32 {
-            let log2_luminance = if highlight > 1.0e-3 { highlight.log2() } else { STARFIELD_LOG2_LUMINANCE };
-            return Some(MeterReading { log2_luminance, coverage });
+            // No Earth in frame: the sky has a fixed brightness, so keep
+            // the exposure (no flash when the Earth comes back into view).
+            return None;
         }
         samples.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut accumulated = 0.0;

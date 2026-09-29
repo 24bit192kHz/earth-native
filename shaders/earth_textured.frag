@@ -111,6 +111,25 @@ float preexposure() {
     return frame.camera_position_distance.w;
 }
 
+// The night side has an exposure of its own, as the adapted eye (or a
+// composited film) shows it: whatever the camera's exposure, city lights,
+// moonlit cloud, lightning, airglow and aurora are drawn as a night series
+// (EV 16) records them. They stay visible beside the daylit Earth and
+// under a sunrise. At a night exposure the factor is one.
+float night_gain() {
+    return max(1.0, 65536.0 / preexposure());
+}
+
+// The same gain eased in through twilight (in stops, so it has no edge):
+// none where the Sun is up, all of it once the Sun is 14 degrees down.
+float night_gain(float mu_sun) {
+    return pow(night_gain(), 1.0 - smoothstep(-0.25, -0.03, mu_sun));
+}
+
+// Moonlight and starlight as the dark-adapted eye and night footage show
+// them: slightly blue (the Purkinje shift).
+const vec3 NIGHT_TINT = vec3(0.80, 0.92, 1.12);
+
 float sphere_intersection(vec3 origin, vec3 direction, float radius, out float discriminant) {
     float b = dot(origin, direction);
     float c = dot(origin, origin) - radius * radius;
@@ -328,7 +347,9 @@ float cox_munk_glint(vec3 normal, vec3 light, vec3 ray) {
     // Schlick water Fresnel: ((1.333 - 1) / (1.333 + 1))^2.
     float fresnel = 0.02037 + 0.97963 * pow(1.0 - max(dot(h, light), 0.0), 5.0);
     float nv = max(dot(normal, -ray), 0.05);
-    return 3.14159265 * fresnel * facets / (4.0 * nv) * step(0.0, dot(normal, light));
+    // The glint fades as the Sun sets on the water (waves shadow each
+    // other); a step here drew the terminator as a straight cut.
+    return 3.14159265 * fresnel * facets / (4.0 * nv) * smoothstep(0.0, 0.08, dot(normal, light));
 }
 
 vec2 sphere_uv(vec3 normal) {
@@ -565,20 +586,23 @@ bool live_clouds() {
 // isotropic on the ground with no lat/lon shear (which smeared it into
 // streaks away from the prime meridian). The variance-preserving blend
 // keeps its contrast where two projections overlap.
-float cloud_noise(vec3 n, float tile_km, vec2 offset) {
+float cloud_noise(vec3 n, float tile_km, vec2 offset, float bias) {
     vec3 p = n * (R_GROUND / tile_km);
     vec3 w = pow(abs(n), vec3(8.0));
     w /= w.x + w.y + w.z;
     float mean = textureLod(tiling_noise, vec2(0.5), 16.0).r;
-    vec3 s = vec3(texture(tiling_noise, p.yz + offset).r,
-                  texture(tiling_noise, p.zx + offset).r,
-                  texture(tiling_noise, p.xy + offset).r);
+    vec3 s = vec3(texture(tiling_noise, p.yz + offset, bias).r,
+                  texture(tiling_noise, p.zx + offset, bias).r,
+                  texture(tiling_noise, p.xy + offset, bias).r);
     return mean + (dot(w, s) - mean) * inversesqrt(dot(w, w));
 }
 
+// The fine octave is read two mips down: cloud elements are rounded at
+// the ~0.5 km scale, and the fractal's last octaves only frayed their edges
+// into specks.
 float cloud_detail(vec3 n) {
-    return 0.68 * cloud_noise(n, 222.0, vec2(0.0))
-        + 0.32 * cloud_noise(n, 28.0, vec2(0.37, 0.71));
+    return 0.68 * cloud_noise(n, 222.0, vec2(0.0), 0.0)
+        + 0.32 * cloud_noise(n, 28.0, vec2(0.37, 0.71), 2.0);
 }
 
 // Real cloud morphology at 1 km (cloud streets, open and closed cells,
@@ -639,19 +663,29 @@ float morphology_quantile_offset(float q) {
 // stands in for optical depth, and reflectance grows with it (two-stream
 // R ~ (1-g)tau / (2 + (1-g)tau)): thin fringes stay grey, cores go white,
 // so a deck keeps its lumpy texture instead of a flat cut-out fill.
-vec2 live_cloud(vec2 map_uv, vec3 n) {
+// z: relief of the cloud top (0 at the edge, 1 over a core), for shading.
+//
+// `slant` is tan(view zenith angle) at the shell. Clouds have sides: a field
+// of fraction f and height/width ratio a hides 1 - (1 - f)^(1 + a tan) of
+// what is behind it (random overlap), so broken cloud closes up toward the
+// horizon, as in every oblique photograph from orbit. Zero for the Sun's
+// path (shadows are cast by the cover itself).
+const float CLOUD_ASPECT = 0.25;
+vec3 live_cloud(vec2 map_uv, vec3 n, float slant) {
     vec2 dx = dFdx(map_uv);
     vec2 dy = dFdy(map_uv);
     dx.x -= round(dx.x);
     dy.x -= round(dy.x);
     float cover = clamp(live_cloud_cover(map_uv, dx, dy), 0.0, 1.0);
+    cover = 1.0 - pow(1.0 - cover, 1.0 + CLOUD_ASPECT * slant);
     float morphology = cloud_morphology(map_uv, n);
     float mean = 0.55 * textureLod(tiling_noise, vec2(0.5), 16.0).r + 0.45 * 0.244;
     float threshold = mean + morphology_quantile_offset(1.0 - cover);
     float band = max(0.012, 0.5 * fwidth(morphology));
     float opacity = smoothstep(threshold - band - 0.015, threshold + band + 0.015, morphology);
     float depth = smoothstep(0.0, 0.22, morphology - threshold);
-    vec2 near = vec2(opacity, mix(0.5, 0.92, depth));
+    float rise = max(morphology - threshold, 0.0);
+    vec3 near = vec3(opacity, mix(0.5, 0.92, depth), rise / (rise + 0.12));
     // From afar the mips average the morphology toward its mean, so the
     // quantile cut above collapses into an on/off switch at 50 % cover:
     // flat white cut-outs tracing the 10 km grid on the globe. Once a pixel
@@ -660,13 +694,13 @@ vec2 live_cloud(vec2 map_uv, vec3 n) {
     float km_x = length(vec2(dx.x * 40075.0 * sqrt(max(1.0 - n.z * n.z, 0.0)), dx.y * 20037.5));
     float km_y = length(vec2(dy.x * 40075.0 * sqrt(max(1.0 - n.z * n.z, 0.0)), dy.y * 20037.5));
     float far = smoothstep(1.5, 8.0, max(km_x, km_y));
-    vec2 wide = vec2(clamp(cover + (morphology - mean) * 1.2 * (1.0 - abs(2.0 * cover - 1.0)), 0.0, 1.0),
-        mix(0.55, 0.9, smoothstep(0.3, 0.95, cover)));
+    float wide_opacity = clamp(cover + (morphology - mean) * 1.2 * (1.0 - abs(2.0 * cover - 1.0)), 0.0, 1.0);
+    vec3 wide = vec3(wide_opacity, mix(0.55, 0.9, smoothstep(0.3, 0.95, cover)), wide_opacity);
     return mix(near, wide, far);
 }
 
 float live_cloud_opacity(vec2 map_uv, vec3 n) {
-    return live_cloud(map_uv, n).x;
+    return live_cloud(map_uv, n, 0.0).x;
 }
 
 float sample_cloud_density(vec2 mesh_uv0, vec3 cloud_normal) {
@@ -744,6 +778,10 @@ float aurora_value_noise(vec2 uv, vec2 cells) {
 // 4.7e-9 in sunlight units (see the airglow note). Bright discrete arcs are
 // 10-100 kR overhead and several times that edge-on at the limb.
 const float KILORAYLEIGH = 4.7e-9;
+// Display gain: quiet ovals (OVATION 10-20 %) are ~1-5 kR, under the
+// night key; this brings them to the brightness of the curtains in
+// orbital time-lapses and in the Incredible Earth reference renders.
+const float AURORA_GAIN = 150.0;
 
 // Volumetric march through the 90-320 km auroral shell. NOAA OVATION gives
 // where the oval is and how active it is; the structure follows DMSP/VIIRS
@@ -820,12 +858,12 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         // them by up to ~100 km and drift over minutes.
         float fold = aurora_noise(uv + vec2(time * 3.0e-4, time * 4.0e-5), vec2(3.0, 1.5), footprint_uv)
             + 0.35 * aurora_noise(uv - vec2(time * 9.0e-4, 0.0), vec2(11.0, 4.0), footprint_uv);
-        float fold_km = (fold - 0.675) * 150.0;
+        float fold_km = (fold - 0.675) * 320.0;
         float spacing = max(abs(slope), 4.0e-5);
         // A bright arc is a bundle of 1-10 km sheets; seen from orbit it
         // reads as a soft band ~30 km wide. Under a footprint it widens with
         // its energy conserved rather than aliasing.
-        const float arc_km = 30.0;
+        const float arc_km = 14.0;
         float arc_sigma = sqrt(arc_km * arc_km + footprint_km * footprint_km);
         float arc_gain = arc_km / arc_sigma;
         float arcs = 0.0;
@@ -849,7 +887,7 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         // field), 15-40 km cells drifting eastward along the arcs; filtered
         // by the footprint so distant or coarsely sampled rays average out.
         float ray_noise = aurora_noise(vec2(uv.x + time * 2.5e-4, uv.y), vec2(160.0, 90.0), footprint_uv);
-        float rays = mix(1.0, 0.35 + 1.3 * ray_noise * ray_noise, 0.8 * (1.0 - smoothstep(20.0, 60.0, footprint_km)));
+        float rays = mix(1.0, 0.15 + 2.2 * ray_noise * ray_noise, 0.9 * (1.0 - smoothstep(80.0, 250.0, footprint_km)));
         float pulse = 0.88 + 0.12 * sin(time * 1.1 + ray_noise * 9.0);
         // Diffuse aurora: smooth large patches over the whole oval.
         float patches = aurora_noise(uv + vec2(time * 1.0e-4, 0.0), vec2(26.0, 13.0), footprint_uv);
@@ -865,8 +903,10 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         // kR per km: diffuse ~1 kR overhead over ~50 km of column, arcs
         // ~20 kR over ~40 km.
         float discrete = arcs * rays * pulse;
-        vec3 local = vec3(0.30, 1.0, 0.30) * green * (0.03 * diffuse + 0.55 * discrete)
-            + vec3(1.0, 0.07, 0.12) * red * (0.012 * diffuse + 0.05 * discrete)
+        // Arcs carry the display: the diffuse glow alone integrates to a
+        // featureless band along the limb.
+        vec3 local = vec3(0.15, 1.0, 0.25) * green * (0.02 * diffuse + 0.9 * discrete)
+            + vec3(1.0, 0.07, 0.12) * red * (0.002 * diffuse + 0.02 * discrete)
             + vec3(0.9, 0.25, 0.8) * fringe * 0.25 * discrete * smoothstep(0.3, 1.0, discrete);
         emission += local * visible * step_km;
     }
@@ -1037,21 +1077,22 @@ void main() {
 
         // Night: moonlight, starlight/airglow and city lights.
         vec3 moon_beam = light_transmittance(r_ground, mu_moon, MOON_ANGULAR_RADIUS) * moon_irradiance;
-        ground += albedo * (moon_beam * max(dot(shading_normal, moon), 0.0) + NIGHT_SKY_IRRADIANCE);
-        ground += water * cox_munk_glint(normal, moon, ray) * moon_beam;
-        // Lights are hidden by daylight at any exposure; skip the fetches.
         float night = 1.0 - smoothstep(-0.05, 0.02, mu_sun);
+        vec3 night_light = NIGHT_TINT * night_gain(mu_sun);
+        ground += albedo * (moon_beam * max(dot(shading_normal, moon), 0.0) + NIGHT_SKY_IRRADIANCE) * night_light;
+        ground += water * cox_munk_glint(normal, moon, ray) * moon_beam * night_light;
+        // Lights are hidden by daylight at any exposure; skip the fetches.
         if (night > 0.0) {
             // Black Marble lights are grayscale radiance; colour them from
             // intensity: dim suburbs read sodium orange, dense cores warm white.
             float lights = nasa_lights(sample_static(static_night_atlas, night_emission, map_uv, map_dx, map_dy).r);
-            vec3 city = mix(vec3(1.0, 0.48, 0.14), vec3(1.0, 0.72, 0.38), smoothstep(0.02, 0.25, lights)) * lights;
+            vec3 city = mix(vec3(1.0, 0.42, 0.08), vec3(1.0, 0.64, 0.24), smoothstep(0.02, 0.25, lights)) * lights;
             // Light scattered by the air over a city: a faint wide halo.
             float texture_width = float(textureSize(night_emission, 0).x);
             float narrow = city_glow_at(map_uv, max(log2(texture_width * 0.0044), 0.0));
             float wide = city_glow_at(map_uv, max(log2(texture_width * 0.0120), 0.0));
             city += vec3(1.0, 0.55, 0.25) * (narrow * 0.06 + wide * 0.04);
-            ground += city * CITY_RADIANCE * night;
+            ground += city * CITY_RADIANCE * night * night_gain(mu_sun);
         }
 
         // Air between the cloud tops and the ground, then the ground itself.
@@ -1077,11 +1118,41 @@ void main() {
         if (through_cloud) {
             vec3 cloud_normal = normalize(camera + ray * (t_cloud / KM_PER_UNIT));
             vec2 cloud_uv = sphere_uv(cloud_normal);
-            vec2 cloud_sample = live_clouds() ? live_cloud(cloud_uv, cloud_normal)
-                : vec2(nasa_cloud_opacity(cloud_uv), nasa_cloud_albedo(cloud_uv));
+            float view_mu = max(dot(cloud_normal, -ray), 0.05);
+            float slant = min(sqrt(1.0 - view_mu * view_mu) / view_mu, 12.0);
+            vec3 cloud_sample;
+            if (live_clouds()) {
+                cloud_sample = live_cloud(cloud_uv, cloud_normal, slant);
+            } else {
+                float nasa = 1.0 - pow(1.0 - nasa_cloud_opacity(cloud_uv), 1.0 + CLOUD_ASPECT * slant);
+                cloud_sample = vec3(nasa, nasa_cloud_albedo(cloud_uv), nasa);
+            }
             float cloud_opacity = cloud_sample.x;
             float r_cloud = R_GROUND + 5.5;
+            // Cloud tops are lumpy: shade them as a height field whose
+            // relief follows the cloud's depth (~1.5 km from edge to core).
+            // Its slope comes from screen-space derivatives (no fetches),
+            // solved into the tangent plane of the shell.
+            vec3 shell_km = cloud_normal * r_cloud;
+            vec3 px = dFdx(shell_km);
+            vec3 py = dFdy(shell_km);
+            vec2 relief_d = 1.5 * vec2(dFdx(cloud_sample.z), dFdy(cloud_sample.z));
+            float gxx = dot(px, px);
+            float gxy = dot(px, py);
+            float gyy = dot(py, py);
+            float det = gxx * gyy - gxy * gxy;
+            vec3 slope = det > 1.0e-12
+                ? ((gyy * relief_d.x - gxy * relief_d.y) * px + (gxx * relief_d.y - gxy * relief_d.x) * py) / det
+                : vec3(0.0);
+            slope *= min(1.0, 1.2 / max(length(slope), 1.0e-6));
+            vec3 top_normal = normalize(cloud_normal - slope);
             float cloud_mu = dot(cloud_normal, sun);
+            // Light diffuses inside a cloud, so the shading wraps: a face
+            // turned from the Sun is dimmed, not black.
+            float top_mu = dot(top_normal, sun);
+            float relief_light = clamp(1.0 + 0.75 * (top_mu - cloud_mu) / max(cloud_mu, 0.12), 0.35, 1.6);
+            float moon_relief = clamp(1.0 + 0.75 * (dot(top_normal, moon) - dot(cloud_normal, moon))
+                / max(dot(cloud_normal, moon), 0.12), 0.35, 1.6);
             float cloud_moon_mu = dot(cloud_normal, moon);
             float cloud_albedo = cloud_sample.y;
             // Thick cloud tops scatter strongly back toward the Sun and stay
@@ -1092,9 +1163,10 @@ void main() {
                 * solar_visibility(cloud_normal * cloud_radius);
             vec3 cloud_sky = sky_irradiance_at(r_cloud, cloud_mu) * sun_irradiance;
             vec3 cloud_moon = light_transmittance(r_cloud, cloud_moon_mu, MOON_ANGULAR_RADIUS) * moon_irradiance;
-            vec3 cloud_colour = cloud_albedo * (cloud_sun * cloud_lambert + 0.6 * cloud_sky
-                + cloud_moon * max(cloud_moon_mu, 0.0) + NIGHT_SKY_IRRADIANCE);
             float cloud_night = 1.0 - smoothstep(-0.12, 0.0, cloud_mu);
+            vec3 cloud_colour = cloud_albedo * (cloud_sun * cloud_lambert * relief_light + 0.6 * cloud_sky
+                + (cloud_moon * max(cloud_moon_mu, 0.0) * moon_relief + NIGHT_SKY_IRRADIANCE)
+                    * NIGHT_TINT * night_gain(cloud_mu));
             if (cloud_night > 0.0) {
                 // Thunderstorm lightning as seen from orbit: brief flashes that
                 // bloom under a cloud top, flicker (several return strokes), and
@@ -1120,10 +1192,13 @@ void main() {
                 float flicker = exp(-(stroke_one * stroke_one))
                     + 0.7 * exp(-(stroke_two * stroke_two))
                     + 0.3 * step(p1, fx) * exp(-max(fx - p1, 0.0) * 18.0);
-                const float frequency = 0.035;
+                const float frequency = 0.11;
                 float strike = step(1.0 - frequency * storm_blob, roll) * flicker * cloud_night;
                 vec2 bloom_center = vec2(hash21(strike_cell + 11.3), hash21(strike_cell + 47.9));
-                float d = length((suv - bloom_center) * vec2(1.6, 1.0));
+                // The flash lights the cloud from inside: it takes the
+                // cloud's own shape, brightest through its thick cores.
+                float d = length((suv - bloom_center) * vec2(1.6, 1.0)) + 0.12 * (0.6 - cloud_sample.z);
+                strike *= 0.3 + 0.9 * cloud_sample.z;
                 float bloom_arg = d * 7.0;
                 float core_arg = d * 19.0;
                 float bloom = exp(-(bloom_arg * bloom_arg));
@@ -1131,11 +1206,15 @@ void main() {
                 float scatter = smoothstep(0.20, 0.60, cloud_opacity);
                 // A lightning-lit cloud top is ~1e-4 of sunlit cloud.
                 cloud_colour += (vec3(0.55, 0.68, 1.0) * bloom * 3.0 + vec3(0.92, 0.96, 1.0) * core * 4.0)
-                    * strike * scatter * 4.0e-5;
+                    * strike * scatter * 4.0e-5 * night_gain(cloud_mu);
                 // City lights glow upward into low night cloud.
+                // The cloud diffuses them: a wide golden glow over a city.
                 float city_signal_cloud = city_signal_at(cloud_uv, vec2(0.0));
-                cloud_colour += vec3(1.0, 0.52, 0.22) * pow(city_signal_cloud, 1.4) * cloud_night
-                    * 0.35 * CITY_RADIANCE;
+                float glow_width = float(textureSize(night_emission, 0).x);
+                float city_diffuse = city_glow_at(cloud_uv, max(log2(glow_width * 0.0012), 0.0))
+                    + city_glow_at(cloud_uv, max(log2(glow_width * 0.0044), 0.0));
+                cloud_colour += vec3(1.0, 0.48, 0.12) * (0.35 * pow(city_signal_cloud, 1.4) + 0.35 * city_diffuse)
+                    * cloud_night * CITY_RADIANCE * night_gain(cloud_mu);
             }
             under = mix(under, cloud_colour, cloud_opacity);
         }
@@ -1149,7 +1228,8 @@ void main() {
             radiance, transmittance);
         coverage = 1.0 - dot(transmittance, vec3(0.2126, 0.7152, 0.0722));
     }
-    radiance += aurora_emission(camera, ray, sun, earth_distance) + night_airglow(camera, ray, sun, earth_distance);
+    radiance += (AURORA_GAIN * aurora_emission(camera, ray, sun, earth_distance)
+        + night_airglow(camera, ray, sun, earth_distance)) * night_gain();
     out_color = vec4(min(radiance * exposure, vec3(30000.0)), coverage);
     out_transmittance = vec4(transmittance, 1.0);
 }

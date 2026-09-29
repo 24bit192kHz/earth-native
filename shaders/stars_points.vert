@@ -17,7 +17,7 @@ layout(push_constant) uniform StarFrame {
     vec4 canvas_rect;
     vec4 viewport_rect;
     // x: Julian years since the catalogue epoch; y: physical pixels per canvas
-    // unit; z: brightness gain; w: 1 for the legacy (planet view) scale.
+    // unit; z: brightness gain.
     vec4 params;
 } frame;
 
@@ -70,22 +70,11 @@ void main() {
     vec2 ndc = view.xy / view.z / frame.projection_tangents.xy;
     if (any(greaterThan(abs(ndc), vec2(4.0)))) { cull(); return; }
 
-    float energy;
-    float sigma;
-    if (frame.params.w > 0.5) {
-        // Planet views: a compressive display scale, 1.8x per magnitude.
-        energy = frame.params.z * 0.13 * exp(0.587787 * (7.5 - vmag));
-        sigma = 0.70 * pow(max(energy, 1.0), 0.22);
-    } else {
-        // Physical: irradiance relative to the Sun (V = -26.74), times the
-        // camera's radiance-per-irradiance gain (pre-exposure * pi / pixel
-        // solid angle). Stars vanish at daylight exposure and appear at night
-        // exposure exactly as in the ISS photographs; the camera stage's
-        // glare makes the bright ones bloom.
-        energy = frame.params.z * exp(-0.921034 * (vmag + 26.74));
-        // A sharp wide-angle lens: ~0.6 px Gaussian core.
-        sigma = 0.62;
-    }
+    // A display scale, 1.8x per magnitude, the same at every camera
+    // exposure and for every body (the sky of a composited space film:
+    // stars stay visible beside a daylit disc and the Sun).
+    float energy = frame.params.z * 0.35 * exp(0.587787 * (6.5 - vmag));
+    float sigma = 0.70 * pow(max(energy, 1.0), 0.2);
     float radius_px = max(4.0 * sigma, 1.5);
 
     vec2 global_xy = vec2(

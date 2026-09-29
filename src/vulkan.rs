@@ -551,7 +551,7 @@ pub struct Renderer {
 }
 
 /// Camera auto-exposure, like an ISS photographer's: sunlit scenes, even
-/// dark ocean, are shot at one "sunny 16" exposure (pre-exposure 1); night
+/// dark ocean, are shot near one "sunny 16" exposure (pre-exposure 1-1.9); night
 /// series are long high-ISO exposures that render moonlit cloud nearly as
 /// bright as daylight while city lights saturate (Earth Observation night
 /// frames are ~15-19 stops above day frames).
@@ -574,14 +574,19 @@ impl ExposureController {
         Self { ev: 0.0, target_ev: 0.0, last_update: None, snap_frames: 4, frame: 0 }
     }
 
-    /// Daylight scenes, even dark ocean, are shot at the same "sunny 16"
-    /// exposure (no opening up within this many stops of the day key).
+    /// Daylight scenes, even dark ocean, are shot near the "sunny 16"
+    /// exposure: within this many stops of the day key the camera opens up
+    /// by only part of the deficit (a low Sun or open ocean is lifted as
+    /// the footage's auto exposure does, and stays darker than noon desert).
     const DAY_LATITUDE_STOPS: f32 = 1.5;
+    const DAY_COMPENSATION: f32 = 0.6;
+    const DAY_MAX_LIFT_STOPS: f32 = 0.9;
 
     fn target_for(log2_luminance: f32) -> f32 {
         let delta = log2_luminance - Self::DAY_LUMINANCE_LOG2;
         let ev = if delta < 0.0 {
-            (-Self::ADAPTATION * delta - Self::DAY_LATITUDE_STOPS).max(0.0)
+            (-Self::ADAPTATION * delta - Self::DAY_LATITUDE_STOPS)
+                .max((-Self::DAY_COMPENSATION * delta).min(Self::DAY_MAX_LIFT_STOPS))
         } else {
             -delta
         };
@@ -2268,8 +2273,9 @@ impl Renderer {
             .max_by_key(|target| target.extent.width as u64 * target.extent.height as u64)
             .and_then(|target| target.last_meter);
         let earth = self.current_body == crate::body::Body::Earth;
-        let sun_cap = if earth { sun_exposure_cap(uniforms, body_selector) } else { None };
-        self.exposure.update(if earth { reading } else { None }, sun_cap, Instant::now());
+        // No exposure cap for a Sun in frame: its glare is display-relative
+        // (camera_settings), so the night side and its lights stay visible.
+        self.exposure.update(if earth { reading } else { None }, None, Instant::now());
         needs_redraw |= earth && self.exposure.converging();
         let camera = camera_settings(uniforms, body_selector, &self.exposure, earth);
         for target in self.outputs.values_mut() {
@@ -2817,63 +2823,8 @@ impl Renderer {
     }
 }
 
-/// Veiling-glare point-spread function of the lens model (post.frag's
-/// `source_glare` lobes), per steradian at `angle` radians off the source.
-fn lens_glare_psf(angle: f64) -> f64 {
-    let near = angle / 0.010;
-    let far = angle / 0.15;
-    0.004 * 0.6 / (std::f64::consts::PI * 0.010 * 0.010) * (1.0 + near * near).powf(-1.6)
-        + 0.0015 / (std::f64::consts::PI * 0.15 * 0.15) * (1.0 + far * far).powf(-2.0)
-}
-
-/// Exposure ceiling (EV) set by the Sun. The scene meter reads the HDR
-/// target before post.frag adds the lens glare, so the Sun's veiling glare is
-/// metered here over a 33 x 15 grid across the whole frame, as a camera's
-/// matrix meter would see it: the exposure keeps the frame's mean glare
-/// under 8 % and all but 8 % of the frame under half white. A Sun just off
-/// the edge then flares that side instead of whiting out the view, and a
-/// night exposure cannot open up while the (sunlit) ISS camera faces the
-/// Sun. A Sun in frame caps it at log2(1 / visible fraction): "sunny 16"
-/// (EV 0) for an open Sun, more for one sinking through the limb.
-fn sun_exposure_cap(uniforms: FrameUniforms, body_selector: f32) -> Option<f32> {
-    let frame = ShaderFrame::from_uniforms(uniforms, LogicalRect::default(), body_selector);
-    let view = frame.celestial_sun_view;
-    let sun = [view[0], view[1], view[2]].map(f64::from);
-    let dot = |a: [f64; 3], b: [f32; 3]| a[0] * f64::from(b[0]) + a[1] * f64::from(b[1]) + a[2] * f64::from(b[2]);
-    let (x, y, z) = (dot(sun, uniforms.right), dot(sun, uniforms.up), dot(sun, uniforms.forward));
-    // Same acceptance as post.frag: no glare from > ~75 degrees off axis.
-    let t = ((z - 0.26) / (0.64 - 0.26)).clamp(0.0, 1.0);
-    let acceptance = t * t * (3.0 - 2.0 * t);
-    if acceptance <= 0.0 {
-        return None;
-    }
-    let km_per_unit = crate::sky::GROUND_KM / f64::from(SCENE_EARTH_RADIUS);
-    let camera_km = uniforms.camera_position.map(|v| f64::from(v) * km_per_unit);
-    let visible = disc_visibility(camera_km, sun, f64::from(view[3]));
-    let luminance = 0.2126 * visible[0] + 0.7152 * visible[1] + 0.0722 * visible[2];
-    if luminance <= 1.0e-7 {
-        return None;
-    }
-    let (tan_x, tan_y) = (f64::from(uniforms.tan_half_fov_x), f64::from(uniforms.tan_half_fov_y));
-    let in_frame = z > 0.0 && (x / z / tan_x).abs() < 1.0 && (y / z / tan_y).abs() < 1.0;
-    let mut glare = Vec::with_capacity(33 * 15);
-    for row in 0..15 {
-        for column in 0..33 {
-            let (u, v) = (f64::from(column) / 16.0 - 1.0, f64::from(row) / 7.0 - 1.0);
-            let direction = [0, 1, 2].map(|c| f64::from(uniforms.forward[c])
-                + f64::from(uniforms.right[c]) * u * tan_x + f64::from(uniforms.up[c]) * v * tan_y);
-            let length = direction.iter().map(|d| d * d).sum::<f64>().sqrt();
-            let cosine = (direction.iter().zip(sun).map(|(d, s)| d * s).sum::<f64>() / length).clamp(-1.0, 1.0);
-            glare.push(std::f64::consts::PI * luminance * acceptance * lens_glare_psf(cosine.acos()));
-        }
-    }
-    glare.sort_by(f64::total_cmp);
-    let mean = glare.iter().sum::<f64>() / glare.len() as f64;
-    let high = glare[glare.len() * 92 / 100];
-    let glare_cap = (0.08 / mean).log2().min((0.5 / high).log2());
-    let cap = if in_frame { glare_cap.min((1.0 / luminance).log2()) } else { glare_cap };
-    Some(cap as f32)
-}
+/// Display-relative strength of the Sun's lens glare (see `camera_settings`).
+const SUN_GLARE: f64 = 0.12;
 
 fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &ExposureController, earth: bool) -> CameraSettings {
     if !earth {
@@ -2912,7 +2863,11 @@ fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &Expos
         post: PostFrame {
             tone: [exposure.contrast(), 0.0, (exposure.frame % 4096) as f32, noise],
             sun: to_camera(frame.celestial_sun_view),
-            sun_light: source(frame.celestial_sun_view, sun_irradiance),
+            // Like the Moon, the Sun is shown as the adapted eye sees it:
+            // the disc saturates (stars_textured.frag) and its glare carries
+            // a fixed display-relative energy, a soft glow at any exposure.
+            sun_light: source(frame.celestial_sun_view,
+                sun_irradiance * (SUN_GLARE / (f64::from(preexposure) * sun_irradiance)).min(1.0)),
             moon: to_camera(frame.celestial_moon_view),
             // The Moon disc is compressed toward display white like the
             // eye's local adaptation (stars_textured.frag); so is its glare.
@@ -6104,16 +6059,10 @@ impl OutputTarget {
             // under the planet (whose opaque disc covers them).
             if let Some(texture) = device.star_texture.as_ref().filter(|texture| texture.star_count > 0) {
                 let mut star_frame = StarFrame::from_uniforms(uniforms, self.viewport, self.extent.width);
-                // Radiance per unit of catalogue irradiance: pre-exposure times
-                // the sunlight unit (pi) over one physical pixel's solid angle.
-                let pixel_angle = 2.0 * uniforms.tan_half_fov_y
-                    / (uniforms.canvas.height * star_frame.params[1]).max(1.0);
-                if camera.post.tone[1] > 0.5 {
-                    star_frame.params[2] = 1.0;
-                    star_frame.params[3] = 1.0;
-                } else {
-                    star_frame.params[2] = camera.preexposure * std::f32::consts::PI / (pixel_angle * pixel_angle);
-                }
+                // The sky has its own display brightness, whatever the
+                // camera exposure: stars show next to a daylit disc and
+                // the Sun.
+                star_frame.params[2] = 1.0;
                 let star_bytes = std::slice::from_raw_parts(
                     (&star_frame as *const StarFrame).cast::<u8>(),
                     size_of::<StarFrame>(),
