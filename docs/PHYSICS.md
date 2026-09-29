@@ -133,10 +133,18 @@ function for the airless Moon and Mercury, Minnaert limb darkening for Mars
 (k = 0.75), Venus (0.80), Uranus/Neptune (0.85) and Jupiter/Saturn (0.90).
 Saturn's rings are a plane with NASA/JPL radial boundaries, modelled optical
 depths, gaps, and the planet's oblate shadow with a finite-Sun penumbra.
-Exposure adapts to each body (as a camera would). Uranus and Neptune are
+The rings cast their shadow on Saturn's globe (the slant optical depth of
+the ring plane toward the Sun).
+
+Every body goes through the same camera as the Earth: radiance in units of
+the body's own sunlight (a white Lambertian surface under its zenith Sun is
+1), the same metered auto exposure, the same Sun (a limb-darkened disc of
+its true apparent size, 68.6' from Mercury to 1.07' from Neptune, with the
+lens's glow), the same stars, bloom, film curve, grain and dither. The
+photographic grade (contrast, saturation, colour rendering) is left off:
+the planet maps are processed photographs already. Uranus and Neptune are
 almost featureless, and their maps' faint gradients are below what BC1
-blocks can carry: Uranus is read four mips down and Neptune two, and the
-output is dithered so the smooth limb darkening does not band in 8 bits.
+blocks can carry: Uranus is read four mips down and Neptune two.
 
 ## Stars
 
@@ -172,8 +180,9 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   level local-horizontal attitude), 78° horizontal lens, pitched so the
   horizon sits ~20 % from the top, 20 fps while riding (the globe animates
   lightning and aurora at 8 fps and otherwise redraws only when it moves).
-- **Auto exposure:** metered on a 64 px mip: the 85th-percentile Earth
-  luminance, or a highlight rule when bright sunlit sky covers more than 3 %
+- **Auto exposure:** metered on a 64 px mip: the 85th-percentile luminance
+  of the lit part of the body (anything under 1/500 of its brightest
+  percent is left out, so a crescent is exposed for the crescent), or a highlight rule when bright sunlit sky covers more than 3 %
   of the frame (the sunrise band seen from the ISS, held ~1.5 stops over
   the key so it keeps its colours). Daylight stays near a "sunny 16"
   exposure: a low Sun or open ocean is lifted by 0.6 of its deficit, at

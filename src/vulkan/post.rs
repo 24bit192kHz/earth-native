@@ -18,7 +18,7 @@ const MAX_TARGETS: u32 = 32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct PostFrame {
-    /// x: log-space contrast of the grade, y: mode (0 camera, 1 legacy
+    /// x: log-space contrast of the grade, y: grade strength (1 Earth, 0 other bodies
     /// planet presentation), z: frame seed, w: sensor noise at mid-grey.
     pub tone: [f32; 4],
     /// tan half-FOV x/y, optical centre x/y in canvas units.
@@ -601,6 +601,13 @@ impl HdrTarget {
             return None;
         }
         samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Meter the lit part: an airless night side is black, and with a
+        // crescent it took the 85th percentile, so the exposure opened up
+        // until the crescent was a white blot. Anything under 1/500 of the
+        // brightest percent is not part of the subject.
+        let reference = samples[(samples.len() * 99 / 100).min(samples.len() - 1)].0;
+        samples.retain(|sample| sample.0 >= reference * 2.0e-3);
+        let total: f32 = samples.iter().map(|(_, w)| w).sum();
         let mut accumulated = 0.0;
         let mut key = samples.last().map_or(1.0, |s| s.0);
         for (luminance, weight) in &samples {

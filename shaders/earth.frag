@@ -92,16 +92,6 @@ float polar_ratio(int body) {
     return 1.0;
 }
 
-// Same SDR presentation as the Earth pass (earth_textured.frag).
-const float exposure = 0.82;
-vec3 filmic(vec3 x) {
-    x = max(x, vec3(0.0));
-    x = x * x / (x + 0.011);
-    const float knee = 0.72;
-    vec3 shoulder = knee + (1.0 - knee) * (1.0 - exp(-(x - knee) / (1.0 - knee)));
-    return mix(x, shoulder, step(knee, x));
-}
-
 // Disk-resolved photometry, in albedo-times-cosine units like Lambert.
 // Airless regoliths (Moon, Mercury) barely limb-darken: Lunar-Lambert with
 // McEwen's (1996) phase function L(alpha). Bodies with atmospheres follow
@@ -150,8 +140,9 @@ vec3 planet_textured(vec3 normal, vec2 uv, vec2 planet_dx, vec2 planet_dy, vec3 
     float day = smoothstep(-terminator_width, terminator_width, sunlight);
     float phase_degrees = degrees(acos(clamp(dot(sun, -ray), -1.0, 1.0)));
     float lit = photometry(body, sunlight, dot(normal, -ray), phase_degrees) * day;
-    // Exposure adapts to the selected body's solar flux (as a camera would),
-    // preserving inspectable albedo; it is not common radiometry across bodies.
+    // Unit: a white Lambertian surface under a zenith Sun at this body's
+    // distance is 1; the camera's exposure (metered, as for the Earth)
+    // adapts to it.
     return albedo * lit;
 }
 
@@ -192,6 +183,21 @@ vec4 saturn_ring_colour(vec3 ray, vec3 camera, float planet_distance) {
     float edge = smoothstep(ring_inner, ring_inner + 0.001, radius)
         * (1.0 - smoothstep(ring_outer - 0.001, ring_outer, radius));
     return vec4(ring.rgb * lighting, opacity * edge);
+}
+
+// Sunlight left at a point of Saturn's globe (body frame) after the rings:
+// the slant path through the ring plane toward the Sun.
+float ring_shadow(vec3 point) {
+    const float ring_inner = surface_radius * (74658.0 / 60268.0);
+    const float ring_outer = surface_radius * (136775.0 / 60268.0);
+    vec3 sun = normalize(world_to_body(frame.sun_direction.xyz));
+    if (abs(sun.z) < 1.0e-5) return 1.0;
+    float t = -point.z / sun.z;
+    if (t <= 0.0) return 1.0;
+    float radius = length(point.xy + sun.xy * t);
+    if (radius < ring_inner || radius > ring_outer) return 1.0;
+    float alpha = textureLod(saturn_ring_texture, vec2((radius - ring_inner) / (ring_outer - ring_inner), 0.5), 0.0).a;
+    return pow(max(1.0 - alpha, 0.0), 1.0 / max(abs(sun.z), 0.02));
 }
 
 void main() {
@@ -241,6 +247,7 @@ void main() {
             vec3 body_point = world_to_body(camera + ray * body_distance);
             vec3 body_normal = normalize(body_to_world(body_point / vec3(1.0, 1.0, ratio * ratio)));
             colour = planet_textured(body_normal, planet_uv, planet_dx, planet_dy, sun, ray, body);
+            if (body == 4) colour *= ring_shadow(body_point);
             alpha = 1.0;
         }
         // Saturn's ring composites over the planet (and shows alone where the
@@ -259,7 +266,7 @@ void main() {
         if (alpha <= 0.0) {
             discard;
         }
-        out_color = vec4(colour * exposure * alpha, alpha);
+        out_color = vec4(colour * frame.camera_position_distance.w * alpha, alpha);
         out_transmittance = vec4(vec3(1.0 - alpha), 1.0);
         return;
     }

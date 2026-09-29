@@ -21,7 +21,7 @@ layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(set = 0, binding = 1) uniform sampler2D bloom_map;
 
 layout(push_constant) uniform PostFrame {
-    vec4 tone;        // x contrast, y mode (0 camera, 1 legacy), z seed, w noise
+    vec4 tone;        // x contrast, y grade strength, z seed, w noise
     vec4 projection;  // tan half-fov x/y, optical centre x/y (canvas units)
     vec4 canvas;
     vec4 viewport;
@@ -32,14 +32,6 @@ layout(push_constant) uniform PostFrame {
 } post;
 
 const float PI = 3.14159265;
-
-vec3 legacy_filmic(vec3 x) {
-    x = max(x, vec3(0.0));
-    x = x * x / (x + 0.011);
-    const float knee = 0.72;
-    vec3 shoulder = knee + (1.0 - knee) * (1.0 - exp(-(x - knee) / (1.0 - knee)));
-    return mix(x, shoulder, step(knee, x));
-}
 
 // Film-like response: a short toe, linear mid-tones and a long shoulder that
 // reaches white only asymptotically (clouds keep texture, lights bloom to
@@ -114,17 +106,6 @@ void main() {
     vec2 uv = in_uv;
     vec3 colour = min(textureLod(scene, uv, 0.0).rgb, vec3(65000.0));
 
-    if (post.tone.y > 0.5) {
-        // Dithered like the camera path: the smooth limb darkening of a
-        // planet's disc banded in 8 bits.
-        vec3 legacy = clamp(legacy_filmic(colour), 0.0, 1.0);
-        vec3 encoded = mix(12.92 * legacy, 1.055 * pow(legacy, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, legacy));
-        vec3 seed = vec3(gl_FragCoord.xy, 0.0);
-        encoded = clamp(encoded + (hash13(seed + 3.7) + hash13(seed + 9.1) - 1.0) / 255.0, 0.0, 1.0);
-        out_color = vec4(mix(encoded / 12.92, pow((encoded + 0.055) / 1.055, vec3(2.4)), step(0.04045, encoded)), 1.0);
-        return;
-    }
-
     // Local adaptation, as for the Moon's disc: above 0.5 the luminance is
     // compressed toward 1.2 with the hue kept. At a night exposure the
     // twilight arc is 2^7 over white: uncompressed it was a featureless
@@ -163,19 +144,20 @@ void main() {
     // Rows sum to one, so greys stay grey. Calibrated on the footage: open
     // ocean blue/green 2.3 -> 1.7 (footage 1.4-2.0), red/green 0.51 -> 0.40
     // (0.26-0.36); land is left within 0.05.
-    colour = vec3(colour.r, mix(colour.g, colour.b, 0.2), mix(colour.b, colour.g, 0.1));
+    float grade = post.tone.y;
+    colour = vec3(colour.r, mix(colour.g, colour.b, 0.2 * grade), mix(colour.b, colour.g, 0.1 * grade));
 
     // Photographic grade, as in the processed Earth Observation frames:
     // contrast in log space around mid-grey and a saturation boost (a raw
     // file developed with a "vivid" picture style), then the film curve.
     float scene_luma = max(dot(colour, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
-    float contrast = post.tone.x;
+    float contrast = mix(1.0, post.tone.x, grade);
     colour *= pow(min(scene_luma, 1.0e3) / 0.18, contrast - 1.0);
     scene_luma = max(dot(colour, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
     // Past clipping a sensor's channels saturate together: highlights run
     // to white. Without this an overexposed twilight arc kept its hue and
     // printed hard yellow and cyan lines where one channel was absent.
-    float saturation = 1.3 * (1.0 - smoothstep(1.0, 6.0, scene_luma));
+    float saturation = mix(1.0, 1.3, grade) * (1.0 - smoothstep(1.0, 6.0, scene_luma));
     colour = max(mix(vec3(scene_luma), colour, saturation), vec3(0.0));
     colour = camera_curve(colour);
     float luma = dot(colour, vec3(0.2126, 0.7152, 0.0722));

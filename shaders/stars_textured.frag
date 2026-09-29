@@ -150,10 +150,8 @@ void main() {
         out_color = vec4(0.0);
         return;
     }
-    // Earth view: scene-linear radiance in sunlight units times the camera
-    // pre-exposure (post.frag makes glare and the tone curve). Other bodies
-    // keep their display-referred presentation.
-    bool physical = body == 0;
+    // Scene-linear radiance in sunlight units times the camera pre-exposure
+    // (post.frag makes glare and the tone curve), for every body.
     float exposure = frame.camera_position_distance.w;
     // The panorama only supplies the unresolved background (Milky Way,
     // zodiacal and faint-star glow). A 4-tap minimum (morphological erosion)
@@ -172,7 +170,7 @@ void main() {
     // The Milky Way's brightest clouds are ~19 mag/arcsec^2, ~7e-8 of
     // sunlight per steradian. Shown as a night series (EV 17) records it,
     // at every camera exposure, like the catalogue stars.
-    if (physical) colour *= 1.0e-6 * 131072.0;
+    colour *= 1.0e-6 * 131072.0;
     // The catalogue stars themselves are drawn next, one quad per star
     // (stars_points.vert/.frag).
 
@@ -183,16 +181,13 @@ void main() {
     float sun_angular_radius = frame.celestial_sun_view.w;
     float sun_cosine = dot(ray, sun);
     float sun_angle = acos(clamp(sun_cosine, -1.0, 1.0));
-    // The two widest layers stay unconditional (they shape the glow when the
-    // Sun sits just off-frame), but they are kept tight and faint: wide gold
-    // washes read as brown fog on black space, and the gated inner layers
-    // already carry the near-disc energy.
-    if (physical) {
-        // Photosphere: mean radiance = irradiance / disc solid angle, with
-        // visible-band limb darkening I(mu) = 1 - 0.6 (1 - mu) normalised to
-        // the disc mean. No painted glow: the lens makes it (post.frag).
-        float solar_au = frame.celestial_distances.x * (6378.137 / 149597870.7);
-        float mean_radiance = 1.0 / (sun_angular_radius * sun_angular_radius * solar_au * solar_au);
+    {
+        // Photosphere: mean radiance = irradiance / disc solid angle, the
+        // same from every planet (1 / (R_sun / AU)^2 in sunlight units),
+        // with visible-band limb darkening I(mu) = 1 - 0.6 (1 - mu)
+        // normalised to the disc mean. No painted glow: the lens makes it
+        // (post.frag).
+        const float mean_radiance = 46200.0;
         float radial_sun = clamp(sin(sun_angle) / sin(max(sun_angular_radius, 1.0e-6)), 0.0, 1.0);
         float mu_disc = sqrt(max(1.0 - radial_sun * radial_sun, 0.0));
         float limb = (1.0 - 0.6 * (1.0 - mu_disc)) / 0.8;
@@ -202,33 +197,6 @@ void main() {
         // without the box pyramid spreading 46000x radiance into a halo.
         colour += vec3(disc * limb * min(mean_radiance * exposure, 40.0));
     }
-    float sun_outer_corona = exp(-max(sun_angle - sun_angular_radius, 0.0) / (sun_angular_radius * 8.0));
-    float sun_aureole = exp(-max(sun_angle, 0.0) / (sun_angular_radius * 12.0));
-    // Wide halo kept faint and neutral-warm so the Sun in-frame does not paint
-    // a muddy vignette across the night sky; deep sky returns to black.
-    if (!physical) {
-    colour += sun_aureole * vec3(0.0032, 0.0028, 0.0024);
-    colour += sun_outer_corona * vec3(0.022, 0.016, 0.010);
-    }
-    // The remaining layers decay to under 1e-3 of full by 40 apparent radii
-    // (shoulder e^-10.2, inner e^-6.6, core 0), so past the precomputed gate
-    // threshold they contribute less than a quantization step. The test is
-    // frame-uniform except at the screen-edge crossing, so the branch is
-    // coherent and free when the Sun is out of view.
-    if (!physical && sun_cosine > frame.moon_body_z.w) {
-        // The photosphere uses the physical apparent radius. The surrounding
-        // corona remains an intentionally display-scale bloom, since the real
-        // corona is not visible at ordinary wallpaper exposure.
-        float disc_edge = max(sun_angular_radius - sun_angle, 0.0) / max(sun_angular_radius, 1.0e-4);
-        float limb_darkening = mix(0.55, 1.0, pow(disc_edge, 0.65));
-        float sun_core = celestial_disc(sun_cosine, sun_angular_radius, sun_angular_radius * 0.05) * limb_darkening;
-        float sun_shoulder = exp(-max(sun_angle - sun_angular_radius * 0.35, 0.0) / (sun_angular_radius * 3.9));
-        float sun_inner_corona = exp(-max(sun_angle - sun_angular_radius * 0.7, 0.0) / (sun_angular_radius * 6.0));
-        colour += sun_inner_corona * vec3(0.55, 0.30, 0.08);
-        colour += sun_shoulder * vec3(1.05, 0.78, 0.28);
-        colour += sun_core * vec3(1.55, 1.45, 1.28);
-    }
-
     if (body == 0 && moon_alpha > 0.0) {
         vec3 albedo = textureGrad(moon_albedo, moon_uv, moon_dx, moon_dy).rgb;
         // Scene-space body positions for the eclipse geometry, reconstructed
@@ -273,12 +241,12 @@ void main() {
         float earth_facing = max(dot(surface_normal, earth_from_moon), 0.0);
         // Physically the full Earth lights the Moon with ~8e-5 of sunlight
         // (albedo 0.3 x (R/d)^2); the old display scale is kept off-Earth.
-        float earthshine_scale = physical ? 8.3e-5 : 0.028;
+        const float earthshine_scale = 8.3e-5;
         vec3 earthshine = vec3(0.55, 0.62, 0.85)
             * (earthshine_scale * earth_facing * (1.0 - clamp(frame.celestial_state.y, 0.0, 1.0)));
         vec3 moon_colour = albedo
             * (earthshine + lighting * phase_surge * eclipse_visibility);
-        if (physical) {
+        {
             float solar_au = frame.celestial_distances.x * (6378.137 / 149597870.7);
             float moon_exposure = exposure / (solar_au * solar_au);
             // The SVS colour map is stretched for display (mean linear

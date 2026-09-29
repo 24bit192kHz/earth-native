@@ -643,7 +643,7 @@ impl ExposureController {
 /// Fraction of a luminous disc's light reaching the camera per channel:
 /// nine rays across the disc, each blocked by the ground or dimmed and
 /// reddened by the air (the Sun rising through the limb).
-fn disc_visibility(camera_km: [f64; 3], direction: [f64; 3], angular_radius: f64) -> [f64; 3] {
+fn disc_visibility(camera_km: [f64; 3], direction: [f64; 3], angular_radius: f64, air: bool) -> [f64; 3] {
     let d = {
         let length = direction.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0e-9);
         direction.map(|v| v / length)
@@ -660,7 +660,15 @@ fn disc_visibility(camera_km: [f64; 3], direction: [f64; 3], angular_radius: f64
     let mut count = 0.0;
     let mut add = |offset_u: f64, offset_v: f64| {
         let ray = normalize([0, 1, 2].map(|c| d[c] + u[c] * offset_u + v[c] * offset_v));
-        let t = crate::sky::ray_transmittance(camera_km, ray);
+        let t = if air {
+            crate::sky::ray_transmittance(camera_km, ray)
+        } else {
+            // Another body: only its globe hides the Sun.
+            let b = (0..3).map(|c| camera_km[c] * ray[c]).sum::<f64>();
+            let c = camera_km.iter().map(|v| v * v).sum::<f64>() - crate::sky::GROUND_KM * crate::sky::GROUND_KM;
+            let disc = b * b - c;
+            if disc > 0.0 && -b - disc.sqrt() > 0.0 { [0.0; 3] } else { [1.0; 3] }
+        };
         for c in 0..3 {
             sum[c] += t[c];
         }
@@ -679,6 +687,10 @@ impl Renderer {
     /// pipeline; Jupiter forces the procedural gas-giant path (there is no
     /// Jupiter virtual-texture bundle).
     pub fn set_body(&mut self, body: crate::body::Body) {
+        if body != self.current_body {
+            // A cut: the new body is metered from its first frames.
+            self.exposure.snap_frames = 8;
+        }
         self.current_body = body;
     }
 
@@ -2275,8 +2287,8 @@ impl Renderer {
         let earth = self.current_body == crate::body::Body::Earth;
         // No exposure cap for a Sun in frame: its glare is display-relative
         // (camera_settings), so the night side and its lights stay visible.
-        self.exposure.update(if earth { reading } else { None }, None, Instant::now());
-        needs_redraw |= earth && self.exposure.converging();
+        self.exposure.update(reading, None, Instant::now());
+        needs_redraw |= self.exposure.converging();
         let camera = camera_settings(uniforms, body_selector, &self.exposure, earth);
         for target in self.outputs.values_mut() {
             if target.format != pipeline.color_format {
@@ -2827,14 +2839,6 @@ impl Renderer {
 const SUN_GLARE: f64 = 0.12;
 
 fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &ExposureController, earth: bool) -> CameraSettings {
-    if !earth {
-        // Other bodies keep their per-body presentation (earth.frag's own
-        // exposure and the legacy filmic curve).
-        return CameraSettings {
-            preexposure: 1.0,
-            post: PostFrame { tone: [1.0, 1.0, 0.0, 0.0], ..PostFrame::default() },
-        };
-    }
     let preexposure = exposure.ev.exp2();
     let frame = ShaderFrame::from_uniforms(uniforms, LogicalRect::default(), body_selector);
     let to_camera = |d: [f32; 4]| {
@@ -2845,7 +2849,7 @@ fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &Expos
     let camera_km = uniforms.camera_position.map(|v| f64::from(v) * km_per_unit);
     let source = |view: [f32; 4], irradiance: f64| {
         let direction = [0, 1, 2].map(|c| f64::from(view[c]));
-        let visible = disc_visibility(camera_km, direction, f64::from(view[3]));
+        let visible = disc_visibility(camera_km, direction, f64::from(view[3]), earth);
         let scale = f64::from(preexposure) * std::f64::consts::PI * irradiance;
         [visible[0] * scale, visible[1] * scale, visible[2] * scale, 1.0].map(|v| v as f32)
     };
@@ -2856,12 +2860,17 @@ fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &Expos
     let distance_ratio = 60.27 / f64::from(uniforms.moon_distance_earth_radii).max(1.0);
     let moon_irradiance = 2.5e-6 * phase_law * distance_ratio * distance_ratio;
     let solar_au = f64::from(uniforms.sun_distance_earth_radii) * crate::sky::GROUND_KM / 149_597_870.7;
-    let sun_irradiance = 1.0 / (solar_au * solar_au).max(1.0e-6);
+    // Other bodies are in units of their own sunlight (earth.frag).
+    let sun_irradiance = if earth { 1.0 / (solar_au * solar_au).max(1.0e-6) } else { 1.0 };
+    let moon_irradiance = if earth { moon_irradiance } else { 0.0 };
     let noise = 0.003 + 0.022 * ((exposure.ev - 7.0) / 8.0).clamp(0.0, 1.0);
     CameraSettings {
         preexposure,
         post: PostFrame {
-            tone: [exposure.contrast(), 0.0, (exposure.frame % 4096) as f32, noise],
+            // y: strength of the photographic grade. The planet maps are
+            // processed photographs already; grading them again turned Mars
+            // neon orange and Neptune cyan.
+            tone: [exposure.contrast(), if earth { 1.0 } else { 0.0 }, (exposure.frame % 4096) as f32, noise],
             sun: to_camera(frame.celestial_sun_view),
             // Like the Moon, the Sun is shown as the adapted eye sees it:
             // the disc saturates (stars_textured.frag) and its glare carries
@@ -6762,16 +6771,13 @@ mod tests {
     }
 
     #[test]
-    fn textured_sun_uses_layered_reference_corona() {
+    fn every_body_shows_the_same_physical_sun() {
         let shader = include_str!("../shaders/stars_textured.frag");
         // Camera-relative Sun/Moon geometry arrives precomputed per frame.
         assert!(shader.contains("frame.celestial_sun_view.xyz"));
         assert!(shader.contains("frame.celestial_sun_view.w"));
         assert!(shader.contains("frame.celestial_moon_view.xyz"));
         assert!(shader.contains("frame.celestial_moon_view.w"));
-        // The corona stack stays gated behind the precomputed 40-radius
-        // threshold instead of running on every fragment.
-        assert!(shader.contains("frame.moon_body_z.w"));
         // Eclipse geometry still derives scene-space positions from the
         // Earth-fixed directions inside the moon-disc branch.
         assert!(shader.contains("frame.celestial_distances.x"));
@@ -6779,27 +6785,18 @@ mod tests {
         assert!(shader.contains("sun_position"));
         assert!(shader.contains("moon_position"));
         assert!(shader.contains("sun_from_moon"));
-        assert!(shader.contains("limb_darkening"));
-        assert!(shader.contains("sun_aureole"));
-        assert!(shader.contains("sun_shoulder"));
-        assert!(shader.contains("sun_core * vec3(1.55, 1.45, 1.28)"));
-        assert!(shader.contains("sun_inner_corona * vec3(0.55, 0.30, 0.08)"));
-         // Wide halo kept tight and faint neutral-warm so a Sun in-frame does
-         // not paint a muddy vignette across the night sky; deep sky returns
-         // to black (the old 35/14-radius gold stack read as brown fog).
-         assert!(shader.contains("sun_aureole * vec3(0.0032, 0.0028, 0.0024)"));
-         assert!(shader.contains("sun_outer_corona * vec3(0.022, 0.016, 0.010)"));
-        assert!(shader.contains("asset_to_equator_of_date"));
-        // Sidereal de-rotation uses the precomputed sine/cosine pair.
-        assert!(shader.contains("frame.moon_body_x.w"));
-        assert!(shader.contains("frame.moon_body_y.w"));
+        // One photosphere (limb-darkened disc, glow from the lens model) for
+        // the Earth and the planets: no painted corona, no per-body branch.
+        assert!(shader.contains("const float mean_radiance = 46200.0;"));
+        assert!(!shader.contains("sun_aureole"));
+        assert!(!shader.contains("sun_inner_corona"));
+        assert!(!shader.contains("physical"));
         assert!(shader.contains("frame.moon_body_x.xyz"));
         assert!(shader.contains("eclipse_visibility"));
         assert!(shader.contains("earthshine"));
         // Lunar opposition surge and directional bluish earthshine.
         assert!(shader.contains("phase_surge"));
         assert!(shader.contains("earth_facing"));
-        assert!(!shader.contains("pow(max(sun_cosine, 0.0), 18000.0)"));
     }
 
     #[test]
