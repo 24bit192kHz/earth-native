@@ -30,6 +30,12 @@ Verified against JPL Horizons (2026-09-27 17:58:10 UTC):
 | Moon distance | 375 675 km | 375 683 km |
 | Moon illuminated | 98.549 % | 98.550 % |
 
+The Moon's face, checked the same way (2026-09-29 21:56:32 UTC): sub-Earth
+point (libration) 2.414°W, 6.573°S against Horizons' 2.416°W, 6.575°S;
+position angle of its north pole 343.70° (343.70°); phase angle 41.806°
+(41.806°); illuminated 87.270 % (87.270 %); distance 58.113 Earth radii
+(58.111).
+
 A pixel test at 2024-04-08 18:18 UTC puts the rendered equatorial terminator
 within one 0.94° sample of the Horizons prediction, and the total-eclipse
 lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day.
@@ -192,7 +198,9 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   the exposure it had. Light
   adaptation is fast (0.12 s, at most 1.5 stops over on the first frames),
   dark adaptation slow (0.9 s), so panning from the night sky back to the
-  daylit Earth does not flash white. Cuts snap the exposure.
+  daylit Earth does not flash white. A cut to another view is shown at the
+  daylight exposure until the new view has been metered (two frames), then
+  snaps: a night exposure carried into a daylit view was a white flash.
 - **The night side's own exposure:** city lights, moonlit cloud and ground
   (tinted slightly blue, the Purkinje shift), lightning, airglow and aurora
   are drawn as a night series (EV 16) records them whatever the camera

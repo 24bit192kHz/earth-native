@@ -560,6 +560,9 @@ struct ExposureController {
     target_ev: f32,
     last_update: Option<Instant>,
     snap_frames: u32,
+    /// Frames after a cut whose meter reading still describes the view
+    /// before it.
+    stale_frames: u32,
     frame: u32,
 }
 
@@ -571,7 +574,7 @@ impl ExposureController {
     const TIME_CONSTANT_S: f32 = 0.9;
 
     fn new() -> Self {
-        Self { ev: 0.0, target_ev: 0.0, last_update: None, snap_frames: 4, frame: 0 }
+        Self { ev: 0.0, target_ev: 0.0, last_update: None, snap_frames: 4, stale_frames: 0, frame: 0 }
     }
 
     /// Daylight scenes, even dark ocean, are shot near the "sunny 16"
@@ -610,7 +613,25 @@ impl ExposureController {
     const LIGHT_TIME_CONSTANT_S: f32 = 0.12;
     const MAX_OVEREXPOSURE_STOPS: f32 = 1.5;
 
+    /// A cut to another view. The readings of the next frames were metered
+    /// on the old view: a night exposure carried into a daylit view was a
+    /// white flash. Until the new view has been metered the cut is shown at
+    /// the daylight exposure, where sunlit ground is right or dark and the
+    /// night side (which has its own exposure) looks as it will.
+    fn cut(&mut self) {
+        self.snap_frames = 8;
+        self.stale_frames = 2;
+        self.ev = 0.0;
+        self.target_ev = 0.0;
+    }
+
     fn update(&mut self, reading: Option<post::MeterReading>, sun_cap: Option<f32>, now: Instant) {
+        let reading = if self.stale_frames > 0 {
+            self.stale_frames -= 1;
+            None
+        } else {
+            reading
+        };
         if let Some(reading) = reading {
             self.target_ev = Self::target_for(reading.log2_luminance);
         }
@@ -688,8 +709,7 @@ impl Renderer {
     /// Jupiter virtual-texture bundle).
     pub fn set_body(&mut self, body: crate::body::Body) {
         if body != self.current_body {
-            // A cut: the new body is metered from its first frames.
-            self.exposure.snap_frames = 8;
+            self.exposure.cut();
         }
         self.current_body = body;
     }
@@ -2307,7 +2327,7 @@ impl Renderer {
     /// Jump cuts (camera or time set over IPC) re-meter instead of easing,
     /// so a capture right after the cut is correctly exposed.
     pub fn snap_exposure(&mut self) {
-        self.exposure.snap_frames = 8;
+        self.exposure.cut();
     }
 
     pub fn exposure_ev(&self) -> f32 {
