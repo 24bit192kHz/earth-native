@@ -173,7 +173,8 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   would clip the Moon ~13 stops over into a flat white disc, so the disc is
   compressed as the eye or an HDR merge sees it, with the maria readable, and
   its glare is scaled to match.
-- **Optics:** bloom from the mip pyramid, each level softly compressed above
+- **Optics:** bloom from the mip pyramid (`shaders/bloom.frag`: levels 1-2
+  at half resolution, 3 and up at one eighth), each level softly compressed above
   16× white (a lit limb 2^10 over a night exposure stays a sharp line with a
   small glow instead of a white fog), an analytic veiling-glare point spread
   and an 18-ray diffraction starburst for the Sun and the Moon (with a

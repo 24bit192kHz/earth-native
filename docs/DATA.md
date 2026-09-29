@@ -25,7 +25,7 @@ live weather manifest written by the feed.
 All maps are block-compressed offline with precomputed linear-light mip
 chains (`pipeline/bcn.py`), so the GPU uploads blocks directly: with the
 8K pack the renderer needs about 350 MiB of VRAM (the 500 m set
-below takes ~2 GB). Equirectangular rows are low-passed
+below ~560 MiB with its static virtual texture, ~2 GB without). Equirectangular rows are low-passed
 along longitude by 1/cos(latitude) (`polar_resample`) so the poles do not
 pinwheel.
 
