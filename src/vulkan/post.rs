@@ -58,14 +58,15 @@ impl PostPipeline {
         unsafe {
             let set_layout = device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?;
-            // Two sets per target (camera pass, bloom pass), two images each.
+            // Three sets per target (camera, fine and coarse bloom passes),
+            // two images each.
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(MAX_TARGETS * 4)];
+                .descriptor_count(MAX_TARGETS * 6)];
             let pool = match device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                    .max_sets(MAX_TARGETS * 2)
+                    .max_sets(MAX_TARGETS * 3)
                     .pool_sizes(&sizes),
                 None,
             ) {
@@ -193,12 +194,10 @@ pub(super) struct HdrTarget {
     pub descriptor_set: vk::DescriptorSet,
     pub extent: vk::Extent2D,
     mip_levels: u32,
-    /// Half-resolution bloom (bloom.frag) and the set its pass samples with.
-    bloom_image: vk::Image,
-    bloom_memory: vk::DeviceMemory,
-    bloom_view: vk::ImageView,
-    bloom_extent: vk::Extent2D,
-    bloom_set: vk::DescriptorSet,
+    /// Bloom (bloom.frag): levels 1-2 at half resolution plus levels 3+
+    /// from a one-eighth-resolution pass; each with the set its pass reads.
+    bloom: BloomImage,
+    coarse: BloomImage,
     meter_level: u32,
     meter_extent: vk::Extent2D,
     meter_buffer: vk::Buffer,
@@ -379,11 +378,8 @@ impl HdrTarget {
                 meter_ptr,
                 meter_preexposure: None,
                 pending_preexposure: None,
-                bloom_image: vk::Image::null(),
-                bloom_memory: vk::DeviceMemory::null(),
-                bloom_view: vk::ImageView::null(),
-                bloom_extent: vk::Extent2D { width: extent.width.div_ceil(2).max(1), height: extent.height.div_ceil(2).max(1) },
-                bloom_set: vk::DescriptorSet::null(),
+                bloom: BloomImage::empty(extent, 2),
+                coarse: BloomImage::empty(extent, 8),
             };
             if let Err(error) = target.create_bloom(device, memory_properties, post) {
                 target.destroy(device);
@@ -394,100 +390,37 @@ impl HdrTarget {
     }
 
     unsafe fn create_bloom(&mut self, device: &Device, memory_properties: vk::PhysicalDeviceMemoryProperties, post: &PostPipeline) -> RendererResult<()> {
-        self.bloom_image = device.create_image(
-            &vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(HDR_FORMAT)
-                .extent(vk::Extent3D { width: self.bloom_extent.width, height: self.bloom_extent.height, depth: 1 })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::UNDEFINED),
-            None,
-        )?;
-        let requirements = device.get_image_memory_requirements(self.bloom_image);
-        let index = find_memory_type(memory_properties, requirements.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        self.bloom_memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(index), None)?;
-        device.bind_image_memory(self.bloom_image, self.bloom_memory, 0)?;
-        self.bloom_view = device.create_image_view(
-            &vk::ImageViewCreateInfo::default()
-                .image(self.bloom_image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(HDR_FORMAT)
-                .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1)),
-            None,
-        )?;
-        let set_layouts = [post.set_layout];
-        self.bloom_set = device.allocate_descriptor_sets(
-            &vk::DescriptorSetAllocateInfo::default().descriptor_pool(post.pool).set_layouts(&set_layouts))?[0];
+        self.bloom.create(device, memory_properties, post)?;
+        self.coarse.create(device, memory_properties, post)?;
         let info = |view| [vk::DescriptorImageInfo::default().sampler(post.sampler).image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let (scene, bloom) = (info(self.sampled_view), info(self.bloom_view));
+        let (scene, bloom, coarse) = (info(self.sampled_view), info(self.bloom.view), info(self.coarse.view));
         fn write<'a>(set: vk::DescriptorSet, binding: u32, info: &'a [vk::DescriptorImageInfo; 1]) -> vk::WriteDescriptorSet<'a> {
             vk::WriteDescriptorSet::default()
                 .dst_set(set).dst_binding(binding).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(info)
         }
-        // The bloom pass reads only the pyramid; its binding 1 repeats it
-        // (the bloom image is its render target).
+        // Camera pass: pyramid + bloom. Fine pass: pyramid + coarse. The
+        // coarse pass reads only the pyramid (its binding 1 repeats it).
         device.update_descriptor_sets(&[
             write(self.descriptor_set, 1, &bloom),
-            write(self.bloom_set, 0, &scene),
-            write(self.bloom_set, 1, &scene),
+            write(self.bloom.set, 0, &scene),
+            write(self.bloom.set, 1, &coarse),
+            write(self.coarse.set, 0, &scene),
+            write(self.coarse.set, 1, &scene),
         ], &[]);
         Ok(())
     }
 
-    /// The half-resolution bloom pass: after `record_resolve`, before the
-    /// camera pass samples it.
+    /// The bloom passes (coarse, then fine): after `record_resolve`, before
+    /// the camera pass samples the result.
     pub unsafe fn record_bloom(&self, device: &Device, command_buffer: vk::CommandBuffer, post: &PostPipeline) {
-        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
-        let to_attachment = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(self.bloom_image)
-            .subresource_range(range);
-        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::DependencyFlags::empty(), &[], &[], &[to_attachment]);
-        let attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(self.bloom_view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .store_op(vk::AttachmentStoreOp::STORE)];
-        let area = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: self.bloom_extent };
-        device.cmd_begin_rendering(command_buffer, &vk::RenderingInfo::default()
-            .render_area(area).layer_count(1).color_attachments(&attachment));
-        device.cmd_set_viewport(command_buffer, 0, &[vk::Viewport {
-            x: 0.0, y: 0.0, width: self.bloom_extent.width as f32, height: self.bloom_extent.height as f32,
-            min_depth: 0.0, max_depth: 1.0,
-        }]);
-        device.cmd_set_scissor(command_buffer, 0, &[area]);
-        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, post.bloom_pipeline);
-        device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, post.layout, 0, &[self.bloom_set], &[]);
-        device.cmd_draw(command_buffer, 3, 1, 0, 0);
-        device.cmd_end_rendering(command_buffer);
-        let to_sampled = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(self.bloom_image)
-            .subresource_range(range);
-        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[to_sampled]);
+        self.coarse.record(device, command_buffer, post, 1.0);
+        self.bloom.record(device, command_buffer, post, 0.0);
     }
 
     pub unsafe fn destroy(&self, device: &Device) {
-        if self.bloom_set != vk::DescriptorSet::null() {
-            let _ = device.free_descriptor_sets(self.pool, &[self.bloom_set]);
-        }
-        device.destroy_image_view(self.bloom_view, None);
-        device.destroy_image(self.bloom_image, None);
-        device.free_memory(self.bloom_memory, None);
+        self.bloom.destroy(device, self.pool);
+        self.coarse.destroy(device, self.pool);
         device.unmap_memory(self.meter_memory);
         device.destroy_buffer(self.meter_buffer, None);
         device.free_memory(self.meter_memory, None);
@@ -682,5 +615,111 @@ impl HdrTarget {
             eprintln!("meter: pre={preexposure:.3e} key={key:.3e} p97={p97:.3e} highlight={highlight:.3e} earth_weight={total:.1} texels={}", width * height);
         }
         Some(MeterReading { log2_luminance: key.max(highlight).log2(), coverage })
+    }
+}
+
+/// One bloom render target (a fraction of the output's size) and the
+/// descriptor set its pass samples through.
+struct BloomImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+    set: vk::DescriptorSet,
+}
+
+impl BloomImage {
+    fn empty(extent: vk::Extent2D, divisor: u32) -> Self {
+        Self {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            extent: vk::Extent2D { width: extent.width.div_ceil(divisor).max(1), height: extent.height.div_ceil(divisor).max(1) },
+            set: vk::DescriptorSet::null(),
+        }
+    }
+
+    unsafe fn create(&mut self, device: &Device, memory_properties: vk::PhysicalDeviceMemoryProperties, post: &PostPipeline) -> RendererResult<()> {
+        self.image = device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(HDR_FORMAT)
+                .extent(vk::Extent3D { width: self.extent.width, height: self.extent.height, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED),
+            None,
+        )?;
+        let requirements = device.get_image_memory_requirements(self.image);
+        let index = find_memory_type(memory_properties, requirements.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        self.memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(index), None)?;
+        device.bind_image_memory(self.image, self.memory, 0)?;
+        self.view = device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(self.image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(HDR_FORMAT)
+                .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1)),
+            None,
+        )?;
+        let set_layouts = [post.set_layout];
+        self.set = device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default().descriptor_pool(post.pool).set_layouts(&set_layouts))?[0];
+        Ok(())
+    }
+
+    unsafe fn record(&self, device: &Device, command_buffer: vk::CommandBuffer, post: &PostPipeline, pass: f32) {
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let to_attachment = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(self.image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::DependencyFlags::empty(), &[], &[], &[to_attachment]);
+        let attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(self.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .store_op(vk::AttachmentStoreOp::STORE)];
+        let area = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: self.extent };
+        device.cmd_begin_rendering(command_buffer, &vk::RenderingInfo::default()
+            .render_area(area).layer_count(1).color_attachments(&attachment));
+        device.cmd_set_viewport(command_buffer, 0, &[vk::Viewport {
+            x: 0.0, y: 0.0, width: self.extent.width as f32, height: self.extent.height as f32,
+            min_depth: 0.0, max_depth: 1.0,
+        }]);
+        device.cmd_set_scissor(command_buffer, 0, &[area]);
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, post.bloom_pipeline);
+        device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, post.layout, 0, &[self.set], &[]);
+        let constants = PostFrame { tone: [pass, 0.0, 0.0, 0.0], ..PostFrame::default() };
+        device.cmd_push_constants(command_buffer, post.layout, vk::ShaderStageFlags::FRAGMENT, 0,
+            std::slice::from_raw_parts((&constants as *const PostFrame).cast::<u8>(), size_of::<PostFrame>()));
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_end_rendering(command_buffer);
+        let to_sampled = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(self.image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &[to_sampled]);
+    }
+
+    unsafe fn destroy(&self, device: &Device, pool: vk::DescriptorPool) {
+        if self.set != vk::DescriptorSet::null() {
+            let _ = device.free_descriptor_sets(pool, &[self.set]);
+        }
+        device.destroy_image_view(self.view, None);
+        device.destroy_image(self.image, None);
+        device.free_memory(self.memory, None);
     }
 }

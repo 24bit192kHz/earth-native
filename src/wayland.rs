@@ -48,9 +48,12 @@ use crate::{
 pub mod x11;
 
 const IDLE_FRAME_RATE: u32 = 15;
-// Riding the ISS the ground moves continuously (~16 px/s near the frame
-// bottom on a 3440 px monitor); 30 fps keeps that motion smooth.
-const ONBOARD_FRAME_RATE: u32 = 30;
+// Riding the ISS the ground moves continuously (~16-39 px/s on a 3440 px
+// monitor); 20 fps steps it by ~1-2 px, a third less GPU work than 30.
+const ONBOARD_FRAME_RATE: u32 = 20;
+// The globe's own motion is gated below; this cadence only animates
+// lightning flashes and aurora drift (was 15 fps).
+const WEATHER_ANIMATION_FRAME_RATE: u32 = 8;
 /// Control-mode look-around from the window, at the default 78 degree lens
 /// (scaled with the field of view so zoomed-in views turn finer).
 const POV_DRAG_DEGREES_PER_PIXEL: f32 = 0.05;
@@ -387,7 +390,7 @@ impl NativeApp {
         } else if self.riding_iss() {
             frame_interval(ONBOARD_FRAME_RATE)
         } else if self.fixed_unix_seconds.is_none() && self.renderer.has_weather_animation() {
-            frame_interval(IDLE_FRAME_RATE)
+            frame_interval(WEATHER_ANIMATION_FRAME_RATE)
         } else {
             self.idle_interval
         }
@@ -400,6 +403,8 @@ impl NativeApp {
             INTERACTIVE_FRAME_RATE
         } else if self.riding_iss() {
             ONBOARD_FRAME_RATE
+        } else if self.fixed_unix_seconds.is_none() && self.renderer.has_weather_animation() {
+            WEATHER_ANIMATION_FRAME_RATE
         } else {
             IDLE_FRAME_RATE
         }

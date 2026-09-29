@@ -42,6 +42,19 @@ vec3 smooth_level(float level, vec2 uv) {
     return mix(mix(e, d, sx), mix(b, a, sx), sy);
 }
 
+// Push constants (the camera stage's block): tone.x selects the pass.
+layout(push_constant) uniform BloomPass {
+    vec4 tone; // x: 0 fine pass (levels 1-2 + coarse), 1 coarse pass (levels 3+)
+} pass_info;
+
+// Levels 1-2 (2-4 px blurs) at half resolution; levels 3+ (8 px and wider)
+// at one eighth, in their own pass, then added here with one bilinear tap:
+// per level the same compression and weight 0.78^(level - 1), normalised
+// by the sum over all levels, as when every level was sampled at every
+// half-resolution pixel (36 fetches, most of the camera stage's cost).
+const int FINE_LEVELS = 2;
+layout(set = 0, binding = 1) uniform sampler2D coarse_bloom;
+
 void main() {
     vec2 uv = in_uv;
     // Near-field glare: a power-law mixture of blurred pyramid levels, each
@@ -50,16 +63,27 @@ void main() {
     // a white fog, which is why the meter used to hold a daylight exposure
     // for it and the night side and stars went black.
     const float BLOOM_KNEE = 16.0;
+    bool coarse_pass = pass_info.tone.x > 0.5;
+    int top = min(textureQueryLevels(scene) - 1, 9);
+    int first = coarse_pass ? FINE_LEVELS + 1 : 1;
+    int last = coarse_pass ? top : min(FINE_LEVELS, top);
     vec3 blur = vec3(0.0);
     float weight_sum = 0.0;
     float weight = 1.0;
-    int top = min(textureQueryLevels(scene) - 1, 9);
     for (int level = 1; level <= top; ++level) {
-        vec3 level_colour = smooth_level(float(level), uv);
-        level_colour /= 1.0 + max(level_colour.r, max(level_colour.g, level_colour.b)) / BLOOM_KNEE;
-        blur += level_colour * weight;
+        if (level >= first && level <= last) {
+            vec3 level_colour = smooth_level(float(level), uv);
+            level_colour /= 1.0 + max(level_colour.r, max(level_colour.g, level_colour.b)) / BLOOM_KNEE;
+            blur += level_colour * weight;
+        }
         weight_sum += weight;
         weight *= 0.78;
     }
+    if (coarse_pass) {
+        // Unnormalised weighted sum of the coarse levels.
+        out_color = vec4(min(blur, vec3(65000.0)), 1.0);
+        return;
+    }
+    blur += textureLod(coarse_bloom, uv, 0.0).rgb;
     out_color = vec4(min(blur / max(weight_sum, 1.0e-6), vec3(65000.0)), 1.0);
 }

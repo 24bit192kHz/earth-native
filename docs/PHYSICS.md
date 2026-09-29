@@ -152,7 +152,8 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
 
 - **Point of view:** `camera live` rides the ISS (SGP4 position and velocity,
   level local-horizontal attitude), 78° horizontal lens, pitched so the
-  horizon sits ~20 % from the top, 30 fps while riding.
+  horizon sits ~20 % from the top, 20 fps while riding (the globe animates
+  lightning and aurora at 8 fps and otherwise redraws only when it moves).
 - **Auto exposure:** metered on a 64 px mip: the 85th-percentile Earth
   luminance, or a highlight rule when bright sunlit sky covers more than 3 %
   of the frame (the sunrise band seen from the ISS). Daylight keeps a "sunny
