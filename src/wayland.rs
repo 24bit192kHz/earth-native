@@ -58,6 +58,13 @@ const WEATHER_ANIMATION_FRAME_RATE: u32 = 8;
 /// (scaled with the field of view so zoomed-in views turn finer).
 const POV_DRAG_DEGREES_PER_PIXEL: f32 = 0.05;
 const POV_KEY_DEGREES_PER_SECOND: f32 = 30.0;
+/// Control-mode WASD flight over the Earth: ground speed in altitudes per
+/// second (~420 km/s from the ISS), Shift for FLY_BOOST times that. It moves
+/// only while a key is held.
+const FLY_ALTITUDES_PER_SECOND: f64 = 1.0;
+const FLY_BOOST: f32 = 4.0;
+/// WASD on the globe orbits this many times faster than the arrow keys.
+const FLY_ORBIT_AXIS: f32 = 2.5;
 const INTERACTIVE_FRAME_RATE: u32 = 30;
 const DEBUG_FRAME_RATE: u32 = 10;
 const INTERACTIVE_GRACE: Duration = Duration::from_secs(2);
@@ -229,6 +236,9 @@ pub struct NativeApp {
     controlled_output: Option<u32>,
     keyboard_yaw: f32,
     keyboard_pitch: f32,
+    /// Held WASD keys (W, A, S, D) and Shift, for control-mode flight.
+    fly_keys: [bool; 4],
+    shift_held: bool,
     ctrl_held: bool,
     interactive_until: Instant,
     last_tick: Instant,
@@ -336,6 +346,8 @@ impl NativeApp {
             controlled_output: None,
             keyboard_yaw: 0.0,
             keyboard_pitch: 0.0,
+            fly_keys: [false; 4],
+            shift_held: false,
             ctrl_held: false,
             interactive_until: now,
             last_tick: now,
@@ -549,6 +561,7 @@ impl NativeApp {
         // idle that drift is usually sub-pixel: the motion gate below decides
         // whether it needs a present. Structural `dirty` is untouched.
         self.camera.tick(elapsed.as_secs_f32());
+        self.fly(elapsed.as_secs_f32());
         if self.pov_active() && (self.keyboard_yaw != 0.0 || self.keyboard_pitch != 0.0) {
             let degrees = POV_KEY_DEGREES_PER_SECOND * self.pov_scale() * elapsed.as_secs_f32().min(0.1);
             self.turn_pov(self.keyboard_yaw * degrees, -self.keyboard_pitch * degrees);
@@ -1228,6 +1241,7 @@ impl NativeApp {
         self.pointer.dragging
             || self.keyboard_yaw != 0.0
             || self.keyboard_pitch != 0.0
+            || self.fly_keys.iter().any(|&held| held)
             || now < self.interactive_until
     }
 
@@ -1484,8 +1498,67 @@ impl NativeApp {
     }
 
     fn update_keyboard_axes(&mut self) {
+        // On the globe WASD orbits too, faster than the arrows (Shift more).
+        let (forward, right) = self.fly_axes();
+        let (orbit_yaw, orbit_pitch) = if self.view_mode == ViewMode::Globe && !self.pov_active_view() {
+            let speed = FLY_ORBIT_AXIS * if self.shift_held { FLY_BOOST } else { 1.0 };
+            (right * speed, forward * speed)
+        } else {
+            (0.0, 0.0)
+        };
         self.camera
-            .set_keyboard_axes(self.keyboard_yaw, self.keyboard_pitch);
+            .set_keyboard_axes(self.keyboard_yaw + orbit_yaw, self.keyboard_pitch + orbit_pitch);
+    }
+
+    fn pov_active_view(&self) -> bool {
+        matches!(self.view_mode, ViewMode::Onboard | ViewMode::FixedPov { .. })
+    }
+
+    /// (forward, right) from the held WASD keys, each -1, 0 or 1.
+    fn fly_axes(&self) -> (f32, f32) {
+        let [w, a, s, d] = self.fly_keys.map(f32::from);
+        (w - s, d - a)
+    }
+
+    /// WASD flight from the window: while a key is held the viewpoint moves
+    /// over the Earth along a great circle, W where the camera looks, A/D
+    /// sideways, and the view direction is carried along (parallel
+    /// transport) so it does not swing. Leaving the ISS, the flight starts
+    /// at its current place and heading; C (or `camera next`) returns.
+    fn fly(&mut self, seconds: f32) {
+        let (forward, right) = self.fly_axes();
+        if (forward == 0.0 && right == 0.0) || !self.pov_active() {
+            return;
+        }
+        if self.view_mode == ViewMode::Onboard && !self.leave_iss_here() {
+            return;
+        }
+        let ViewMode::FixedPov { latitude, longitude, altitude_km } = self.view_mode else { return };
+        let boost = if self.shift_held { f64::from(FLY_BOOST) } else { 1.0 };
+        let speed_km_s = f64::from(altitude_km).max(100.0) * FLY_ALTITUDES_PER_SECOND * boost;
+        let angle = speed_km_s * f64::from(seconds.min(0.1)) / (EARTH_EQUATORIAL_RADIUS_KM + f64::from(altitude_km));
+        let (new_latitude, new_longitude, new_heading) =
+            fly_step(latitude, longitude, self.pov_look.heading_degrees, forward, right, angle as f32);
+        self.view_mode = ViewMode::FixedPov { latitude: new_latitude, longitude: new_longitude, altitude_km };
+        self.pov_look.heading_degrees = new_heading;
+        self.dirty = true;
+    }
+
+    /// Replace the ISS ride by a fixed viewpoint at its current place,
+    /// altitude and absolute heading (the view does not jump).
+    fn leave_iss_here(&mut self) -> bool {
+        let Some(state) = self.iss_state else { return false };
+        let up = state.position.normalized();
+        let latitude = up.z.clamp(-1.0, 1.0).asin().to_degrees().clamp(-89.9, 89.9);
+        let longitude = (-up.y).atan2(up.x).to_degrees();
+        let (_, north) = surface_frame(latitude, longitude);
+        let east = up.cross(north).normalized();
+        let level = (state.velocity - up * state.velocity.dot(up)).normalized();
+        let heading = self.pov_look.heading_degrees.to_radians();
+        let facing = level * heading.cos() + up.cross(level).normalized() * heading.sin();
+        self.view_mode = ViewMode::FixedPov { latitude, longitude, altitude_km: state.altitude_km as f32 };
+        self.pov_look.heading_degrees = facing.dot(east).atan2(facing.dot(north)).to_degrees().rem_euclid(360.0);
+        true
     }
 }
 
@@ -1907,9 +1980,10 @@ impl NativeApp {
     }
 
     /// Keyboard control shared by the Wayland and Xorg frontends (Linux
-    /// evdev key codes): arrows orbit (or look around from the ISS), Q/E
-    /// zoom, C switches ISS window/globe, R resets the look, Esc releases
-    /// control, and Ctrl+Left/Right tours the bodies.
+    /// evdev key codes): arrows orbit (or look around from the ISS), W/A/S/D
+    /// fly over the Earth while held (orbit faster on the globe), Shift
+    /// boosts them, Q/E zoom, C switches ISS window/globe, R resets the
+    /// look, Esc releases control, and Ctrl+Left/Right tours the bodies.
     fn handle_evdev_key(&mut self, key: u32, pressed: bool, ctrl_held: bool) {
         if self.controlled_output.is_none() {
             return;
@@ -1939,6 +2013,12 @@ impl NativeApp {
                 self.reset_look();
                 return;
             }
+            // Shift boosts WASD; W A S D fly (or orbit the globe).
+            42 | 54 => self.shift_held = pressed,
+            17 => self.fly_keys[0] = pressed,
+            30 => self.fly_keys[1] = pressed,
+            31 => self.fly_keys[2] = pressed,
+            32 => self.fly_keys[3] = pressed,
             105 => self.keyboard_yaw = if pressed { -1.0 } else { 0.0 },
             106 => self.keyboard_yaw = if pressed { 1.0 } else { 0.0 },
             103 => self.keyboard_pitch = if pressed { 1.0 } else { 0.0 },
@@ -2052,6 +2132,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wasd_flight_follows_great_circles() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.05;
+        // East along the equator: longitude grows, latitude and heading stay.
+        let (lat, lon, heading) = fly_step(0.0, 10.0, 90.0, 1.0, 0.0, 5.0_f32.to_radians());
+        assert!(near(lat, 0.0) && near(lon, 15.0) && near(heading, 90.0), "{lat} {lon} {heading}");
+        // North: latitude grows by the arc.
+        let (lat, lon, heading) = fly_step(10.0, 20.0, 0.0, 1.0, 0.0, 30.0_f32.to_radians());
+        assert!(near(lat, 40.0) && near(lon, 20.0) && near(heading, 0.0), "{lat} {lon} {heading}");
+        // Over the pole: down the far side, now facing south.
+        let (lat, lon, heading) = fly_step(80.0, 0.0, 0.0, 1.0, 0.0, 20.0_f32.to_radians());
+        assert!(near(lat, 80.0) && near(lon.abs(), 180.0) && near(heading, 180.0), "{lat} {lon} {heading}");
+        // S goes back, D strafes right (east when facing north).
+        let (lat, ..) = fly_step(10.0, 0.0, 0.0, -1.0, 0.0, 5.0_f32.to_radians());
+        assert!(near(lat, 5.0), "{lat}");
+        let (lat, lon, _) = fly_step(0.0, 0.0, 0.0, 0.0, 1.0, 5.0_f32.to_radians());
+        assert!(near(lat, 0.0) && near(lon, 5.0), "{lat} {lon}");
+    }
+
+    #[test]
     fn frame_intervals_match_the_native_idle_interactive_policy() {
         assert_eq!(
             frame_interval(IDLE_FRAME_RATE),
@@ -2145,4 +2244,39 @@ mod tests {
 fn continuous_rendering() -> bool {
     static CONTINUOUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CONTINUOUS.get_or_init(|| std::env::var_os("EARTH_NATIVE_CONTINUOUS").is_some_and(|value| value == "1"))
+}
+
+/// One flight step: from (latitude, longitude) facing `heading` (degrees
+/// from north), move `angle` radians of arc along the great circle toward
+/// forward/right (-1..1); returns the new place and the parallel-transported
+/// heading.
+fn fly_step(latitude: f32, longitude: f32, heading: f32, forward: f32, right: f32, angle: f32) -> (f32, f32, f32) {
+    let (up, north) = surface_frame(latitude, longitude);
+    let east = up.cross(north).normalized();
+    let heading = heading.to_radians();
+    let facing = (north * heading.cos() + east * heading.sin()).normalized();
+    let side = up.cross(facing).normalized();
+    let travel = (facing * forward + side * right).normalized();
+    let (sin, cos) = (angle.sin(), angle.cos());
+    let new_up = (up * cos + travel * sin).normalized();
+    // Parallel transport: the component along the travel turns with the
+    // great circle, the rest is unchanged.
+    let along = facing.dot(travel);
+    let new_facing = (facing - travel * along + (travel * cos - up * sin) * along).normalized();
+    let new_latitude = new_up.z.clamp(-1.0, 1.0).asin().to_degrees().clamp(-89.9, 89.9);
+    let new_longitude = (-new_up.y).atan2(new_up.x).to_degrees();
+    let (_, new_north) = surface_frame(new_latitude, new_longitude);
+    let new_east = new_up.cross(new_north).normalized();
+    let new_heading = new_facing.dot(new_east).atan2(new_facing.dot(new_north)).to_degrees().rem_euclid(360.0);
+    (new_latitude, new_longitude, new_heading)
+}
+
+/// Local vertical and north at a latitude/longitude, in the scene's
+/// longitude-mirrored frame (as `onboard_pose` builds a fixed viewpoint).
+fn surface_frame(latitude: f32, longitude: f32) -> (Vec3, Vec3) {
+    let (lat, lon) = (f64::from(latitude).to_radians(), f64::from(longitude).to_radians());
+    let direction = crate::orbit::scene_direction(lat, lon);
+    let up = Vec3::new(direction[0] as f32, direction[1] as f32, direction[2] as f32);
+    let north = Vec3::new((-lat.sin() * lon.cos()) as f32, (lat.sin() * lon.sin()) as f32, lat.cos() as f32);
+    (up, north)
 }

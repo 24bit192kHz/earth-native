@@ -140,9 +140,11 @@ earth-native stop
 ```
 
 In control mode: drag (or the arrow keys) to look around from the ISS or to
-orbit the globe, scroll or Q/E to zoom, **C** to switch ISS window/globe,
-**R** to reset the look, **Ctrl+←/→** to tour the planets, Esc to hand the
-desktop back.
+orbit the globe, **W/A/S/D** to fly over the Earth (from the window; on the
+globe they orbit faster) for as long as they are held, **Shift** for 4× the
+speed, scroll or Q/E to zoom, **C** to switch ISS window/globe (and to ride
+the ISS again after flying), **R** to reset the look, **Ctrl+←/→** to tour
+the planets, Esc to hand the desktop back.
 
 | Variable | Effect |
 | --- | --- |
