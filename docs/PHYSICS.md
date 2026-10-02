@@ -84,9 +84,16 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
 - **Clouds, live:** hourly NOAA GMGSI geostationary mosaics (visible by day,
   10.7 µm infrared by night, ~10 km). Each is compared with a decaying
   clear-sky composite of the same place, so deserts, snow and sea ice are
-  not mistaken for cloud. GFS low cloud fills in warm low cloud at night, and
-  GFS covers the poles beyond the mosaic. The observed cover (B-spline
-  upsampled, so the 10 km grid leaves no straight edges) is read as a cloud
+  not mistaken for cloud. The mosaic joins five satellites along fixed
+  meridians (178.2° W, 106.1° W, 37.7° W, 22.7° E, 93.1° E), and the one
+  looking toward the Sun reads clear sea and haze up to 0.4 brighter than
+  its neighbour (sunglint, forward scattering): a straight edge down the
+  globe with false cloud on one side. The offset is measured across each
+  seam (median over 1.6° of latitude, so real cloud cancels) and taken off
+  the brighter side, easing out over 20° of longitude. GFS low cloud fills
+  in warm low cloud at night, and GFS covers the poles beyond the mosaic.
+  The observed cover (B-spline upsampled, so the 10 km grid leaves no
+  straight edges) is read as a cloud
   fraction. Where inside it the cloud sits comes from a fractal projected
   triplanar from the sphere (isotropic, no lat/lon shear) mixed with the 1 km
   texture of the NASA cloud composite: that field is cut at its

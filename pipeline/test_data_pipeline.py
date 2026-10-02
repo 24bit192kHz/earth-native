@@ -22,6 +22,59 @@ class DataPipelineTests(unittest.TestCase):
         self.assertTrue(np.isnan(vis[0, 0]))
         self.assertEqual(list(vis[0, 1:]), [1.0, 255.0])
 
+    def test_gmgsi_seams_lie_midway_between_the_satellites(self):
+        # The sector boundaries measured in the 2026-10 mosaics.
+        longitudes = sorted(column / 10 - 180 for column in pipeline.gmgsi_seams(3600))
+        for found, measured in zip(longitudes, [-178.2, -106.1, -37.7, 22.7, 93.1]):
+            self.assertAlmostEqual(found, measured, delta=0.15)
+
+    def test_satellites_are_matched_across_a_seam(self):
+        # 93 E, 2026-10-02 10:05 UTC: Himawari looks toward the Sun and reads
+        # clear sea 0.3 brighter than Meteosat. 1 degree per pixel, so the
+        # 20 degree reach is 20 columns.
+        height, width = 90, 360
+        seam = pipeline.gmgsi_seams(width)[3]
+        hazy_east = np.full((height, width), 0.05)
+        hazy_east[:, seam:seam + 60] += 0.3
+        balanced = pipeline.balance_satellites(hazy_east)
+        row = height // 2
+        self.assertLess(abs(balanced[row, seam] - balanced[row, seam - 1]), 0.01)
+        self.assertAlmostEqual(balanced[row, seam - 5], 0.05)        # the clearer side stays as it is
+        self.assertAlmostEqual(balanced[row, seam + 30], 0.35)       # beyond the reach the haze is the satellite's own
+        self.assertTrue(np.all(np.diff(balanced[row, seam:seam + 20]) >= 0))   # and returns smoothly
+        # The same when the west side is the brighter one.
+        hazy_west = np.full((height, width), 0.05)
+        hazy_west[:, seam - 60:seam] += 0.3
+        balanced = pipeline.balance_satellites(hazy_west)
+        self.assertLess(abs(balanced[row, seam] - balanced[row, seam - 1]), 0.01)
+        self.assertAlmostEqual(balanced[row, seam + 5], 0.05)
+        self.assertAlmostEqual(balanced[row, seam - 30], 0.35)
+
+    def test_the_seam_is_found_where_it_really_is(self):
+        # The cut at 93 E sits a pixel east of the satellites' midpoint; the
+        # clear column west of it must not be treated as part of the haze.
+        height, width = 90, 360
+        nominal = pipeline.gmgsi_seams(width)[3]
+        field = np.full((height, width), 0.05)
+        field[:, nominal + 1:nominal + 61] += 0.3
+        balanced = pipeline.balance_satellites(field)
+        row = height // 2
+        self.assertAlmostEqual(balanced[row, nominal], 0.05)
+        self.assertAlmostEqual(balanced[row, nominal - 1], 0.05)
+        self.assertLess(abs(balanced[row, nominal + 1] - 0.05), 0.01)
+
+    def test_satellite_balance_ignores_gaps_and_leaves_alone_what_matches(self):
+        height, width = 90, 360
+        seam = pipeline.gmgsi_seams(width)[3]
+        night_east = np.full((height, width), 0.05)
+        night_east[:, seam:seam + 60] = np.nan                     # no visible image on one side
+        np.testing.assert_array_equal(pipeline.balance_satellites(night_east), night_east)
+        noise = np.random.default_rng(3).normal(0.05, 0.02, (720, width))
+        self.assertLess(np.abs(pipeline.balance_satellites(noise) - noise).max(), 0.03)
+        cloud_on_both_sides = np.full((height, width), 0.05)
+        cloud_on_both_sides[20:40, seam - 15:seam + 15] = 0.9      # one cloud straddling the seam
+        np.testing.assert_allclose(pipeline.balance_satellites(cloud_on_both_sides), cloud_on_both_sides, atol=1e-9)
+
     def test_grib_ranges_are_exact_and_all_fields_required(self):
         index = "\n".join([
             "1:0:d=2026090512:TCDC:entire atmosphere:anl:",

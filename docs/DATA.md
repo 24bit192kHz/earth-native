@@ -98,10 +98,15 @@ refreshes every 30 minutes:
   lightning flashes), and low cloud.
 - **NOAA GMGSI** hourly geostationary mosaics (visible and 10.7 µm infrared)
   for observed cloud cover, against clear-sky composites kept in
-  `weather/clearsky.npz`. A missing satellite segment arrives as counts of
-  255 (infrared) or 0 (visible) rather than the declared fill value; both
-  are treated as missing, and the gap is filled from the GFS cloud field,
-  feathered into the observation over ~2.5° so it leaves no seam.
+  `weather/clearsky.npz`. The visible image is stitched from five satellites
+  that see the same ground from different sides, so its brightness steps at
+  their seams (up to 0.4 in albedo at 93° E, where Himawari looks toward the
+  Sun across Meteosat's sea); the step is measured across each seam and
+  removed from the brighter side. A missing satellite segment arrives as
+  counts of 255 (infrared) or 0 (visible) rather than the declared fill
+  value; both are treated as missing, and the gap is filled from the GFS
+  cloud field, feathered into the observation over ~2.5° so it leaves no
+  seam.
 - **NOAA GEFS-Aerosols analysis** (GOCART, 0.25°): aerosol optical depth at
   440, 550 and 645 nm.
 - **EUMETSAT OSI SAF** daily sea-ice concentration (OSI-401, 10 km polar

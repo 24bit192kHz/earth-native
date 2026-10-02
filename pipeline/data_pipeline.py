@@ -662,6 +662,78 @@ def gmgsi_equirect(payload, product, size=CLOUD_SIZE):
     return out
 
 
+# Sub-satellite longitudes of the five sectors of the GMGSI mosaic: GOES-West,
+# GOES-East, Meteosat at 0 and over the Indian Ocean (45.5 E), Himawari. Each
+# pixel comes from the nearest satellite, so the sectors meet midway: at
+# 178.2 W, 106.1 W, 37.7 W, 22.7 E and 93.1 E (as found in the 2026-10 files).
+GMGSI_SATELLITES = (-137.0, -75.2, 0.0, 45.5, 140.7)
+
+
+def gmgsi_seams(width):
+    """Columns of a `width`-pixel equirectangular grid that should start the
+    sector east of each seam between the satellites of the mosaic (the cut
+    itself can sit a pixel or two off the midpoint: see `_seam_start`)."""
+    ordered = sorted(GMGSI_SATELLITES)
+    middles = [0.5 * (west + east) for west, east in zip(ordered, ordered[1:] + [ordered[0] + 360.0])]
+    return [int(round((middle + 180.0) * width / 360.0)) % width for middle in middles]
+
+
+def _seam_start(field, nominal, radius=3):
+    """The column that really starts the east sector: where, within `radius`
+    pixels of the nominal one, neighbouring columns differ most (median over
+    the rows; the cut at 93 E sits one pixel east of the midpoint)."""
+    width = field.shape[1]
+    columns = (nominal + np.arange(-radius, radius + 1)) % width
+    jumps = []
+    for column in columns:
+        difference = np.abs(field[:, column] - field[:, (column - 1) % width])
+        difference = difference[np.isfinite(difference)]
+        jumps.append(np.median(difference) if difference.size >= 60 else 0.0)
+    return int(columns[int(np.argmax(jumps))]) if max(jumps) > 0.0 else nominal
+
+
+def _row_mean(block, minimum=2):
+    """Mean of the finite values of each row, NaN under `minimum` of them."""
+    valid = np.isfinite(block)
+    count = valid.sum(axis=1)
+    return np.where(count >= minimum, np.where(valid, block, 0.0).sum(axis=1) / np.maximum(count, 1), np.nan)
+
+
+def balance_satellites(field, reach_degrees=20.0, window_degrees=1.6, limit=0.5):
+    """Take the step out of a visible-channel field (brightness above clear
+    sky) where two satellites of the mosaic meet.
+
+    At a seam both satellites see the same ground under the same Sun from
+    opposite sides, and the one looking toward the Sun sees far more light:
+    sunglint on the sea and forward-scattered haze. At 10:05 UTC on
+    2026-10-02 Himawari read 0.1-0.4 brighter than Meteosat along 93 E, clear
+    ocean as 35-90 % cloud, a straight edge down the globe. The offset is
+    measured across each seam (median over `window_degrees` of latitude, so
+    real cloud, which is the same on both sides, cancels) and removed from the
+    brighter side, easing to nothing over `reach_degrees` of longitude. Never
+    more than `limit`, and rows with too little data are left alone."""
+    height, width = field.shape
+    out = field.copy()
+    half = max(1, int(round(window_degrees * height / 180.0)))
+    reach = max(1, int(round(reach_degrees * width / 360.0)))
+    # The strips start two pixels from the seam: the resampling blends it.
+    near = 2 + np.arange(4)
+    taper = 0.5 * (1.0 + np.cos(np.pi * (np.arange(reach) + 0.5) / reach))
+    for seam in (_seam_start(field, nominal) for nominal in gmgsi_seams(width)):
+        step = _row_mean(field[:, (seam + near) % width]) - _row_mean(field[:, (seam - 1 - near) % width])
+        windows = np.lib.stride_tricks.sliding_window_view(np.pad(step, half, constant_values=np.nan), 2 * half + 1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            offset = np.nanmedian(windows, axis=1)
+        offset = np.where(np.isfinite(windows).sum(axis=1) >= max(3, half), np.clip(offset, -limit, limit), 0.0)
+        # A median jumps between neighbouring rows; smoothed, and fading out
+        # where the data end, the correction cannot draw lines of its own.
+        offset = np.convolve(np.pad(offset, half), np.bartlett(2 * half + 1) / half, mode="valid")
+        out[:, (seam + np.arange(reach)) % width] -= np.maximum(offset, 0.0)[:, None] * taper
+        out[:, (seam - 1 - np.arange(reach)) % width] -= np.maximum(-offset, 0.0)[:, None] * taper
+    return out
+
+
 def solar_cosine(when, size=CLOUD_SIZE):
     """Cosine of the solar zenith angle on the grid (NOAA low-precision
     formulae, ~0.1 degree): enough to normalise visible brightness."""
@@ -697,13 +769,14 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
     Visible (daytime) and 10.7 um infrared counts are compared with decaying
     clear-sky composites kept on disk (the darkest visible albedo and the
     warmest infrared recently seen at each place), so deserts, snow and ice
-    stay clear and clouds are departures from the surface. Day: visible,
-    backed by cold infrared; night: infrared, plus the GFS model's cloud
-    where warm low cloud is invisible to infrared; beyond the mosaic (the
-    poles) GFS. Returns RGBA uint8 (R cover; G sea-ice concentration when
-    `sea_ice` is given, else cloud-top coldness; B and A the aerosol when
-    `aerosol` is given, else observed fraction and 1) and the observation
-    time.
+    stay clear and clouds are departures from the surface; the visible
+    fields of neighbouring satellites are matched at the mosaic's seams.
+    Day: visible, backed by cold infrared; night: infrared, plus the GFS
+    model's cloud where warm low cloud is invisible to infrared; beyond the
+    mosaic (the poles) GFS. Returns RGBA uint8 (R cover; G sea-ice
+    concentration when `sea_ice` is given, else cloud-top coldness; B and A
+    the aerosol when `aerosol` is given, else observed fraction and 1) and
+    the observation time.
     """
     vis_url, vis_hour = gmgsi_latest("VIS", now)
     ir_url, ir_hour = gmgsi_latest("LW", now)
@@ -743,7 +816,9 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
     ir_fallback = np.broadcast_to((65 + 60 * (np.abs(lat) / 72.0) ** 2)[:, None], albedo.shape)
     ir_clear = np.where(is_day, ir_day, ir_night)
     ir_surface = np.where(np.isfinite(ir_clear), ir_clear, ir_fallback)
-    vis_cloud = smoothstep(0.02, 0.45, albedo - vis_surface)
+    # The composite cannot tell a satellite looking toward the Sun (glint,
+    # haze) from one looking away: match the two at every seam of the mosaic.
+    vis_cloud = smoothstep(0.02, 0.45, balance_satellites(albedo - vis_surface))
     ir_cloud = smoothstep(16.0, 60.0, ir - ir_surface)
     day = smoothstep(0.10, 0.34, cosine)
     def upsample(field):

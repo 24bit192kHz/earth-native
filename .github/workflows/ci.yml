@@ -21,4 +21,4 @@ jobs:
       - name: Pipeline unit tests
         run: |
           python3 -m pip install --quiet numpy pillow
-          cd pipeline && python3 -m unittest -k block_compression -k polar -k preview -k resize -k atomic -k range test_data_pipeline
+          cd pipeline && python3 -m unittest -k block_compression -k polar -k preview -k resize -k atomic -k range -k gmgsi -k seam -k satellite test_data_pipeline
