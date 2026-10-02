@@ -155,7 +155,12 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   display brightness it has at the night series' EV 16 when the camera
   opens further (EV 19 from the ISS at night), where it would burn out to a
   flat white blob, and it fades out smoothly at the edge of the cells asked
-  about it, so no glow is ever cut by a straight edge.
+  about it, so no glow is ever cut by a straight edge. A flash is on for its
+  whole length or not at all: the cell's chance is read once, at the start
+  of its slot (read at the current time, the rate drifted and, in the most
+  active storms, one flash in six started or stopped halfway), and the tail
+  is faded out over its last 0.2 s instead of being cut while still a few
+  percent of the peak.
 
 ## Moon and planets
 

@@ -6747,6 +6747,22 @@ mod tests {
     }
 
     #[test]
+    fn meter_and_shader_agree_on_the_night_series() {
+        let shader = include_str!("../shaders/earth_textured.frag");
+        // One number, in both places: the meter undoes the gain the shader applies.
+        let definition = format!("const float NIGHT_SERIES_PREEXPOSURE = {:.1};", post::NIGHT_SERIES_PREEXPOSURE);
+        assert!(shader.contains(&definition), "the shader's night series is not the meter's: {definition}");
+        assert!(shader.contains("max(1.0, NIGHT_SERIES_PREEXPOSURE / preexposure())"));
+        assert!(shader.contains("min(1.0, NIGHT_SERIES_PREEXPOSURE / preexposure())"));
+        assert!(!shader.contains("65536.0 /"), "the night series' exposure must not be written out again");
+        // The flag is the alpha's sign alone: a smooth ramp left the meter a
+        // coverage that was not one across the twilight band.
+        assert!(shader.contains("bool metered_lit = true;"));
+        assert!(shader.contains("metered_lit ? coverage : -coverage"));
+        assert!(!shader.contains("2.0 * metered_lit"));
+    }
+
+    #[test]
     fn textured_earth_marches_a_physical_atmosphere() {
         let shader = include_str!("../shaders/earth_textured.frag");
         // Precomputed Bruneton/Hillaire tables from sky.rs, not an analytic glow.
@@ -6782,6 +6798,15 @@ mod tests {
         assert!(shader.contains("float flash_gain()"));
         assert!(shader.contains("FLASH_RADIANCE * night_gain(cloud_mu) * flash_gain()"));
         assert!(shader.contains("float inside = 1.0 - smoothstep(1.0, 1.5,"));
+        // A flash is on for its whole length or not at all: its chance is read
+        // once, at the start of its slot (read at the current time the rate
+        // drifted, and in the most active storms one flash in six started or
+        // stopped halfway), and its tail is faded out where it ends instead
+        // of cut.
+        assert!(shader.contains("fract((phase - own.x) * (FLASH_SLOT / 9.0) + own.y)"));
+        assert!(!shader.contains("fract(time * (1.0 / 9.0)"));
+        assert!(shader.contains("float fade = 1.0 - smoothstep(finish - 0.2, finish, local);"));
+        assert!(shader.contains("if (row < 0 || row >= size.y) continue;"));
         assert!(shader.contains("city_signal_cloud"));
         assert!(shader.contains("cloud_shadow"));
         assert!(shader.contains("cox_munk_glint"));

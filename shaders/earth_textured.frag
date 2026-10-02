@@ -111,13 +111,17 @@ float preexposure() {
     return frame.camera_position_distance.w;
 }
 
+// Pre-exposure of the night series, EV 16 (post.rs holds the same number for
+// the meter, and a test keeps the two equal).
+const float NIGHT_SERIES_PREEXPOSURE = 65536.0;
+
 // The night side has an exposure of its own, as the adapted eye (or a
 // composited film) shows it: whatever the camera's exposure, city lights,
 // moonlit cloud, lightning, airglow and aurora are drawn as a night series
 // (EV 16) records them. They stay visible beside the daylit Earth and
 // under a sunrise. At a night exposure the factor is one.
 float night_gain() {
-    return max(1.0, 65536.0 / preexposure());
+    return max(1.0, NIGHT_SERIES_PREEXPOSURE / preexposure());
 }
 
 // The same gain eased in through twilight (in stops, so it has no edge):
@@ -999,7 +1003,7 @@ const float FLASH_RADIANCE = 5.0e-5;
 // every flash out to a flat white blob: a flash keeps the display brightness
 // it has at EV 16 instead, so its structure stays.
 float flash_gain() {
-    return min(1.0, 65536.0 / preexposure());
+    return min(1.0, NIGHT_SERIES_PREEXPOSURE / preexposure());
 }
 
 // Mean over the window ending at `time` of a pulse that starts at `onset` and
@@ -1042,7 +1046,8 @@ vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
     vec3 light = vec3(0.0);
     float lumps = -1.0;
     for (int dy = -1; dy <= 1; ++dy) {
-        int row = clamp(home.y + dy, 0, size.y - 1);
+        int row = home.y + dy;
+        if (row < 0 || row >= size.y) continue;
         float cos_lat = cos((0.5 - (float(row) + 0.5) / grid.y) * PI);
         // A cell is 111 km tall and 111 cos(latitude) km wide.
         float cell_km = 111.0 * max(cos_lat, 0.25);
@@ -1059,7 +1064,9 @@ vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
             float slot_time = time / FLASH_SLOT + own.x;
             float phase = floor(slot_time);
             float local = (slot_time - phase) * FLASH_SLOT;
-            float wave = 0.5 - 0.5 * cos(6.2831853 * fract(time * (1.0 / 9.0) + own.y));
+            // Read at the start of the slot: were it read now, the rate would
+            // move while a flash is on and start or stop it halfway.
+            float wave = 0.5 - 0.5 * cos(6.2831853 * fract((phase - own.x) * (FLASH_SLOT / 9.0) + own.y));
             float rate = FLASH_RATE * storm_blob * cos_lat * (0.25 + 2.0 * wave * wave);
             float roll = storm_random(strike_cell, uint(phase));
             if (roll >= rate * FLASH_SLOT) continue;
@@ -1071,7 +1078,8 @@ vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
             float duration = 0.10 + 0.30 * pow(flash_size, 0.7);
             // The flash, tail included, ends inside its slot.
             float start = draw.y * max(FLASH_SLOT - duration - 0.25, 0.0);
-            if (local < start || local > start + duration + 0.24) continue;
+            float finish = start + duration + 0.24;
+            if (local < start || local > finish) continue;
 
             float tau = 0.018 + 0.030 * draw.z;
             int strokes = 2 + int(draw.w * 3.0);
@@ -1115,7 +1123,10 @@ vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
             if (lumps < 0.0) lumps = flash_lumps(normal, pixel_km);
             float reach = 0.6 + 0.9 * lumps;       // thick lobes of the cloud reach further
             float strength = 0.55 + 0.9 * lumps;   // and glow brighter
-            float amplitude = (0.25 + 0.95 * flash_size) * sigma / wide * inside;
+            // The tail is faded out over its last 0.2 s: it is still a few
+            // percent of the peak where the flash ends, and would vanish at once.
+            float fade = 1.0 - smoothstep(finish - 0.2, finish, local);
+            float amplitude = (0.25 + 0.95 * flash_size) * sigma / wide * inside * fade;
 
             // The cloud deck around the flash, lit faintly through its thick
             // parts. Kept inside the cells asked.
@@ -1202,11 +1213,12 @@ void main() {
     vec3 transmittance = vec3(1.0);
     float coverage = 0.0;
     // For the meter (post.rs read_meter), which sees this texel scaled by
-    // the camera's exposure: 1 where it is (sunlit ground or air), 0 where
-    // night_gain holds it at the night series' EV 16 instead. The meter
+    // the camera's exposure: true where it is (sunlit ground or air), false
+    // where night_gain holds it at the night series' EV 16 instead. The meter
     // must undo that gain, or the night side looks darker to it at every
-    // stop the camera opens up and the exposure chases itself.
-    float metered_lit = 1.0;
+    // stop the camera opens up and the exposure chases itself. Only the sign
+    // of the alpha carries it: its size stays the coverage.
+    bool metered_lit = true;
 
     if (earth_distance > 0.0) {
         float t_ground = earth_distance * KM_PER_UNIT;
@@ -1220,7 +1232,7 @@ void main() {
         float mu_moon = dot(normal, moon);
         // Sunlit or sky-lit ground; past this the night gain (eased in from
         // -0.03 to -0.25) carries more than a quarter of its stops.
-        metered_lit = smoothstep(-0.12, -0.08, mu_sun);
+        metered_lit = mu_sun > -0.10;
 
         // Cloud shadows: march the sun-leg from the surface into the cloud
         // shell and attenuate direct sun by the density found there.
@@ -1401,12 +1413,12 @@ void main() {
         float r_tangent = length(tangent);
         float mu_tangent = dot(tangent, sun) / r_tangent;
         float shadow_axis = r_tangent * sqrt(max(1.0 - mu_tangent * mu_tangent, 0.0));
-        metered_lit = mu_tangent >= 0.0 ? 1.0 : smoothstep(R_GROUND - 60.0, R_GROUND, shadow_axis);
+        metered_lit = mu_tangent >= 0.0 || shadow_axis > R_GROUND - 30.0;
     }
     radiance += (AURORA_GAIN * aurora_emission(camera, ray, sun, earth_distance)
         + night_airglow(camera, ray, sun, earth_distance)) * night_gain();
     // The coverage's sign is the meter's flag (see metered_lit); the blend
     // passes it through (stars leave alpha 0) and nothing else reads it.
-    out_color = vec4(min(radiance * exposure, vec3(30000.0)), coverage * (2.0 * metered_lit - 1.0));
+    out_color = vec4(min(radiance * exposure, vec3(30000.0)), metered_lit ? coverage : -coverage);
     out_transmittance = vec4(transmittance, 1.0);
 }

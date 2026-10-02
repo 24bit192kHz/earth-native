@@ -191,8 +191,9 @@ struct MeterSample {
 }
 
 /// Pre-exposure of the night series the night side is drawn at (EV 16,
-/// `night_gain` in earth_textured.frag).
-const NIGHT_SERIES_PREEXPOSURE: f32 = 65536.0;
+/// `NIGHT_SERIES_PREEXPOSURE` in earth_textured.frag; a test in vulkan.rs
+/// keeps the two equal).
+pub(super) const NIGHT_SERIES_PREEXPOSURE: f32 = 65536.0;
 
 pub(super) struct HdrTarget {
     pool: vk::DescriptorPool,
