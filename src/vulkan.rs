@@ -6789,7 +6789,12 @@ mod tests {
         // asked so that no glow is cut at a cell edge.
         assert!(shader.contains("storm_random4(strike_cell, 0u)"));
         assert!(shader.contains("float slot_time = time / FLASH_SLOT + own.x;"));
-        assert!(shader.contains("for (int dy = -1; dy <= 1; ++dy)"));
+        // The nine cells are one loop whose count the compiler cannot see:
+        // unrolled, it fetched all nine at once and the Earth shader went
+        // from 64 to 116 registers, a quarter slower for every pixel.
+        assert!(shader.contains("int cells = 9 + int(min(preexposure(), 0.0));"));
+        assert!(shader.contains("for (int cell = 0; cell < cells; ++cell)"));
+        assert!(!shader.contains("for (int dy = -1; dy <= 1; ++dy)"));
         assert!(!shader.contains("float life = 1.4"));
         assert!(!shader.contains("bloom_center"));
         // A flash keeps its EV 16 display brightness when the camera opens up

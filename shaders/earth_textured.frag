@@ -997,6 +997,8 @@ const float FLASH_WINDOW = 0.09;
 // Radiance scale of a flash in sunlight units: its centre reaches a few 1e-5,
 // the brightest ~1e-4 of sunlit cloud.
 const float FLASH_RADIANCE = 5.0e-5;
+// Brightness of the 1st-4th return stroke of a flash, before its own variation.
+const vec4 STROKE_WEIGHT = vec4(1.0, 0.62, 0.48, 0.38);
 
 // The night series is EV 16 (night_gain brings a flash there from a shorter
 // exposure). A camera opened further, EV 19 from the ISS at night, would burn
@@ -1045,115 +1047,113 @@ vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
     ivec2 home = ivec2(floor(uv * grid));
     vec3 light = vec3(0.0);
     float lumps = -1.0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        int row = home.y + dy;
+    // The compiler must not be able to count these as nine. Unrolled, it
+    // fetched all nine cells up front and the whole Earth shader needed 116
+    // registers instead of 64: every pixel ran slower, not only the storms.
+    int cells = 9 + int(min(preexposure(), 0.0));
+    for (int cell = 0; cell < cells; ++cell) {
+        int row = home.y + cell / 3 - 1;
         if (row < 0 || row >= size.y) continue;
-        float cos_lat = cos((0.5 - (float(row) + 0.5) / grid.y) * PI);
+        ivec2 texel = ivec2((home.x + cell % 3 - 1 + size.x) % size.x, row);
+        vec3 weather = textureLod(weather_fields, (vec2(texel) + 0.5) / grid, 2.0).rgb;
+        float storm_blob = smoothstep(0.025, 0.4, weather.g) * smoothstep(0.05, 0.5, weather.b)
+            * smoothstep(0.3, 0.8, weather.r);
+        if (storm_blob <= 0.0) continue;
         // A cell is 111 km tall and 111 cos(latitude) km wide.
+        float cos_lat = cos((0.5 - (float(row) + 0.5) / grid.y) * PI);
         float cell_km = 111.0 * max(cos_lat, 0.25);
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 texel = ivec2((home.x + dx + size.x) % size.x, row);
-            vec3 weather = textureLod(weather_fields, (vec2(texel) + 0.5) / grid, 2.0).rgb;
-            float storm_blob = smoothstep(0.025, 0.4, weather.g) * smoothstep(0.05, 0.5, weather.b)
-                * smoothstep(0.3, 0.8, weather.r);
-            if (storm_blob <= 0.0) continue;
-            vec2 strike_cell = vec2(texel);
-            // The cell's own clock, and an activity that waxes and wanes over
-            // ~9 s (mean 1): storms flash in bursts, not at an even rate.
-            vec4 own = storm_random4(strike_cell, 0u);
-            float slot_time = time / FLASH_SLOT + own.x;
-            float phase = floor(slot_time);
-            float local = (slot_time - phase) * FLASH_SLOT;
-            // Read at the start of the slot: were it read now, the rate would
-            // move while a flash is on and start or stop it halfway.
-            float wave = 0.5 - 0.5 * cos(6.2831853 * fract((phase - own.x) * (FLASH_SLOT / 9.0) + own.y));
-            float rate = FLASH_RATE * storm_blob * cos_lat * (0.25 + 2.0 * wave * wave);
-            float roll = storm_random(strike_cell, uint(phase));
-            if (roll >= rate * FLASH_SLOT) continue;
+        vec2 strike_cell = vec2(texel);
+        // The cell's own clock, and an activity that waxes and wanes over
+        // ~9 s (mean 1): storms flash in bursts, not at an even rate.
+        vec4 own = storm_random4(strike_cell, 0u);
+        float slot_time = time / FLASH_SLOT + own.x;
+        float phase = floor(slot_time);
+        float local = (slot_time - phase) * FLASH_SLOT;
+        // Read at the start of the slot: were it read now, the rate would
+        // move while a flash is on and start or stop it halfway.
+        float wave = 0.5 - 0.5 * cos(6.2831853 * fract((phase - own.x) * (FLASH_SLOT / 9.0) + own.y));
+        float rate = FLASH_RATE * storm_blob * cos_lat * (0.25 + 2.0 * wave * wave);
+        float roll = storm_random(strike_cell, uint(phase));
+        if (roll >= rate * FLASH_SLOT) continue;
 
-            vec4 draw = storm_random4(strike_cell, uint(phase) ^ 0x68e31da4u);
-            vec4 jitter = storm_random4(strike_cell, uint(phase) ^ 0xb5297a4du);
-            vec4 place = storm_random4(strike_cell, uint(phase) ^ 0x1b56c4e9u);
-            float flash_size = pow(draw.x, 2.2);
-            float duration = 0.10 + 0.30 * pow(flash_size, 0.7);
-            // The flash, tail included, ends inside its slot.
-            float start = draw.y * max(FLASH_SLOT - duration - 0.25, 0.0);
-            float finish = start + duration + 0.24;
-            if (local < start || local > finish) continue;
+        vec4 draw = storm_random4(strike_cell, uint(phase) ^ 0x68e31da4u);
+        vec4 jitter = storm_random4(strike_cell, uint(phase) ^ 0xb5297a4du);
+        vec4 place = storm_random4(strike_cell, uint(phase) ^ 0x1b56c4e9u);
+        float flash_size = pow(draw.x, 2.2);
+        float duration = 0.10 + 0.30 * pow(flash_size, 0.7);
+        // The flash, tail included, ends inside its slot.
+        float start = draw.y * max(FLASH_SLOT - duration - 0.25, 0.0);
+        float finish = start + duration + 0.24;
+        if (local < start || local > finish) continue;
 
-            float tau = 0.018 + 0.030 * draw.z;
-            int strokes = 2 + int(draw.w * 3.0);
-            vec4 onset = start + duration * (vec4(0.0, 1.0, 2.0, 3.0) + vec4(0.0, 0.8 * jitter.yzw)) / float(strokes);
-            vec4 weight = vec4(1.0, 0.62, 0.48, 0.38) * (0.6 + 0.8 * fract(jitter * 17.31 + draw));
-            float temporal = 0.2 * flash_pulse(local, start, 0.04 + 0.5 * duration);
-            for (int k = 0; k < 4; ++k) {
-                if (k < strokes) temporal += weight[k] * flash_pulse(local, onset[k], tau);
-            }
-            if (temporal < 1.0e-4) continue;
+        // Fades out towards the edge of the cells asked, so no glow can
+        // be cut there however bright it is.
+        vec2 from_cell = uv * grid - (strike_cell + 0.5);
+        from_cell.x -= round(from_cell.x / grid.x) * grid.x;
+        float inside = 1.0 - smoothstep(1.0, 1.5, max(abs(from_cell.x), abs(from_cell.y)));
+        if (inside <= 0.0) continue;
 
-            // Fades out towards the edge of the cells asked, so no glow can
-            // be cut there however bright it is.
-            vec2 from_cell = uv * grid - (strike_cell + 0.5);
-            from_cell.x -= round(from_cell.x / grid.x) * grid.x;
-            float inside = 1.0 - smoothstep(1.0, 1.5, max(abs(from_cell.x), abs(from_cell.y)));
-            if (inside <= 0.0) continue;
+        // A storm re-flashes around its core: every cell has a hot spot,
+        // each flash lands within a quarter of a cell of it.
+        vec2 center = (strike_cell + clamp(0.2 + 0.6 * own.zw + 0.5 * (place.xy - 0.5), 0.05, 0.95)) / grid;
+        vec2 offset = uv - center;
+        offset.x -= round(offset.x);
+        vec2 km = vec2(offset.x * 2.0 * PI * cos((0.5 - center.y) * PI), offset.y * PI) * R_GROUND;
+        float sigma = 4.5 + 13.0 * pow(flash_size, 0.8);
+        // The odd flash lights a whole cloud shield. None is wider than
+        // the cells asked about it can carry (a tail of 4 sigma).
+        if (jitter.w > 0.96) sigma *= 1.6;
+        sigma = min(sigma, 0.22 * cell_km);
+        // The glow spreads over the first ~100 ms, as the discharge branches.
+        sigma *= 0.55 + 0.45 * smoothstep(0.0, 0.12, local - start);
+        // Under a pixel the glow cannot be narrower than the pixel: widen
+        // it and give up a share of its peak.
+        float wide = sqrt(sigma * sigma + 0.3 * pixel_km * pixel_km);
+        float stretch = 1.0 + 1.2 * jitter.x;
+        vec2 axis = normalize(place.zw - 0.5 + 1.0e-3);
+        float along = dot(km, axis);
+        float across = dot(km, vec2(-axis.y, axis.x));
+        float r2 = (along * along / stretch + across * across * stretch) / (wide * wide);
+        if (r2 > 45.0) continue;
+        if (lumps < 0.0) lumps = flash_lumps(normal, pixel_km);
+        float reach = 0.6 + 0.9 * lumps;       // thick lobes of the cloud reach further
+        float strength = 0.55 + 0.9 * lumps;   // and glow brighter
+        // The tail is faded out over its last 0.2 s: it is still a few
+        // percent of the peak where the flash ends, and would vanish at once.
+        float fade = 1.0 - smoothstep(finish - 0.2, finish, local);
+        float amplitude = (0.25 + 0.95 * flash_size) * sigma / wide * inside * fade;
 
-            // A storm re-flashes around its core: every cell has a hot spot,
-            // each flash lands within a quarter of a cell of it.
-            vec2 center = (strike_cell + clamp(0.2 + 0.6 * own.zw + 0.5 * (place.xy - 0.5), 0.05, 0.95)) / grid;
-            vec2 offset = uv - center;
-            offset.x -= round(offset.x);
-            vec2 km = vec2(offset.x * 2.0 * PI * cos((0.5 - center.y) * PI), offset.y * PI) * R_GROUND;
-            float sigma = 4.5 + 13.0 * pow(flash_size, 0.8);
-            // The odd flash lights a whole cloud shield. None is wider than
-            // the cells asked about it can carry (a tail of 4 sigma).
-            if (jitter.w > 0.96) sigma *= 1.6;
-            sigma = min(sigma, 0.22 * cell_km);
-            // The glow spreads over the first ~100 ms, as the discharge branches.
-            sigma *= 0.55 + 0.45 * smoothstep(0.0, 0.12, local - start);
-            // Under a pixel the glow cannot be narrower than the pixel: widen
-            // it and give up a share of its peak.
-            float wide = sqrt(sigma * sigma + 0.3 * pixel_km * pixel_km);
-            float stretch = 1.0 + 1.2 * jitter.x;
-            vec2 axis = normalize(place.zw - 0.5 + 1.0e-3);
-            float along = dot(km, axis);
-            float across = dot(km, vec2(-axis.y, axis.x));
-            float r2 = (along * along / stretch + across * across * stretch) / (wide * wide);
-            if (r2 > 45.0) continue;
-            if (lumps < 0.0) lumps = flash_lumps(normal, pixel_km);
-            float reach = 0.6 + 0.9 * lumps;       // thick lobes of the cloud reach further
-            float strength = 0.55 + 0.9 * lumps;   // and glow brighter
-            // The tail is faded out over its last 0.2 s: it is still a few
-            // percent of the peak where the flash ends, and would vanish at once.
-            float fade = 1.0 - smoothstep(finish - 0.2, finish, local);
-            float amplitude = (0.25 + 0.95 * flash_size) * sigma / wide * inside * fade;
-
-            // The cloud deck around the flash, lit faintly through its thick
-            // parts. Kept inside the cells asked.
-            float halo_sigma = min(2.2 * wide, 0.30 * cell_km);
-            float halo_r2 = (along * along / sqrt(stretch) + across * across * sqrt(stretch)) / (halo_sigma * halo_sigma);
-            if (halo_r2 < 18.0) {
-                light += vec3(0.45, 0.58, 1.0) * (exp(-0.5 * halo_r2) * lumps * lumps * 0.035 * amplitude * temporal);
-            }
-            // The continuing glow sits on the flash; every return stroke lights
-            // the cloud a little further along it, so the lit part changes
-            // from one stroke to the next instead of one disc fading.
-            for (int k = 0; k < 4; ++k) {
-                if (k >= strokes) break;
-                float pulse = weight[k] * flash_pulse(local, onset[k], tau);
-                if (pulse < 1.0e-3) continue;
-                float shift = k == 0 ? 0.0 : (fract(jitter[k] * 7.7 + draw.x) - 0.5) * 2.4 * wide;
-                float a = along - shift;
-                float stroke_r2 = (a * a / stretch + across * across * stretch) / (wide * wide * reach);
-                if (stroke_r2 > 18.0) continue;
-                light += (vec3(0.60, 0.72, 1.0) * exp(-0.5 * stroke_r2) + vec3(0.9, 0.87, 0.82) * exp(-3.0 * stroke_r2))
-                    * (pulse * amplitude * strength);
-            }
-            float glow_r2 = r2 / (1.4 * reach);
-            if (glow_r2 < 18.0) {
-                light += vec3(0.60, 0.72, 1.0) * (exp(-0.5 * glow_r2) * 0.2
-                    * flash_pulse(local, start, 0.04 + 0.5 * duration) * amplitude * strength);
-            }
+        // The continuing glow sits on the flash; every return stroke lights
+        // the cloud a little further along it, so the lit part changes
+        // from one stroke to the next instead of one disc fading.
+        float tau = 0.018 + 0.030 * draw.z;
+        int strokes = 2 + int(draw.w * 3.0);
+        float glow = 0.2 * flash_pulse(local, start, 0.04 + 0.5 * duration);
+        float temporal = glow;
+        for (int k = 0; k < 4; ++k) {
+            if (k >= strokes) break;
+            float onset = start + duration * (float(k) + (k == 0 ? 0.0 : 0.8 * jitter[k])) / float(strokes);
+            float pulse = STROKE_WEIGHT[k] * (0.6 + 0.8 * fract(jitter[k] * 17.31 + draw[k]))
+                * flash_pulse(local, onset, tau);
+            temporal += pulse;
+            if (pulse < 1.0e-3) continue;
+            float shift = k == 0 ? 0.0 : (fract(jitter[k] * 7.7 + draw.x) - 0.5) * 2.4 * wide;
+            float a = along - shift;
+            float stroke_r2 = (a * a / stretch + across * across * stretch) / (wide * wide * reach);
+            if (stroke_r2 > 18.0) continue;
+            light += (vec3(0.60, 0.72, 1.0) * exp(-0.5 * stroke_r2) + vec3(0.9, 0.87, 0.82) * exp(-3.0 * stroke_r2))
+                * (pulse * amplitude * strength);
+        }
+        float glow_r2 = r2 / (1.4 * reach);
+        if (glow_r2 < 18.0) {
+            light += vec3(0.60, 0.72, 1.0) * (exp(-0.5 * glow_r2) * glow * amplitude * strength);
+        }
+        // The cloud deck around the flash, lit faintly through its thick
+        // parts. Kept inside the cells asked.
+        float halo_sigma = min(2.2 * wide, 0.30 * cell_km);
+        float halo_r2 = (along * along / sqrt(stretch) + across * across * sqrt(stretch)) / (halo_sigma * halo_sigma);
+        if (halo_r2 < 18.0) {
+            light += vec3(0.45, 0.58, 1.0) * (exp(-0.5 * halo_r2) * lumps * lumps * 0.035 * amplitude * temporal);
         }
     }
     return light;
