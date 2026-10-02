@@ -134,9 +134,28 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   closed rings. Green 557.7 nm (peak ~110 km), red 630 nm (~240 km) and N₂⁺
   violet profiles; field-aligned rays make curtains at the limb. Emission
   fades out through nautical twilight at the emission point.
-- **Lightning:** flashes cluster where NOAA GFS reports convective energy,
-  precipitation and cloud water; each takes the shape of the cloud it
-  lights, brightest through the thick cores.
+- **Lightning:** flashes belong to the 1° cells where NOAA GFS reports
+  convective energy, precipitation and cloud water, at a rate that follows
+  the storm and waxes and wanes over ~9 s. Every cell keeps its own clock
+  and draws a new flash in each 0.8 s slot (a place near its storm core, a
+  size, a length, a stroke pattern), so nothing repeats and no two cells
+  flash on a common beat. A flash is the intracloud kind: a soft elongated
+  glow 5-17 km across (the odd one lights a cloud shield 1.6 times wider,
+  where the cell is wide enough to carry it) that spreads over its first
+  100 ms and lasts 0.1-0.4 s, with 2-4 return strokes decaying in 20-50 ms
+  and a dimmer continuing glow behind them.
+  Most are small and dim, a few large and bright. It lights the cloud from
+  inside, so it follows the lumps of the cloud top (the tiling fractal read
+  at towers a few km across) and its opacity, with a faint wider halo
+  through the thick parts; each return stroke lights the cloud a little
+  further along the flash, so the lit part changes from stroke to stroke.
+  Strokes are averaged over the last 90 ms, as a camera does, so every
+  flash shows in the 8-20 fps frames it falls in; under a pixel the glow
+  widens to the pixel and gives up part of its peak. A flash keeps the
+  display brightness it has at the night series' EV 16 when the camera
+  opens further (EV 19 from the ISS at night), where it would burn out to a
+  flat white blob, and it fades out smoothly at the edge of the cells asked
+  about it, so no glow is ever cut by a straight edge.
 
 ## Moon and planets
 

@@ -6768,6 +6768,20 @@ mod tests {
         // Night side: lightning, city underglow, OVATION aurora, airglow.
         assert!(shader.contains("storm_random(strike_cell, uint(phase))"));
         assert!(!shader.contains("phase * 5.31"));
+        // Flashes: every cell on a clock of its own (no common beat), a new
+        // flash in each slot (nothing repeats), the cells around the pixel
+        // asked so that no glow is cut at a cell edge.
+        assert!(shader.contains("storm_random4(strike_cell, 0u)"));
+        assert!(shader.contains("float slot_time = time / FLASH_SLOT + own.x;"));
+        assert!(shader.contains("for (int dy = -1; dy <= 1; ++dy)"));
+        assert!(!shader.contains("float life = 1.4"));
+        assert!(!shader.contains("bloom_center"));
+        // A flash keeps its EV 16 display brightness when the camera opens up
+        // (EV 19 at night from the ISS burned every flash out to a white blob)
+        // and fades smoothly where the cells asked end, so it is never cut.
+        assert!(shader.contains("float flash_gain()"));
+        assert!(shader.contains("FLASH_RADIANCE * night_gain(cloud_mu) * flash_gain()"));
+        assert!(shader.contains("float inside = 1.0 - smoothstep(1.0, 1.5,"));
         assert!(shader.contains("city_signal_cloud"));
         assert!(shader.contains("cloud_shadow"));
         assert!(shader.contains("cox_munk_glint"));

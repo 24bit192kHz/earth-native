@@ -723,6 +723,18 @@ float storm_random(vec2 cell, uint phase) {
     return float((word >> 22u) ^ word) * (1.0 / 4294967296.0);
 }
 
+// Four independent numbers for one (cell, phase): the same hash chained.
+vec4 storm_random4(vec2 cell, uint phase) {
+    uint word = uint(cell.x) * 1973u ^ uint(cell.y) * 9277u ^ phase * 26699u;
+    vec4 value;
+    for (int i = 0; i < 4; ++i) {
+        uint state = (word + uint(i) * 2654435761u) * 747796405u + 2891336453u;
+        word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        value[i] = float((word >> 22u) ^ word) * (1.0 / 4294967296.0);
+    }
+    return value;
+}
+
 // Black Marble 2016 is an 8-bit display product (sRGB-coded BC4). Mapped to
 // radiance so the brightest city cores reach ~25x a full-Moon-lit desert
 // (VIIRS DNB: ~500 vs ~20 nW cm^-2 sr^-1), in sunlight units.
@@ -961,6 +973,181 @@ vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
     return glow * 4.7e-12 * dark;
 }
 
+// --- Lightning -----------------------------------------------------------
+// Flashes belong to the 1 degree cells (~110 km, wider than any glow) of the
+// weather fields where NOAA GFS reports convective energy, rain and cloud
+// water (the cell's storm blob). Every cell keeps its own clock, so no two
+// flash on a common beat, and draws a new flash in each slot of FLASH_SLOT
+// seconds: position, size, length and stroke pattern all differ, nothing
+// repeats. A flash is the intracloud kind that fills the top of a storm: a
+// soft elongated glow, 5-17 km across (the Gaussian sigma), that lasts
+// 0.1-0.4 s, several return strokes (each decaying in ~20-50 ms) and a
+// dimmer continuing glow behind them. Big flashes are bright, wide and long;
+// most are small. The cells around the pixel are all asked, so a glow is
+// never cut at a cell edge.
+const float FLASH_SLOT = 0.8;
+const float FLASH_RATE = 0.48;     // flashes per second of a cell with blob 1
+// Frames are drawn at 8-20 per second: averaging each stroke over the last
+// 90 ms, as a camera does, shows every flash in the frame it falls in.
+const float FLASH_WINDOW = 0.09;
+// Radiance scale of a flash in sunlight units: its centre reaches a few 1e-5,
+// the brightest ~1e-4 of sunlit cloud.
+const float FLASH_RADIANCE = 5.0e-5;
+
+// The night series is EV 16 (night_gain brings a flash there from a shorter
+// exposure). A camera opened further, EV 19 from the ISS at night, would burn
+// every flash out to a flat white blob: a flash keeps the display brightness
+// it has at EV 16 instead, so its structure stays.
+float flash_gain() {
+    return min(1.0, 65536.0 / preexposure());
+}
+
+// Mean over the window ending at `time` of a pulse that starts at `onset` and
+// decays with time constant `tau`.
+float flash_pulse(float time, float onset, float tau) {
+    if (time <= onset) return 0.0;
+    float from = max(time - FLASH_WINDOW, onset);
+    return tau * (exp(-(from - onset) / tau) - exp(-(time - onset) / tau)) / FLASH_WINDOW;
+}
+
+// How thick and lumpy the cloud top is under a flash, 0 (a gap) to 1 (a
+// tower): the glow follows it, so a flash shows the cauliflower top it lights
+// instead of a smooth disc. The fractal is read three times coarser than a
+// pixel: towers a few km across, not pixel noise.
+float flash_lumps(vec3 normal, float pixel_km) {
+    vec3 w = pow(abs(normal), vec3(8.0));
+    w /= w.x + w.y + w.z;
+    float mean = textureLod(tiling_noise, vec2(0.5), 16.0).r;
+    float lumps = 0.0;
+    for (int octave = 0; octave < 2; ++octave) {
+        float tile_km = octave == 0 ? 160.0 : 45.0;
+        float lod = log2(max(3.0 * pixel_km * 256.0 / tile_km, 1.0));
+        vec3 p = normal * (R_GROUND / tile_km) + float(octave) * 0.37;
+        vec3 s = vec3(textureLod(tiling_noise, p.yz, lod).r,
+                      textureLod(tiling_noise, p.zx, lod).r,
+                      textureLod(tiling_noise, p.xy, lod).r);
+        float n = mean + (dot(w, s) - mean) * inversesqrt(dot(w, w));
+        lumps += (octave == 0 ? 0.65 : 0.35) * (n - mean);
+    }
+    return clamp(0.5 + 3.5 * lumps, 0.0, 1.0);
+}
+
+// Light the storms add to the cloud tops at map position `uv` (`normal` is the
+// same point as a direction); `pixel_km` is the ground size of a pixel.
+vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
+    if (frame.material_state.y < 0.5) return vec3(0.0);
+    ivec2 size = textureSize(weather_fields, 0) / 4;
+    vec2 grid = vec2(size);
+    ivec2 home = ivec2(floor(uv * grid));
+    vec3 light = vec3(0.0);
+    float lumps = -1.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        int row = clamp(home.y + dy, 0, size.y - 1);
+        float cos_lat = cos((0.5 - (float(row) + 0.5) / grid.y) * PI);
+        // A cell is 111 km tall and 111 cos(latitude) km wide.
+        float cell_km = 111.0 * max(cos_lat, 0.25);
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 texel = ivec2((home.x + dx + size.x) % size.x, row);
+            vec3 weather = textureLod(weather_fields, (vec2(texel) + 0.5) / grid, 2.0).rgb;
+            float storm_blob = smoothstep(0.025, 0.4, weather.g) * smoothstep(0.05, 0.5, weather.b)
+                * smoothstep(0.3, 0.8, weather.r);
+            if (storm_blob <= 0.0) continue;
+            vec2 strike_cell = vec2(texel);
+            // The cell's own clock, and an activity that waxes and wanes over
+            // ~9 s (mean 1): storms flash in bursts, not at an even rate.
+            vec4 own = storm_random4(strike_cell, 0u);
+            float slot_time = time / FLASH_SLOT + own.x;
+            float phase = floor(slot_time);
+            float local = (slot_time - phase) * FLASH_SLOT;
+            float wave = 0.5 - 0.5 * cos(6.2831853 * fract(time * (1.0 / 9.0) + own.y));
+            float rate = FLASH_RATE * storm_blob * cos_lat * (0.25 + 2.0 * wave * wave);
+            float roll = storm_random(strike_cell, uint(phase));
+            if (roll >= rate * FLASH_SLOT) continue;
+
+            vec4 draw = storm_random4(strike_cell, uint(phase) ^ 0x68e31da4u);
+            vec4 jitter = storm_random4(strike_cell, uint(phase) ^ 0xb5297a4du);
+            vec4 place = storm_random4(strike_cell, uint(phase) ^ 0x1b56c4e9u);
+            float flash_size = pow(draw.x, 2.2);
+            float duration = 0.10 + 0.30 * pow(flash_size, 0.7);
+            // The flash, tail included, ends inside its slot.
+            float start = draw.y * max(FLASH_SLOT - duration - 0.25, 0.0);
+            if (local < start || local > start + duration + 0.24) continue;
+
+            float tau = 0.018 + 0.030 * draw.z;
+            int strokes = 2 + int(draw.w * 3.0);
+            vec4 onset = start + duration * (vec4(0.0, 1.0, 2.0, 3.0) + vec4(0.0, 0.8 * jitter.yzw)) / float(strokes);
+            vec4 weight = vec4(1.0, 0.62, 0.48, 0.38) * (0.6 + 0.8 * fract(jitter * 17.31 + draw));
+            float temporal = 0.2 * flash_pulse(local, start, 0.04 + 0.5 * duration);
+            for (int k = 0; k < 4; ++k) {
+                if (k < strokes) temporal += weight[k] * flash_pulse(local, onset[k], tau);
+            }
+            if (temporal < 1.0e-4) continue;
+
+            // Fades out towards the edge of the cells asked, so no glow can
+            // be cut there however bright it is.
+            vec2 from_cell = uv * grid - (strike_cell + 0.5);
+            from_cell.x -= round(from_cell.x / grid.x) * grid.x;
+            float inside = 1.0 - smoothstep(1.0, 1.5, max(abs(from_cell.x), abs(from_cell.y)));
+            if (inside <= 0.0) continue;
+
+            // A storm re-flashes around its core: every cell has a hot spot,
+            // each flash lands within a quarter of a cell of it.
+            vec2 center = (strike_cell + clamp(0.2 + 0.6 * own.zw + 0.5 * (place.xy - 0.5), 0.05, 0.95)) / grid;
+            vec2 offset = uv - center;
+            offset.x -= round(offset.x);
+            vec2 km = vec2(offset.x * 2.0 * PI * cos((0.5 - center.y) * PI), offset.y * PI) * R_GROUND;
+            float sigma = 4.5 + 13.0 * pow(flash_size, 0.8);
+            // The odd flash lights a whole cloud shield. None is wider than
+            // the cells asked about it can carry (a tail of 4 sigma).
+            if (jitter.w > 0.96) sigma *= 1.6;
+            sigma = min(sigma, 0.22 * cell_km);
+            // The glow spreads over the first ~100 ms, as the discharge branches.
+            sigma *= 0.55 + 0.45 * smoothstep(0.0, 0.12, local - start);
+            // Under a pixel the glow cannot be narrower than the pixel: widen
+            // it and give up a share of its peak.
+            float wide = sqrt(sigma * sigma + 0.3 * pixel_km * pixel_km);
+            float stretch = 1.0 + 1.2 * jitter.x;
+            vec2 axis = normalize(place.zw - 0.5 + 1.0e-3);
+            float along = dot(km, axis);
+            float across = dot(km, vec2(-axis.y, axis.x));
+            float r2 = (along * along / stretch + across * across * stretch) / (wide * wide);
+            if (r2 > 45.0) continue;
+            if (lumps < 0.0) lumps = flash_lumps(normal, pixel_km);
+            float reach = 0.6 + 0.9 * lumps;       // thick lobes of the cloud reach further
+            float strength = 0.55 + 0.9 * lumps;   // and glow brighter
+            float amplitude = (0.25 + 0.95 * flash_size) * sigma / wide * inside;
+
+            // The cloud deck around the flash, lit faintly through its thick
+            // parts. Kept inside the cells asked.
+            float halo_sigma = min(2.2 * wide, 0.30 * cell_km);
+            float halo_r2 = (along * along / sqrt(stretch) + across * across * sqrt(stretch)) / (halo_sigma * halo_sigma);
+            if (halo_r2 < 18.0) {
+                light += vec3(0.45, 0.58, 1.0) * (exp(-0.5 * halo_r2) * lumps * lumps * 0.035 * amplitude * temporal);
+            }
+            // The continuing glow sits on the flash; every return stroke lights
+            // the cloud a little further along it, so the lit part changes
+            // from one stroke to the next instead of one disc fading.
+            for (int k = 0; k < 4; ++k) {
+                if (k >= strokes) break;
+                float pulse = weight[k] * flash_pulse(local, onset[k], tau);
+                if (pulse < 1.0e-3) continue;
+                float shift = k == 0 ? 0.0 : (fract(jitter[k] * 7.7 + draw.x) - 0.5) * 2.4 * wide;
+                float a = along - shift;
+                float stroke_r2 = (a * a / stretch + across * across * stretch) / (wide * wide * reach);
+                if (stroke_r2 > 18.0) continue;
+                light += (vec3(0.60, 0.72, 1.0) * exp(-0.5 * stroke_r2) + vec3(0.9, 0.87, 0.82) * exp(-3.0 * stroke_r2))
+                    * (pulse * amplitude * strength);
+            }
+            float glow_r2 = r2 / (1.4 * reach);
+            if (glow_r2 < 18.0) {
+                light += vec3(0.60, 0.72, 1.0) * (exp(-0.5 * glow_r2) * 0.2
+                    * flash_pulse(local, start, 0.04 + 0.5 * duration) * amplitude * strength);
+            }
+        }
+    }
+    return light;
+}
+
 void main() {
     vec2 surface_uv = in_uv;
     vec2 global_xy = frame.viewport_rect.xy + surface_uv * frame.viewport_rect.zw;
@@ -1177,45 +1364,15 @@ void main() {
                 + (cloud_moon * max(cloud_moon_mu, 0.0) * moon_relief + NIGHT_SKY_IRRADIANCE)
                     * NIGHT_TINT * night_gain(cloud_mu));
             if (cloud_night > 0.0) {
-                // Thunderstorm lightning as seen from orbit: brief flashes that
-                // bloom under a cloud top, flicker (several return strokes), and
-                // cluster inside mesoscale convective systems (NOAA GFS CAPE,
-                // precipitation and cloud water).
-                const vec2 grid_size = vec2(720.0, 360.0);
-                vec2 strike_grid = cloud_uv * grid_size;
-                vec2 strike_cell = floor(strike_grid);
-                vec2 suv = fract(strike_grid);
-                vec2 cell_center_uv = (strike_cell + 0.5) / grid_size;
-                vec3 weather = texture(weather_fields, cell_center_uv).rgb;
-                float storm_blob = smoothstep(0.025, 0.4, weather.g) * smoothstep(0.05, 0.5, weather.b)
-                    * smoothstep(0.3, 0.8, weather.r) * frame.material_state.y;
-                float t = frame.celestial_state.w;
-                float life = 1.4;
-                float phase = floor(t / life);
-                float roll = storm_random(strike_cell, uint(phase));
-                float fx = fract(t / life);
-                float p1 = hash21(strike_cell + 9.1) * 0.5;
-                float p2 = p1 + 0.12 + hash21(strike_cell + 4.4) * 0.18;
-                float stroke_one = (fx - p1) * 26.0;
-                float stroke_two = (fx - p2) * 22.0;
-                float flicker = exp(-(stroke_one * stroke_one))
-                    + 0.7 * exp(-(stroke_two * stroke_two))
-                    + 0.3 * step(p1, fx) * exp(-max(fx - p1, 0.0) * 18.0);
-                const float frequency = 0.11;
-                float strike = step(1.0 - frequency * storm_blob, roll) * flicker * cloud_night;
-                vec2 bloom_center = vec2(hash21(strike_cell + 11.3), hash21(strike_cell + 47.9));
-                // The flash lights the cloud from inside: it takes the
-                // cloud's own shape, brightest through its thick cores.
-                float d = length((suv - bloom_center) * vec2(1.6, 1.0)) + 0.12 * (0.6 - cloud_sample.z);
-                strike *= 0.3 + 0.9 * cloud_sample.z;
-                float bloom_arg = d * 7.0;
-                float core_arg = d * 19.0;
-                float bloom = exp(-(bloom_arg * bloom_arg));
-                float core = exp(-(core_arg * core_arg));
+                // Thunderstorm lightning as seen from orbit: the flash lights the
+                // cloud from inside, so it takes the cloud's own shape,
+                // brightest through its thick cores.
                 float scatter = smoothstep(0.20, 0.60, cloud_opacity);
-                // A lightning-lit cloud top is ~1e-4 of sunlit cloud.
-                cloud_colour += (vec3(0.55, 0.68, 1.0) * bloom * 3.0 + vec3(0.92, 0.96, 1.0) * core * 4.0)
-                    * strike * scatter * 4.0e-5 * night_gain(cloud_mu);
+                float thick = 0.3 + 0.9 * cloud_sample.z;
+                if (scatter > 0.0) {
+                    cloud_colour += lightning_light(cloud_uv, cloud_normal, max(length(px), length(py)), frame.celestial_state.w)
+                        * (cloud_night * scatter * thick * FLASH_RADIANCE * night_gain(cloud_mu) * flash_gain());
+                }
                 // City lights glow upward into low night cloud.
                 // The cloud diffuses them: a wide golden glow over a city.
                 float city_signal_cloud = city_signal_at(cloud_uv, vec2(0.0));
