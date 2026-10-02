@@ -1014,6 +1014,12 @@ void main() {
     vec3 radiance = vec3(0.0);
     vec3 transmittance = vec3(1.0);
     float coverage = 0.0;
+    // For the meter (post.rs read_meter), which sees this texel scaled by
+    // the camera's exposure: 1 where it is (sunlit ground or air), 0 where
+    // night_gain holds it at the night series' EV 16 instead. The meter
+    // must undo that gain, or the night side looks darker to it at every
+    // stop the camera opens up and the exposure chases itself.
+    float metered_lit = 1.0;
 
     if (earth_distance > 0.0) {
         float t_ground = earth_distance * KM_PER_UNIT;
@@ -1025,6 +1031,9 @@ void main() {
         vec3 shading_normal = relief_normal(normal, map_uv, map_dx, map_dy);
         float mu_sun = dot(normal, sun);
         float mu_moon = dot(normal, moon);
+        // Sunlit or sky-lit ground; past this the night gain (eased in from
+        // -0.03 to -0.25) carries more than a quarter of its stops.
+        metered_lit = smoothstep(-0.12, -0.08, mu_sun);
 
         // Cloud shadows: march the sun-leg from the surface into the cloud
         // shell and attenuate direct sun by the density found there.
@@ -1227,9 +1236,20 @@ void main() {
         march(origin_km, ray, t_entry, t_exit, t_closest, 32, sun_light, moon_light, with_moon,
             radiance, transmittance);
         coverage = 1.0 - dot(transmittance, vec3(0.2126, 0.7152, 0.0722));
+        // Sunlit air: the ray's closest approach lies outside the Earth's
+        // shadow, eased over the lowest 60 km, where the higher air along
+        // the ray still catches the Sun. Otherwise only the airglow and the
+        // aurora light it, at the night gain.
+        vec3 tangent = origin_km + ray * clamp(t_closest, t_entry, t_exit);
+        float r_tangent = length(tangent);
+        float mu_tangent = dot(tangent, sun) / r_tangent;
+        float shadow_axis = r_tangent * sqrt(max(1.0 - mu_tangent * mu_tangent, 0.0));
+        metered_lit = mu_tangent >= 0.0 ? 1.0 : smoothstep(R_GROUND - 60.0, R_GROUND, shadow_axis);
     }
     radiance += (AURORA_GAIN * aurora_emission(camera, ray, sun, earth_distance)
         + night_airglow(camera, ray, sun, earth_distance)) * night_gain();
-    out_color = vec4(min(radiance * exposure, vec3(30000.0)), coverage);
+    // The coverage's sign is the meter's flag (see metered_lit); the blend
+    // passes it through (stars leave alpha 0) and nothing else reads it.
+    out_color = vec4(min(radiance * exposure, vec3(30000.0)), coverage * (2.0 * metered_lit - 1.0));
     out_transmittance = vec4(transmittance, 1.0);
 }

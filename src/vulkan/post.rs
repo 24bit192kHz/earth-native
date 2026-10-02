@@ -181,6 +181,19 @@ pub(super) struct MeterReading {
     pub coverage: f32,
 }
 
+/// One meter texel of the Earth: its scene luminance, its weight (coverage,
+/// centre-weighted) and whether it is sunlit (scaled by the camera's
+/// exposure) or drawn at the night side's own exposure.
+struct MeterSample {
+    luminance: f32,
+    weight: f32,
+    lit: bool,
+}
+
+/// Pre-exposure of the night series the night side is drawn at (EV 16,
+/// `night_gain` in earth_textured.frag).
+const NIGHT_SERIES_PREEXPOSURE: f32 = 65536.0;
+
 pub(super) struct HdrTarget {
     pool: vk::DescriptorPool,
     image: vk::Image,
@@ -555,11 +568,21 @@ impl HdrTarget {
     /// as the adapted eye sees the night side and the stars past them. The
     /// 99th percentile used before kept a daylight exposure for that thin
     /// rim. A frame without the Earth is a starfield.
+    ///
+    /// The Earth's night side is drawn at an exposure of its own (EV 16,
+    /// `night_gain` in earth_textured.frag), so its texels do not scale
+    /// with the camera's. The shader flags them with a negative coverage
+    /// and the meter undoes the gain: read as scene luminance they are the
+    /// same at every camera exposure. Read naively they looked a stop darker
+    /// for every stop the camera opened, the target chased the exposure,
+    /// and once they fell under the subject cut the key jumped to the lit
+    /// limb: a sawtooth between EV 8 and 13 every two seconds, with the blue
+    /// twilight arc blooming and fading in step.
     pub fn read_meter(&self) -> Option<MeterReading> {
         let preexposure = self.meter_preexposure?;
         let (width, height) = (self.meter_extent.width as usize, self.meter_extent.height as usize);
         let texels = unsafe { std::slice::from_raw_parts(self.meter_ptr, width * height * 4) };
-        let mut samples: Vec<(f32, f32)> = Vec::with_capacity(width * height);
+        let mut samples: Vec<MeterSample> = Vec::with_capacity(width * height);
         let mut whole_frame: Vec<f32> = Vec::with_capacity(width * height);
         let mut coverage = 0.0_f64;
         for (index, texel) in texels.chunks_exact(4).enumerate() {
@@ -573,17 +596,19 @@ impl HdrTarget {
             if r.is_nan() || g.is_nan() || b.is_nan() || a.is_nan() {
                 continue;
             }
-            let a = a.clamp(0.0, 1.0);
+            let lit = a >= 0.0;
+            let a = a.abs().min(1.0);
+            let exposure = if lit { preexposure } else { preexposure.max(NIGHT_SERIES_PREEXPOSURE) };
             coverage += f64::from(a);
-            whole_frame.push(((0.2126 * r + 0.7152 * g + 0.0722 * b) / preexposure).clamp(1.0e-12, 4.0));
+            whole_frame.push(((0.2126 * r + 0.7152 * g + 0.0722 * b) / exposure).clamp(1.0e-12, 4.0));
             if a < 0.25 {
                 continue;
             }
             let x = ((index % width) as f32 + 0.5) / width as f32 - 0.5;
             let y = ((index / width) as f32 + 0.5) / height as f32 - 0.5;
             let centre = 1.0 - (x * x + y * y);
-            let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / a / preexposure;
-            samples.push((luminance.clamp(1.0e-12, 4.0), a * centre));
+            let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / a / exposure;
+            samples.push(MeterSample { luminance: luminance.clamp(1.0e-12, 4.0), weight: a * centre, lit });
         }
         let coverage = (coverage / (width * height) as f64) as f32;
         whole_frame.sort_by(|a, b| a.total_cmp(b));
@@ -594,26 +619,31 @@ impl HdrTarget {
         // The band keeps its colours (orange, white, blue) at ~1.5 stops
         // over the key; at 3 stops over it was a featureless white arc.
         let highlight = if p97 > 2.0e-3 { p97 / 3.0 } else { 0.0 };
-        let total: f32 = samples.iter().map(|(_, w)| w).sum();
+        let total: f32 = samples.iter().map(|s| s.weight).sum();
         if total < 0.02 * (width * height) as f32 {
             // No Earth in frame: the sky has a fixed brightness, so keep
             // the exposure (no flash when the Earth comes back into view).
             return None;
         }
-        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        samples.sort_by(|a, b| a.luminance.total_cmp(&b.luminance));
         // Meter the lit part: an airless night side is black, and with a
         // crescent it took the 85th percentile, so the exposure opened up
         // until the crescent was a white blot. Anything under 1/500 of the
-        // brightest percent is not part of the subject.
-        let reference = samples[(samples.len() * 99 / 100).min(samples.len() - 1)].0;
-        samples.retain(|sample| sample.0 >= reference * 2.0e-3);
-        let total: f32 = samples.iter().map(|(_, w)| w).sum();
+        // brightest lit percent is not part of the subject. The Earth's
+        // night side (moonlight, cities, aurora) is a subject in its own
+        // right: it stays, and outweighs a thin twilight arc as the night
+        // footage's exposure does, with the arc blooming over it.
+        let lit: Vec<f32> = samples.iter().filter(|s| s.lit).map(|s| s.luminance).collect();
+        if let Some(&reference) = lit.get((lit.len() * 99 / 100).min(lit.len().saturating_sub(1))) {
+            samples.retain(|sample| !sample.lit || sample.luminance >= reference * 2.0e-3);
+        }
+        let total: f32 = samples.iter().map(|s| s.weight).sum();
         let mut accumulated = 0.0;
-        let mut key = samples.last().map_or(1.0, |s| s.0);
-        for (luminance, weight) in &samples {
-            accumulated += weight;
+        let mut key = samples.last().map_or(1.0, |s| s.luminance);
+        for sample in &samples {
+            accumulated += sample.weight;
             if accumulated >= 0.85 * total {
-                key = *luminance;
+                key = sample.luminance;
                 break;
             }
         }

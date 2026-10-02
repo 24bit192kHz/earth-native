@@ -188,7 +188,10 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   lightning and aurora at 8 fps and otherwise redraws only when it moves).
 - **Auto exposure:** metered on a 64 px mip: the 85th-percentile luminance
   of the lit part of the body (anything under 1/500 of its brightest
-  percent is left out, so a crescent is exposed for the crescent), or a highlight rule when bright sunlit sky covers more than 3 %
+  percent is left out, so a crescent is exposed for the crescent; the
+  Earth's night side, which has its own exposure, is read at that
+  exposure and kept as a subject, so a thin twilight arc over it blooms
+  at the night exposure instead of holding the camera down), or a highlight rule when bright sunlit sky covers more than 3 %
   of the frame (the sunrise band seen from the ISS, held ~1.5 stops over
   the key so it keeps its colours). Daylight stays near a "sunny 16"
   exposure: a low Sun or open ocean is lifted by 0.6 of its deficit, at
