@@ -195,6 +195,11 @@ struct MeterSample {
 /// keeps the two equal).
 pub(super) const NIGHT_SERIES_PREEXPOSURE: f32 = 65536.0;
 
+/// Scene luminance above which a meter texel holds sunlit Earth: a tenth
+/// of a percent of white under a zenith Sun, far over moonlit cloud
+/// (~1e-6) and city lights, and still under a crescent at a low Sun.
+const DAYLIGHT_FLOOR: f32 = 1.0e-3;
+
 pub(super) struct HdrTarget {
     pool: vk::DescriptorPool,
     image: vk::Image,
@@ -641,22 +646,17 @@ impl HdrTarget {
         let total: f32 = samples.iter().map(|s| s.weight).sum();
         // A thin arc may bloom over the night side, but a crescent that is a
         // real part of the globe is the subject: from 2 % of the Earth's
-        // weight to 6 % its median is held to ~1.5 stops over the key. The
+        // area to 6 % its median is held to ~1.5 stops over the key. The
         // night key alone once put a wide crescent at EV 17, a white blot.
-        let lit_weight: f32 = samples.iter().filter(|s| s.lit).map(|s| s.weight).sum();
-        let lit_share = if total > 0.0 { lit_weight / total } else { 0.0 };
-        let (crescent, blend) = {
-            let mut accumulated = 0.0;
-            let mut median = 0.0;
-            for sample in samples.iter().filter(|s| s.lit) {
-                accumulated += sample.weight;
-                if accumulated >= 0.5 * lit_weight {
-                    median = sample.luminance;
-                    break;
-                }
-            }
-            (median / 2.8, ((lit_share - 0.02) / 0.04).clamp(0.0, 1.0))
-        };
+        // Daylight is found by brightness over the whole frame, not by the
+        // lit flag: a thin crescent falls mostly in meter texels it shares
+        // with the night side, which read as night or under the coverage
+        // cut (8 of 217 Earth texels for a crescent of ~5 %).
+        let daylit = &whole_frame[whole_frame.partition_point(|&l| l < DAYLIGHT_FLOOR)..];
+        let earth_texels = coverage * (width * height) as f32;
+        let lit_share = if earth_texels > 0.0 { daylit.len() as f32 / earth_texels } else { 0.0 };
+        let crescent = daylit.get(daylit.len() / 2).map_or(0.0, |median| median / 2.8);
+        let blend = ((lit_share - 0.02) / 0.04).clamp(0.0, 1.0);
         let mut accumulated = 0.0;
         let mut key = samples.last().map_or(1.0, |s| s.luminance);
         for sample in &samples {
