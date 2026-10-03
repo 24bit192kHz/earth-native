@@ -645,8 +645,8 @@ impl HdrTarget {
         }
         let total: f32 = samples.iter().map(|s| s.weight).sum();
         // A thin arc may bloom over the night side, but a crescent that is a
-        // real part of the globe is the subject: from 2 % of the Earth's
-        // area to 6 % its median is held to ~1.5 stops over the key. The
+        // real part of the globe is the subject: from 1.5 % of the Earth's
+        // area to 4 % its median is held to ~1.5 stops over the key. The
         // night key alone once put a wide crescent at EV 17, a white blot.
         // Daylight is found by brightness over the whole frame, not by the
         // lit flag: a thin crescent falls mostly in meter texels it shares
@@ -656,7 +656,7 @@ impl HdrTarget {
         let earth_texels = coverage * (width * height) as f32;
         let lit_share = if earth_texels > 0.0 { daylit.len() as f32 / earth_texels } else { 0.0 };
         let crescent = daylit.get(daylit.len() / 2).map_or(0.0, |median| median / 2.8);
-        let blend = ((lit_share - 0.02) / 0.04).clamp(0.0, 1.0);
+        let blend = ((lit_share - 0.015) / 0.025).clamp(0.0, 1.0);
         let mut accumulated = 0.0;
         let mut key = samples.last().map_or(1.0, |s| s.luminance);
         for sample in &samples {
