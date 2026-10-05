@@ -12,6 +12,59 @@ import data_pipeline as pipeline
 
 
 class DataPipelineTests(unittest.TestCase):
+    def test_cloud_observation_survives_failed_updates_and_generation_cleanup(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+        index = "\n".join([
+            "1:0:d=x:TCDC:entire atmosphere:anl:", "2:100:d=x:CAPE:surface:anl:",
+            "3:400:d=x:PRATE:surface:anl:",
+            "4:600:d=x:CWAT:entire atmosphere (considered as a single layer):anl:",
+            "5:900:d=x:LCDC:low cloud layer:anl:", "6:1000:d=x:TMP:surface:anl:"])
+        with tempfile.TemporaryDirectory() as directory, patch.object(pipeline, "DATA", Path(directory)), \
+                patch.object(pipeline, "CLOUD_SIZE", (4, 2)), patch.object(pipeline, "datetime") as clock, \
+                patch.object(pipeline, "download", return_value=index.encode()), \
+                patch.object(pipeline, "aurora_field", return_value=(np.zeros((720, 1440), np.uint8), 0)), \
+                patch.object(pipeline, "aerosol_field", side_effect=OSError("offline")), \
+                patch.object(pipeline, "sea_ice_field", side_effect=OSError("offline")), \
+                patch.object(pipeline, "live_clouds", side_effect=OSError("offline")):
+            root = Path(directory) / "weather"
+            old = root / "20261005T12-1791199800"
+            fields = pipeline.preview(old, "fields", np.zeros((720, 1440, 3), np.uint8))
+            clouds = pipeline.preview(old, "clouds", np.ones((2, 4, 3), np.uint8))
+            np.save(root / "gfs-low-cloud.npy", np.zeros((720, 1440), np.float16))
+            observation = int((now - timedelta(hours=1)).timestamp())
+            existing = dict(packing_version=4, valid_unix_utc=int(now.timestamp()),
+                            texture=str(old / fields["file"]), sha256=fields["sha256"],
+                            clouds_texture=str(old / clouds["file"]), clouds_sha256=clouds["sha256"],
+                            clouds_unix_utc=observation, aerosol_unix_utc=observation - 3600)
+            pipeline.atomic_json(root / "current.json", existing)
+            for minutes in (0, 30, 60):
+                clock.now.return_value = now + timedelta(minutes=minutes)
+                result = pipeline.weather()
+                self.assertEqual(result["clouds_texture"], existing["clouds_texture"])
+                self.assertEqual(result["clouds_unix_utc"], observation)
+                self.assertEqual(result["aerosol_unix_utc"], observation - 3600)
+                self.assertTrue(Path(result["clouds_texture"]).is_file())
+            self.assertEqual(len(list(root.glob("20261005T12-*"))), 3)  # two GFS + retained clouds
+            clock.now.return_value = now + timedelta(hours=5)  # six-hour observation limit
+            expired = pipeline.weather()
+            self.assertNotIn("clouds_texture", expired)
+            self.assertFalse(old.exists())
+
+    def test_corrupt_or_missing_cloud_payload_is_not_retained(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory, patch.object(pipeline, "CLOUD_SIZE", (4, 2)):
+            root = Path(directory)
+            cloud = pipeline.preview(root, "clouds", np.zeros((2, 4, 3), np.uint8))
+            existing = dict(packing_version=4, clouds_unix_utc=int(now.timestamp()),
+                            clouds_texture=str(root / cloud["file"]), clouds_sha256=cloud["sha256"])
+            self.assertTrue(pipeline.retained_cloud_metadata(existing, now))
+            (root / cloud["file"]).write_bytes(bytes([1]) * 32)
+            self.assertEqual(pipeline.retained_cloud_metadata(existing, now), {})
+            (root / cloud["file"]).unlink()
+            self.assertEqual(pipeline.retained_cloud_metadata(existing, now), {})
+
     def test_gmgsi_missing_segments_are_not_cloud(self):
         # A missing satellite segment arrives as 255 (infrared) or 0
         # (visible), not as the -9999 fill value; both must become NaN.

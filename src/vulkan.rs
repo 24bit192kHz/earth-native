@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     ffi::CString,
     io::Cursor,
@@ -76,9 +76,10 @@ const VT_BUDGET_ENV: &str = "EARTH_NATIVE_EARTHVT_BUDGET_MB";
 /// Atlas budgets. A view needs ~70-100 day tiles and ~20-60 static tiles
 /// (about one texel per pixel over 3440x1440 + 2560x1080); the budgets hold
 /// several times that as cache, and batched streaming refills the rest in a
-/// few frames. 256 MB (capped at 2048 slots, 143 MB) and 96 MB were reserved.
-const VT_DEFAULT_BUDGET_MB: u32 = 48;
-const STATIC_VT_DEFAULT_BUDGET_MB: u64 = 40;
+/// few frames. Native A/B captures and live ISS motion validate the smaller
+/// budgets; environment overrides still support larger desktops.
+const VT_DEFAULT_BUDGET_MB: u32 = 24;
+const STATIC_VT_DEFAULT_BUDGET_MB: u64 = 24;
 const STATIC_VT_ENV: &str = "EARTH_NATIVE_STATIC_VT";
 const STATIC_VT_BUDGET_ENV: &str = "EARTH_NATIVE_STATIC_VT_BUDGET_MB";
 const VT_ATLAS_SIZE: u32 = PADDED_TILE_SIZE;
@@ -506,6 +507,7 @@ pub struct Renderer {
     xcb_surface_loader: Option<ash::khr::xcb_surface::Instance>,
     device: Option<DeviceState>,
     outputs: HashMap<u32, OutputTarget>,
+    suspended_outputs: HashSet<u32>,
     // A CPU-side descriptor kept only until its one-time, device-local upload.
     star_panorama: Option<StarPanorama>,
     // Stage-three fixed-resolution source previews. Production uses `.earthvt`
@@ -1730,12 +1732,16 @@ impl Renderer {
     pub fn capture_frame(&mut self) -> RendererResult<serde_json::Value> {
         let device = self.device.as_ref().ok_or("no Vulkan device")?;
         if self.outputs.is_empty() { return Err("no configured outputs".into()); }
-        if self.outputs.values().any(|target| !target.capture_supported
+        if self.all_outputs_suspended() { return Err("all outputs are asleep".into()); }
+        if self.outputs.iter().filter(|(id, _)| !self.suspended_outputs.contains(id)).any(|(_, target)| !target.capture_supported
             || target.debug_capture.as_ref().is_some_and(|capture| !capture.periodic)) {
             return Err("capture unavailable or already pending".into());
         }
         // Never replace a debug buffer that a timed-out submission still owns.
-        for target in self.outputs.values() {
+        for (output_id, target) in &self.outputs {
+            if self.suspended_outputs.contains(output_id) {
+                continue;
+            }
             if target.debug_capture.is_some() && !unsafe { device.device.get_fence_status(target.in_flight)? } {
                 return Err("previous debug readback is in flight; retry capture".into());
             }
@@ -1743,6 +1749,9 @@ impl Renderer {
         let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         let mut captures = Vec::new();
         for (&output_id, target) in &self.outputs {
+            if self.suspended_outputs.contains(&output_id) {
+                continue;
+            }
             match DebugCapture::create(&device.device, device.memory_properties,
                 target.extent, target.format, &target.output_name, &format!("capture-{id}")) {
                 Ok(mut capture) => {
@@ -1881,6 +1890,7 @@ impl Renderer {
             xcb_surface_loader,
             device: None,
             outputs: HashMap::new(),
+            suspended_outputs: HashSet::new(),
             vt_config,
             vt_streamer,
             static_vt_config,
@@ -1965,7 +1975,7 @@ impl Renderer {
             Some(state) if state.live_clouds(now).is_some() && state.live_sea_ice(now) => "OSI-SAF",
             _ => "none",
         };
-        format!("vt_tiles={} static_tiles={} body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2},post={gpu_post_ms:.2})", self.vt_wanted_tiles.0, self.vt_wanted_tiles.1, self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
+        format!("vt_tiles={} static_tiles={} suspended_outputs={} body={} quality={} hdr={} stars={} textures={textures} clouds={clouds} aerosol={aerosol} sea_ice={sea_ice} star_map=reference weather={weather} vt_vram_mb={:.1} channels={channels} gpu_ms={gpu_total_ms:.2}(star={gpu_star_ms:.2},earth={gpu_earth_ms:.2},post={gpu_post_ms:.2})", self.vt_wanted_tiles.0, self.vt_wanted_tiles.1, self.outputs.keys().filter(|id| self.suspended_outputs.contains(id)).count(), self.current_body.name(), self.render_quality.name(), "swapchain-sdr", self.star_format, vt_bytes as f64 / (1024.0 * 1024.0))
     }
 
     pub unsafe fn configure_output(
@@ -2073,6 +2083,7 @@ impl Renderer {
     }
 
     pub fn destroy_output(&mut self, output_id: u32) {
+        self.suspended_outputs.remove(&output_id);
         let Some(device) = self.device.as_ref() else {
             return;
         };
@@ -2100,6 +2111,20 @@ impl Renderer {
         for output_id in output_ids {
             self.destroy_output(output_id);
         }
+    }
+
+    /// Power events may arrive before the output's first configure.
+    pub fn set_output_suspended(&mut self, output_id: u32, suspended: bool) -> bool {
+        if suspended {
+            self.suspended_outputs.insert(output_id)
+        } else {
+            self.suspended_outputs.remove(&output_id)
+        }
+    }
+
+    pub fn all_outputs_suspended(&self) -> bool {
+        !self.outputs.is_empty()
+            && self.outputs.keys().all(|id| self.suspended_outputs.contains(id))
     }
 
     pub fn reload_weather(&mut self) -> RendererResult<()> {
@@ -2302,8 +2327,9 @@ impl Renderer {
         // Meter from the largest output that has a reading.
         let reading = self
             .outputs
-            .values()
-            .filter(|target| target.last_meter.is_some())
+            .iter()
+            .filter(|(id, target)| !self.suspended_outputs.contains(id) && target.last_meter.is_some())
+            .map(|(_, target)| target)
             .max_by_key(|target| target.extent.width as u64 * target.extent.height as u64)
             .and_then(|target| target.last_meter);
         let earth = self.current_body == crate::body::Body::Earth;
@@ -2312,7 +2338,10 @@ impl Renderer {
         self.exposure.update(reading, None, Instant::now());
         needs_redraw |= self.exposure.converging();
         let camera = camera_settings(uniforms, body_selector, &self.exposure, earth);
-        for target in self.outputs.values_mut() {
+        for (id, target) in &mut self.outputs {
+            if self.suspended_outputs.contains(id) {
+                continue;
+            }
             if target.format != pipeline.color_format {
                 continue;
             }
@@ -2403,6 +2432,7 @@ impl Renderer {
         let outputs = self
             .outputs
             .iter()
+            .filter(|(id, _)| !self.suspended_outputs.contains(id))
             .map(|(output_id, target)| OutputDescriptor {
                 output_id: *output_id,
                 viewport: target.viewport,

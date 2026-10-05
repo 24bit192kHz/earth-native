@@ -27,6 +27,10 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
 };
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+    zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
+};
 
 use crate::{
     astronomy::{
@@ -219,6 +223,8 @@ pub struct NativeApp {
     compositor: Option<WlCompositor>,
     layer_shell: Option<ZwlrLayerShellV1>,
     xdg_output_manager: Option<ZxdgOutputManagerV1>,
+    output_power_manager: Option<ZwlrOutputPowerManagerV1>,
+    output_powers: BTreeMap<u32, ZwlrOutputPowerV1>,
     outputs: BTreeMap<u32, OutputState>,
     layers: BTreeMap<u32, LayerState>,
     camera: OrbitCamera,
@@ -320,6 +326,8 @@ impl NativeApp {
             compositor: None,
             layer_shell: None,
             xdg_output_manager: None,
+            output_power_manager: None,
+            output_powers: BTreeMap::new(),
             outputs: BTreeMap::new(),
             layers: BTreeMap::new(),
             camera: OrbitCamera::new(SCENE_EARTH_RADIUS),
@@ -395,7 +403,9 @@ impl NativeApp {
     }
 
     pub fn next_frame_interval(&self) -> Duration {
-        if self.debug_mode {
+        if self.renderer.all_outputs_suspended() {
+            IDLE_MAX_INTERVAL
+        } else if self.debug_mode {
             frame_interval(DEBUG_FRAME_RATE)
         } else if self.is_interactive(Instant::now()) {
             frame_interval(INTERACTIVE_FRAME_RATE)
@@ -409,7 +419,9 @@ impl NativeApp {
     }
 
     fn current_frame_rate(&self) -> u32 {
-        if self.debug_mode {
+        if self.renderer.all_outputs_suspended() {
+            0
+        } else if self.debug_mode {
             DEBUG_FRAME_RATE
         } else if self.is_interactive(Instant::now()) {
             INTERACTIVE_FRAME_RATE
@@ -539,6 +551,12 @@ impl NativeApp {
     }
 
     pub fn render_frame(&mut self) -> RendererResult<()> {
+        if self.renderer.all_outputs_suspended() {
+            // Leave streaming, metering and animation asleep together.
+            // The Wayland source still dispatches power and IPC events.
+            self.last_tick = Instant::now();
+            return Ok(());
+        }
         let now = Instant::now();
         if self.layout_dirty {
             self.update_desktop_layout();
@@ -1244,7 +1262,7 @@ impl NativeApp {
             iss_tle_epoch,
             iss_tle_age_hours,
             self.current_frame_rate(),
-            self.frame_cadence.measured_per_second,
+            if self.renderer.all_outputs_suspended() { 0 } else { self.frame_cadence.measured_per_second },
             self.last_render_ms,
             self.renderer.status_fields(),
             self.celestial_detail_fields(),
@@ -1443,6 +1461,20 @@ impl NativeApp {
         }
     }
 
+    fn attach_output_power(&mut self, output_id: u32, qh: &QueueHandle<Self>) {
+        if self.output_powers.contains_key(&output_id) {
+            return;
+        }
+        if let (Some(manager), Some(output)) = (
+            self.output_power_manager.as_ref(),
+            self.outputs.get(&output_id).and_then(|state| state.output.as_ref()),
+        ) {
+            self.output_powers.insert(output_id, manager.get_output_power(
+                output, qh, OutputToken { global_name: output_id },
+            ));
+        }
+    }
+
     fn configure_layer_surface(&mut self, output_id: u32, serial: u32, width: u32, height: u32) {
         let Some(layer) = self.layers.get_mut(&output_id) else {
             return;
@@ -1610,6 +1642,13 @@ impl Dispatch<WlRegistry, ()> for NativeApp {
                     state.xdg_output_manager = Some(registry.bind(name, version.min(3), qh, ()));
                     state.attach_pending_xdg_outputs(qh);
                 }
+                "zwlr_output_power_manager_v1" => {
+                    state.output_power_manager = Some(registry.bind(name, 1, qh, ()));
+                    let ids: Vec<_> = state.outputs.keys().copied().collect();
+                    for id in ids {
+                        state.attach_output_power(id, qh);
+                    }
+                }
                 "wl_output" => {
                     let output = registry.bind::<WlOutput, _, _>(
                         name,
@@ -1626,6 +1665,7 @@ impl Dispatch<WlRegistry, ()> for NativeApp {
                         },
                     );
                     state.attach_xdg_output(name, qh);
+                    state.attach_output_power(name, qh);
                     state.try_create_layer_surface(name, qh);
                 }
                 "wl_seat" => {
@@ -1634,6 +1674,9 @@ impl Dispatch<WlRegistry, ()> for NativeApp {
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { name } => {
+                if let Some(power) = state.output_powers.remove(&name) {
+                    power.destroy();
+                }
                 state.renderer.destroy_output(name);
                 if let Some(layer) = state.layers.remove(&name) {
                     layer.layer_surface.destroy();
@@ -1644,6 +1687,37 @@ impl Dispatch<WlRegistry, ()> for NativeApp {
                     state.release_control();
                 }
                 state.layout_dirty = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrOutputPowerV1, OutputToken> for NativeApp {
+    fn event(
+        state: &mut Self,
+        power: &ZwlrOutputPowerV1,
+        event: zwlr_output_power_v1::Event,
+        token: &OutputToken,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_output_power_v1::Event::Mode { mode } => {
+                let suspended = matches!(mode, WEnum::Value(zwlr_output_power_v1::Mode::Off));
+                let changed = state.renderer.set_output_suspended(token.global_name, suspended);
+                if changed && !suspended {
+                    state.renderer.snap_exposure();
+                    state.dirty = true;
+                }
+            }
+            zwlr_output_power_v1::Event::Failed => {
+                // Unsupported or exclusively controlled outputs keep the
+                // ordinary render policy. We never request a mode change.
+                state.renderer.set_output_suspended(token.global_name, false);
+                state.output_powers.remove(&token.global_name);
+                power.destroy();
+                state.dirty = true;
             }
             _ => {}
         }
@@ -2057,6 +2131,7 @@ impl NativeApp {
 }
 
 delegate_noop!(NativeApp: ignore WlCompositor);
+delegate_noop!(NativeApp: ignore ZwlrOutputPowerManagerV1);
 delegate_noop!(NativeApp: ignore WlSurface);
 delegate_noop!(NativeApp: ignore WlRegion);
 

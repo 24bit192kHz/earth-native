@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Compare render-ab runs: check scene geometry, measure block-averaged error,
+and write labeled before/after contact sheets. Requires Pillow and NumPy.
+
+Usage: tools/compare-ab BASELINE_DIR CANDIDATE_DIR OUTPUT_DIR
+JPEG/grain noise is reduced by comparing 16x16 pixel block means. This is
+an image-preservation measure, not an objective score of visual realism.
+"""
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+def blocks(image):
+    pixels = np.asarray(image, dtype=np.float64)
+    height, width = pixels.shape[:2]
+    pixels = pixels[:height // 16 * 16, :width // 16 * 16]
+    return pixels.reshape(height // 16, 16, width // 16, 16, 3).mean(axis=(1, 3))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("baseline", type=Path)
+    parser.add_argument("candidate", type=Path)
+    parser.add_argument("out", type=Path)
+    args = parser.parse_args()
+    a = json.loads((args.baseline / "report.json").read_text())
+    b = json.loads((args.candidate / "report.json").read_text())
+    assert a["weather"] == b["weather"], "Weather differs between variants"
+    args.out.mkdir(parents=True, exist_ok=True)
+    report = {}
+    sheets = []
+    for name in a["scenes"].keys() & b["scenes"].keys():
+        sa, sb = a["scenes"][name], b["scenes"][name]
+        assert sa["unix"] == sb["unix"] and sa["camera"] == sb["camera"], name
+        scene = {"gpu_ms_before": sa["gpu_ms"], "gpu_ms_after": sb["gpu_ms"],
+                 "earth_ms_before": sa["earth_ms"], "earth_ms_after": sb["earth_ms"],
+                 "vram_mib_before": sa["vram_mib"], "vram_mib_after": sb["vram_mib"],
+                 "outputs": {}}
+        for before in sorted(args.baseline.glob(f"{name}-*.jpg")):
+            after = args.candidate / before.name
+            if not after.exists():
+                continue
+            ma = json.loads(before.with_suffix(".json").read_text())
+            mb = json.loads(after.with_suffix(".json").read_text())
+            # Grain changes with the presented-frame counter. Projection,
+            # lighting, weather flags and the pinned camera must be identical.
+            assert ma["frame"] == mb["frame"], f"Scene metadata differs: {before.name}"
+            ia, ib = Image.open(before).convert("RGB"), Image.open(after).convert("RGB")
+            assert ia.size == ib.size
+            difference = np.abs(blocks(ia) - blocks(ib))
+            scene["outputs"][before.stem] = {
+                "mean_block_error_255": float(difference.mean()),
+                "p99_block_error_255": float(np.percentile(difference, 99)),
+                "max_block_error_255": float(difference.max()),
+            }
+            if ia.width > ia.height:
+                thumbs = [im.resize((1000, round(im.height * 1000 / im.width)), Image.Resampling.LANCZOS)
+                          for im in (ia, ib)]
+                sheet = Image.new("RGB", (2000, thumbs[0].height + 40), "#101820")
+                draw = ImageDraw.Draw(sheet)
+                draw.text((12, 12), f"{name}: before ({args.baseline.name})", fill="white")
+                draw.text((1012, 12), f"after ({args.candidate.name})", fill="white")
+                sheet.paste(thumbs[0], (0, 40))
+                sheet.paste(thumbs[1], (1000, 40))
+                sheet.save(args.out / f"{name}-comparison.png")
+                sheets.append((name, sheet))
+        report[name] = scene
+    (args.out / "comparison.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+    if sheets:
+        sheets.sort()
+        contact = Image.new("RGB", (2000, sum(sheet.height for _, sheet in sheets)), "black")
+        offset = 0
+        for _, sheet in sheets:
+            contact.paste(sheet, (0, offset))
+            offset += sheet.height
+        contact.save(args.out / "contact-sheet.png")
+    for name, scene in sorted(report.items()):
+        errors = list(scene["outputs"].values())
+        print(f"{name}: Earth {scene['earth_ms_before']:.2f} -> {scene['earth_ms_after']:.2f} ms; "
+              f"VRAM {scene['vram_mib_before']} -> {scene['vram_mib_after']} MiB; "
+              f"mean block error {max(e['mean_block_error_255'] for e in errors):.3f}/255")
+
+
+if __name__ == "__main__":
+    main()

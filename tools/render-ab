@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Native visual/performance experiment. Restores the installed service on exit.
+
+Usage: tools/render-ab --binary PATH --out DIR --label NAME [--scenes day,clouds]
+                      [--env NAME=VALUE ...] [--settle 6] [--measure 8]
+The output directory owns a frozen weather snapshot shared by every variant.
+GPU timings exclude captures; JPEGs and camera metadata come from Vulkan readback.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import statistics
+import subprocess
+import time
+
+SCENES = {
+    "day": (1710936000, ["pov", 24, 36, 420, 330, "auto", 78]),
+    "clouds": (1710920000, ["pov", 36, -4, 420, 100, "auto", 78]),
+    "sunrise": (1710948312, ["pov", 20, 60, 420, 262, "auto", 78]),
+    "night": (1710975600, ["pov", 40, 5, 420, 40, "auto", 78]),
+    "globe": (1710936000, [165, 5, 8]),
+    "aurora": (1710975600, ["pov", 62, 15, 1500, 0, 35, 78]),
+    "live": (None, ["live"]),
+}
+
+
+def command(*args, **kwargs):
+    return subprocess.run([str(x) for x in args], check=True, capture_output=True,
+                          text=True, **kwargs).stdout.strip()
+
+
+def status_fields(status):
+    fields = {k: v for k, v in re.findall(r"(\w+)=([^ ]+)", status)}
+    total, stars, earth, post = re.search(
+        r"gpu_ms=([\d.]+)\(star=([\d.]+),earth=([\d.]+),post=([\d.]+)\)", status).groups()
+    fields.update(gpu_ms=float(total), star_ms=float(stars),
+                  earth_ms=float(earth), post_ms=float(post))
+    return fields
+
+
+def cpu_ticks(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return int(fields[11]) + int(fields[12])
+
+
+def memory(pid):
+    return {key: int(value) for key, value in re.findall(
+        r"^(Rss|Pss|Anonymous|Pss_File|Swap):\s+(\d+)",
+        Path(f"/proc/{pid}/smaps_rollup").read_text(), re.M)}
+
+
+def freeze_weather(out):
+    snapshot = out / "weather.json"
+    if not snapshot.exists():
+        data = Path(os.environ.get("EARTH_NATIVE_DATA_DIR",
+                    Path.home() / ".local/share/earth-native"))
+        manifest = json.loads((data / "weather/current.json").read_text())
+        for key in ("texture", "clouds_texture"):
+            if manifest.get(key):
+                source = Path(manifest[key])
+                destination = out / source.name
+                shutil.copy2(source, destination)
+                sidecar = Path(str(source) + ".json")
+                if sidecar.exists():
+                    shutil.copy2(sidecar, str(destination) + ".json")
+                manifest[key] = str(destination)
+        snapshot.write_text(json.dumps(manifest, indent=2))
+    return snapshot
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--label", required=True)
+    parser.add_argument("--scenes", default=",".join(name for name in SCENES if name != "live"))
+    parser.add_argument("--env", action="append", default=[])
+    parser.add_argument("--settle", type=float, default=6)
+    parser.add_argument("--measure", type=float, default=8)
+    args = parser.parse_args()
+    binary, out = args.binary.resolve(), args.out.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    dest = out / args.label
+    dest.mkdir(exist_ok=False)
+    snapshot = freeze_weather(out)
+    env = dict(os.environ, EARTH_NATIVE_CONTINUOUS="1",
+               EARTH_NATIVE_WEATHER_MANIFEST=str(snapshot))
+    overrides = dict(item.split("=", 1) for item in args.env)
+    env.update(overrides)
+    active = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
+                             "earth-native.service"]).returncode == 0
+    process = None
+    report = {"binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "environment": overrides,
+              "weather": json.loads(snapshot.read_text()), "scenes": {}}
+    cli = lambda *parts: command(binary, *parts, env=env)
+    try:
+        if active:
+            command("systemctl", "--user", "stop", "earth-native.service")
+        else:
+            subprocess.run([str(binary), "stop"], capture_output=True)
+        with (dest / "renderer.log").open("w") as log:
+            process = subprocess.Popen([str(binary), "serve"], env=env,
+                                       stdout=log, stderr=log)
+        for _ in range(100):
+            if process.poll() is not None:
+                raise RuntimeError((dest / "renderer.log").read_text())
+            try:
+                cli("status")
+                break
+            except subprocess.CalledProcessError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("Renderer did not start")
+        for name in args.scenes.split(","):
+            unix, camera = SCENES[name]
+            if unix is None:
+                cli("time", "live")
+            else:
+                cli("time", "unix", unix)
+            cli("camera", *camera)
+            time.sleep(args.settle)
+            samples, statuses = [], []
+            cpu_start, started = cpu_ticks(process.pid), time.monotonic()
+            while time.monotonic() - started < args.measure:
+                status = cli("status")
+                statuses.append(status)
+                samples.append(status_fields(status))
+                time.sleep(0.4)
+            elapsed = time.monotonic() - started
+            scene = {
+                "unix": unix, "camera": camera, "samples": samples,
+                "cpu_one_core_percent": (cpu_ticks(process.pid) - cpu_start)
+                    / os.sysconf("SC_CLK_TCK") / elapsed * 100,
+                "memory_kib": memory(process.pid),
+                "gpu_ms": statistics.median(s["gpu_ms"] for s in samples),
+                "earth_ms": statistics.median(s["earth_ms"] for s in samples),
+                "post_ms": statistics.median(s["post_ms"] for s in samples),
+                "status": statuses[-1],
+            }
+            gpu = command("nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
+                          "--format=csv,noheader,nounits")
+            scene["vram_mib"] = next((int(row.split(",")[1]) for row in gpu.splitlines()
+                                      if int(row.split(",")[0]) == process.pid), None)
+            scene["gpu_device"] = command("nvidia-smi",
+                "--query-gpu=name,clocks.gr,clocks.mem,power.draw,temperature.gpu",
+                "--format=csv,noheader,nounits")
+            captured = json.loads(cli("capture_frame"))
+            for cap in captured["captures"]:
+                source = Path(cap["image"])
+                output = source.stem.rsplit("-", 2)[-2:]
+                destination = dest / f"{name}-{'-'.join(output)}.jpg"
+                shutil.move(source, destination)
+                shutil.move(source.with_suffix(".json"), destination.with_suffix(".json"))
+                cap["image"] = str(destination)
+            scene["capture"] = captured
+            report["scenes"][name] = scene
+            (dest / "report.json").write_text(json.dumps(report, indent=2))
+            print(f"{args.label}/{name}: GPU {scene['gpu_ms']:.2f} ms, "
+                  f"Earth {scene['earth_ms']:.2f} ms, VRAM {scene['vram_mib']} MiB, "
+                  f"CPU {scene['cpu_one_core_percent']:.1f}%", flush=True)
+    finally:
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if active:
+            command("systemctl", "--user", "start", "earth-native.service")
+
+
+if __name__ == "__main__":
+    main()

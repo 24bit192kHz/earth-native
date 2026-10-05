@@ -851,6 +851,29 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
     return np.round(np.clip(rgba, 0, 1) * 255).astype(np.uint8), int(observed.timestamp())
 
 
+def retained_cloud_metadata(existing, now):
+    """Keep a verified, still-fresh observation across a temporary fetch failure.
+
+    Preserve observation times: a new GFS generation must not make old clouds,
+    aerosols or sea ice appear newer. Match the renderer's six-hour cloud limit.
+    """
+    try:
+        if existing.get("packing_version") != 4 or not existing.get("clouds_unix_utc"):
+            return {}
+        if abs(now.timestamp() - existing["clouds_unix_utc"]) >= 6 * 3600:
+            return {}
+        path = Path(existing["clouds_texture"])
+        digest, size = file_sha256(path)
+        if size != CLOUD_SIZE[0] * CLOUD_SIZE[1] * 4 or digest != existing["clouds_sha256"]:
+            return {}
+        if not Path(str(path) + ".json").is_file():
+            return {}
+    except (OSError, KeyError, TypeError, ValueError):
+        return {}
+    extra = {"aerosol_unix_utc", "aerosol_source", "sea_ice_unix_utc", "sea_ice_source"}
+    return {key: value for key, value in existing.items() if key.startswith("clouds_") or key in extra}
+
+
 def weather():
     now = datetime.now(timezone.utc)
     cycle = now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0)
@@ -888,7 +911,7 @@ def weather():
                 aurora, aurora_utc = np.zeros((720, 1440), dtype=np.uint8), 0
             generation = DATA / "weather" / f"{candidate:%Y%m%dT%H}-{int(now.timestamp())}"
             asset = preview(generation, "fields", packed, alpha=aurora)
-            clouds_meta = {}
+            clouds_meta = retained_cloud_metadata(existing, now)
             try:
                 try:
                     low_cloud = np.load(DATA / "weather" / "gfs-low-cloud.npy").astype(np.float32)
@@ -917,7 +940,8 @@ def weather():
                                                    "b": "(Angstrom exponent 440-645 nm + 0.5) / 3" if aerosol else "observed fraction",
                                                    "a": "sqrt(aerosol optical depth 550 nm / 4)" if aerosol else "1"}}
             except (HTTPError, OSError, ValueError, KeyError, ImportError) as error:
-                print(f"GMGSI clouds unavailable, static clouds stay: {error}", file=sys.stderr, flush=True)
+                fallback = "retaining last valid observation" if clouds_meta else "static clouds stay"
+                print(f"GMGSI clouds unavailable, {fallback}: {error}", file=sys.stderr, flush=True)
             metadata = {"schema_version": 1, "packing_version": 4, "source": "NOAA-GFS", "kind": "model-analysis", "url": base,
                         "valid_unix_utc": int(candidate.timestamp()), "downloaded_unix_utc": int(now.timestamp()),
                         "aurora_unix_utc": aurora_utc, "aurora_source": "NOAA-SWPC-OVATION-forecast",
@@ -929,11 +953,15 @@ def weather():
             snapshots = sorted(path for path in existing_path.parent.iterdir()
                                if path.is_dir() and re.fullmatch(r"\d{8}T\d{2}-\d{10}", path.name))
             owned = {"fields.bgra", "fields.bgra.json", "clouds.bgra", "clouds.bgra.json"}
-            # The renderer reads only the current generation; one more
-            # covers a reload in progress (36 MB each; 8 were kept).
+            # One previous generation covers a reload in progress. A cloud
+            # observation retained after fetch failures may live in an older
+            # generation; protect that one until replaced or six hours old.
+            retained_generation = Path(clouds_meta["clouds_texture"]).parent if clouds_meta else None
             previews = [path for path in existing_path.parent.iterdir()
                         if path.is_dir() and re.fullmatch(r"preview-kp[\d.]+-\d{10}", path.name)]
             for obsolete in snapshots[:-2] + previews:
+                if obsolete == retained_generation:
+                    continue
                 names = {path.name for path in obsolete.iterdir()}
                 if {"fields.bgra", "fields.bgra.json"} <= names <= owned:
                     for name in names:

@@ -8,7 +8,7 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 
 ![Earth over Africa, rendered by earth-native](docs/previews/earth-day.jpg)
 
-[Features](#features) · [Gallery](#gallery) · [Install](#install) · [Use](#use) · [How it works](docs/PHYSICS.md) · [Data](docs/DATA.md)
+[Features](#features) · [Gallery](#gallery) · [Install](#install) · [Use](#use) · [How it works](docs/PHYSICS.md) · [Data](docs/DATA.md) · [Performance A/B](docs/PERFORMANCE.md)
 
 </div>
 
@@ -42,10 +42,12 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
   real flattening and its own limb-darkening law.
 - **Built to sit in the background.** Block-compressed maps, streamed
   virtual textures, motion-gated redraws (20 fps while riding the ISS, 8 on
-  the globe), idle CPU priority. On an RTX 3080 Ti driving 3440×1440 and
-  2560×1080 monitors with the 500 m set: ~7 ms of GPU time per frame from
-  the ISS, ~580 MiB of VRAM, ~3 % of one CPU core, ~150 MB of RAM, first
-  frame 0.55 s after start; the weather feed holds 26 MB between updates.
+  the globe), idle CPU priority, and sleep detection on supported Wayland
+  compositors. On an RTX 3080 Ti driving 3440×1440 and 2560×1080 monitors
+  with the high-resolution set: ~458 MiB of VRAM with static clouds or
+  ~500 MiB with live NOAA clouds, ~1–3 % of one CPU core. GPU time varies
+  with the scene and GPU clocks; see the [measured A/B](docs/PERFORMANCE.md).
+  The weather feed holds 26 MB between updates.
 - **Native everywhere.** Wayland via wlr-layer-shell (Hyprland, Sway, KDE
   Plasma, niri, river, labwc, Wayfire…) and Xorg via an EWMH desktop window on
   every monitor. Multi-monitor desktops share one continuous camera.

@@ -1315,11 +1315,11 @@ void main() {
         float t_split = through_cloud ? t_cloud : t_ground;
         vec3 above_radiance = vec3(0.0);
         vec3 above_transmittance = vec3(1.0);
-        // 16 steps: against 24 the image differs by 0.06-0.10/255 on
-        // average (max ~1.5/255) over grain-free 16x16 block means in
-        // sunrise, day haze, moonlit night and twilight views; ~13 % less
-        // Earth-pass GPU time.
-        march(origin_km, ray, t_entry, t_split, t_split, 16, sun_light, moon_light, with_moon,
+        // Short downward paths need fewer samples than grazing views;
+        // preserve the 16-step integration near the horizon and the
+        // separate 32-step limb march below.
+        int air_steps = view_cos > 0.35 ? 12 : 16;
+        march(origin_km, ray, t_entry, t_split, t_split, air_steps, sun_light, moon_light, with_moon,
             above_radiance, above_transmittance);
         vec3 below_radiance = vec3(0.0);
         vec3 below_transmittance = vec3(1.0);
