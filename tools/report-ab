@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Build a compact, offline HTML review from archived native A/B runs.
+Usage: tools/report-ab ARTIFACT_ROOT OUTPUT.html
+Requires Pillow. The HTML embeds preview images, not the full raw captures.
+"""
+import argparse
+import base64
+import io
+import json
+from pathlib import Path
+
+from PIL import Image
+
+COMPARISONS = [
+    ("final", "Retained changes · NASA clouds", "baseline", "final", "Kept: same visible detail; less VRAM and Earth-pass work.", True),
+    ("noaa", "Retained changes · NOAA clouds", "noaa/baseline", "noaa/final", "Kept: 81 MiB less VRAM; appearance preserved. Speed is uncertain because GPU clocks changed.", False),
+    ("cache", "Cache reduction only", "baseline", "cache24", "Kept: 48/40 → 24/24 MiB budgets; 81 MiB less process VRAM. No visible detail loss in tested views.", True),
+    ("air", "Atmosphere sampling only", "baseline", "air12", "Kept: 16 → 12 steps on steep ground views; grazing and limb integration preserved.", True),
+    ("relief", "Rejected · stronger cloud relief", "baseline", "relief25", "Discarded: 1.5 → 2.5 km relief showed no convincing visual benefit.", True),
+    ("highlight", "Rejected · brighter highlights", "baseline", "highlight", "Discarded: highlight knee 0.5 → 1.0 made sunrise harsher.", True),
+    ("averaging", "Rejected · earlier cloud averaging", "noaa/baseline", "noaa/footprint", "Discarded: averaging starts at 0.75–4 km instead of 1.5–8 km; no convincing benefit. NOAA timings are not comparable.", False),
+    ("moon", "Rejected · daylight lunar shortcut", "final", "efficient", "Discarded: the earlier bundle skips some daylight lunar shading. No convincing extra speed gain; this was not a separate isolated timing test.", False),
+    ("diagnostic", "Diagnostic · clouds removed", "baseline", "no-clouds", "Diagnostic only: removing clouds showed the blocky patches came from cloud rendering. This is not an improvement candidate.", False),
+]
+
+
+def build(root):
+    images, comparisons = {}, []
+
+    def embed(path):
+        key = str(path.relative_to(root))
+        if key not in images:
+            with Image.open(path) as image:
+                image = image.convert("RGB")
+                image.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                image.save(buf, format="JPEG", quality=88, optimize=True)
+                images[key] = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        return key
+
+    for key, title, before, after, verdict, timing in COMPARISONS:
+        a = json.loads((root / before / "report.json").read_text())
+        b = json.loads((root / after / "report.json").read_text())
+        assert a["weather"] == b["weather"], title
+        scenes = []
+        for name in a["scenes"]:
+            if name not in b["scenes"]:
+                continue
+            sa, sb = a["scenes"][name], b["scenes"][name]
+            assert sa["unix"] == sb["unix"] and sa["camera"] == sb["camera"], title
+            outputs = {}
+            for output in ("DP-2", "DP-1"):
+                pa, pb = root / before / f"{name}-{output}.jpg", root / after / f"{name}-{output}.jpg"
+                if not pa.exists() or not pb.exists():
+                    continue
+                ma = json.loads(pa.with_suffix(".json").read_text())["frame"]
+                mb = json.loads(pb.with_suffix(".json").read_text())["frame"]
+                assert ma == mb, f"Frame metadata differs: {title}/{name}/{output}"
+                outputs[output] = [embed(pa), embed(pb)]
+            assert outputs, f"No captures: {title}/{name}"
+            scenes.append(dict(name=name, outputs=outputs, earth=[sa["earth_ms"], sb["earth_ms"]],
+                               vram=[sa["vram_mib"], sb["vram_mib"]]))
+        comparisons.append(dict(key=key, title=title, before=before, after=after,
+                                verdict=verdict, timing=timing, scenes=scenes))
+    return dict(images=images, comparisons=comparisons)
+
+
+TEMPLATE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Earth-native · before / after</title>
+<style>
+:root{color-scheme:dark;--bg:#0c131c;--panel:#131e2b;--line:#2c3b4e;--text:#edf3fa;--muted:#a9b9cb;--good:#9de7bc;--neutral:#a9c9f7;--warn:#f1cc83}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}main{max-width:1120px;margin:auto;padding:28px 24px 36px}h1{font-size:32px;line-height:1.15;margin:8px 0 12px;letter-spacing:-.8px}h2{font-size:18px;margin:0 0 12px}p{margin:8px 0}.eyebrow,.muted{color:var(--muted)}.eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase}.summary{max-width:850px;color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:22px 0}.card,section,details{border:1px solid var(--line);border-radius:12px;background:var(--panel)}.card{padding:15px}.card strong{display:block;font-size:25px;margin:4px 0}.card small{color:var(--muted)}section{padding:18px;margin:16px 0}.tag{font-size:12px;font-weight:650;white-space:nowrap}.good{color:var(--good)}.neutral{color:var(--neutral)}.warn{color:var(--warn)}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px;text-align:left}th{color:var(--muted);font-weight:550}th,td{padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr:last-child td{border:0}td:first-child{font-weight:600;width:18%}table td:last-child{width:23%}.controls{display:flex;flex-wrap:wrap;align-items:end;gap:10px;margin-bottom:12px}label{font-size:12px;color:var(--muted);display:grid;gap:5px}select,button{font:inherit;color:var(--text);background:#0c1622;border:1px solid #52657c;border-radius:7px;padding:8px 10px}button{cursor:pointer;font-size:13px}button:hover{border-color:#9dc2ed}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--neutral);outline-offset:3px}#experiment{max-width:380px}#verdict{font-size:13px;color:var(--muted)}.viewer{display:grid;grid-template-columns:1fr 1fr;gap:10px}.viewer figure{margin:0;min-width:0}.viewer figcaption{padding:6px 0;font-size:13px;color:var(--muted)}.viewer img{display:block;width:100%;height:310px;object-fit:contain;background:#000;border-radius:6px}.viewer.wipe{position:relative;display:block;height:430px;background:#000;overflow:hidden;border-radius:6px}.viewer.wipe figure{position:absolute;inset:0}.viewer.wipe img{height:430px;border-radius:0}.viewer.wipe figcaption{position:absolute;top:10px;left:10px;background:#111d;padding:5px 9px;z-index:2;border-radius:5px}.viewer.wipe figure:last-child figcaption{left:auto;right:10px}#slider-label{margin:12px 0}input[type=range]{width:100%;accent-color:#b1d4ff}#readout{font-size:13px;margin-top:12px;color:var(--muted)}details{margin:16px 0;padding:14px 18px}summary{cursor:pointer;font-weight:600}details .body{padding-top:8px;font-size:13px;color:var(--muted)}.body p{margin:10px 0}.body table{color:var(--text)}footer{font-size:12px;color:var(--muted);margin-top:20px}code{font-size:12px;overflow-wrap:anywhere}.note{font-size:13px;color:var(--warn)}[hidden]{display:none!important}a{color:var(--neutral)}
+@media(max-width:640px){main{padding:20px 12px}h1{font-size:27px}.cards{grid-template-columns:1fr;gap:8px}.card{display:grid;grid-template-columns:140px minmax(0,1fr);gap:4px 10px;align-items:center;padding:10px}.card .tag{white-space:normal}.card strong{font-size:20px;margin:0}.card small{grid-column:1/-1;font-size:12px}section{padding:12px}.viewer{gap:6px}.viewer img{height:180px}.viewer.wipe,.viewer.wipe img{height:260px}.controls label:first-child{width:100%}#experiment{max-width:100%;width:100%}.scroll table{min-width:640px}td,th{padding:8px 6px}}
+@media print{body{color:#111;background:white}main{max-width:none}.card,section,details{background:white;border-color:#aaa}.muted,.summary,th,footer,.body,#verdict,#readout{color:#444!important}.controls,button,#slider-label{display:none}.cards{break-inside:avoid}.scroll{overflow:visible}section{break-inside:avoid}.viewer img{height:220px}.tag{color:#222}.viewer.wipe{height:300px}.viewer.wipe img{height:300px}}
+</style></head><body><main>
+<div class="eyebrow">Earth-native / native Vulkan audit / 05 Oct 2026</div>
+<h1>Same detail. Less work.</h1>
+<p class="summary">Before <code>2c5576a</code> → installed changes <code>58630ca</code>. Matched images preserve the appearance; resource use and cloud-feed reliability improve. Rejected visual experiments are available below for inspection.</p>
+<div class="cards">
+<div class="card"><span class="tag good">BETTER · VRAM</span><strong>581 → 500 MiB</strong><small>Live NOAA clouds: −81 MiB / 14%.<br>NASA fallback: 539 → 458 MiB / −15%.</small></div>
+<div class="card"><span class="tag good">BETTER · EARTH PASS</span><strong>3–6% less time</strong><small>Comparable fixed scenes; aurora −0.4%.<br>NOAA speed results are inconclusive.</small></div>
+<div class="card"><span class="tag neutral">UNCHANGED · APPEARANCE</span><strong>No visible loss</strong><small>Six NASA + four NOAA scene pairs.<br>Both displays checked; not a realism score.</small></div>
+</div>
+<section aria-labelledby="visual-title"><h2 id="visual-title">Judge the before / after</h2>
+<div class="controls"><label>Experiment<select id="experiment"></select></label><label>Scene<select id="scene"></select></label><label>Display<select id="output"><option value="DP-2">DP-2 · landscape</option><option value="DP-1">DP-1 · portrait</option></select></label><button id="mode" type="button" aria-pressed="false">Wipe compare</button></div>
+<p id="verdict"></p><div class="viewer" id="viewer"><figure><img id="before" alt=""><figcaption id="before-label">Before</figcaption></figure><figure><img id="after" alt=""><figcaption id="after-label">After</figcaption></figure></div>
+<label id="slider-label" hidden>Reveal after <input id="wipe" type="range" min="0" max="100" value="50" aria-label="Amount of after image revealed"></label>
+<p id="readout" aria-live="polite"></p><button id="enlarge-before" type="button">Enlarge before</button> <button id="enlarge-after" type="button">Enlarge after</button>
+<noscript><p>Enable JavaScript to use the embedded image comparisons. All measurements and verdicts remain readable below.</p></noscript>
+</section>
+<section aria-labelledby="changes-title"><h2 id="changes-title">Everything retained</h2><div class="scroll"><table>
+<thead><tr><th>Change</th><th>Before</th><th>After</th><th>Verdict / evidence</th></tr></thead><tbody>
+<tr><td>Texture caches</td><td>Day 48 MiB; static 40 MiB.</td><td>24 MiB each. Same source resolution.</td><td><span class="tag good">BETTER</span><br>−81 MiB process VRAM. Isolated A/B + live motion checked.</td></tr>
+<tr><td>Clear-air sampling</td><td>16 steps for all ground views.</td><td>12 on steep rays; grazing 16, limb 32, below-cloud 6.</td><td><span class="tag good">BETTER</span><br>Less GPU work; matched captures preserve detail.</td></tr>
+<tr><td>Sleeping displays</td><td>No power-event suspension. Old-build sleep was not measured.</td><td>One asleep: skip it. Both: 0 fps; 0 CPU ticks / 2 s. Wake: 20 fps.</td><td><span class="tag good">BETTER</span><br>Real DPMS + capture test. Supported Wayland only; X11 unchanged.</td></tr>
+<tr><td>Cloud download fails</td><td>Manifest drops valid NOAA clouds; renderer falls back to NASA.</td><td>Keep verified clouds &lt;6 h old, without refreshing timestamps. Cleanup protects their files.</td><td><span class="tag good">BETTER</span><br>Regression tests cover repeated failure, corruption and expiry. Up to one extra stored generation.</td></tr>
+<tr><td>Review &amp; delivery</td><td>Existing work uncommitted; no dedicated A/B report.</td><td>Baseline saved first, validated changes committed and installed. Reusable capture, comparison and HTML tools.</td><td><span class="tag neutral">REVIEWABLE</span><br>138 Rust + 18 pipeline tests pass. Both services active; report preference saved in AGENTS.md.</td></tr>
+</tbody></table></div></section>
+<details><summary>Exact timing results · six fixed views</summary><div class="body"><p>Earth-pass medians, milliseconds, summed across both outputs. Lower is better. NASA fallback clouds; identical weather, UTC, camera and frame geometry.</p><table><thead><tr><th>Scene</th><th>Before → after</th><th>Reduction</th></tr></thead><tbody id="timings">__TIMINGS__</tbody></table><p>45-second ISS motion test: 20 → 20 fps; Earth pass 2.32 → 2.21 ms. Positions differed, so live captures are not pixel A/B pairs.</p></div></details>
+<details><summary>Four experiments discarded · nothing hidden</summary><div class="body"><table><thead><tr><th>Experiment</th><th>Before → trial</th><th>Why discarded</th></tr></thead><tbody>
+<tr><td>Cloud relief</td><td>1.5 → 2.5 km.</td><td>No convincing visual benefit.</td></tr><tr><td>Highlight knee</td><td>0.5 → 1.0.</td><td>Harsher sunrise; not a better balance.</td></tr><tr><td>Cloud averaging</td><td>1.5–8 → 0.75–4 km.</td><td>No convincing improvement in the real NOAA views.</td></tr><tr><td>Lunar shortcut</td><td>Normal shading → some daylight shading skipped.</td><td>No convincing extra gain; no isolated timing claim.</td></tr></tbody></table><p>Select any trial in the image viewer. “Clouds removed” is a diagnostic showing the source of the blocky patches; it was never retained.</p></div></details>
+<details><summary>Limits, remaining costs &amp; test setup</summary><div class="body">
+<p><strong>Not improved:</strong> CPU/RAM reductions were not established. Weather processing still peaks at 2.32 GiB, then returns to about 24 MB. Cloud layers and height variation remain the main visual opportunity.</p>
+<p><strong>Speed uncertainty:</strong> another GPU workload stopped during the NOAA series, dropping core clocks from about 1935–1965 to 330–480 MHz. NOAA images and VRAM are usable; its speed results are not. Whole-card watts are not app power measurements.</p>
+<p><strong>Image limits:</strong> compared native Vulkan readbacks, including crops. Landscape mean 16×16-block differences were 0.002–0.076 / 255 (NASA) and 0.005–0.079 / 255 (NOAA), comparable to a cache-only grain control. This supports preserved appearance, not improved physical realism. Embedded previews are resized; original captures remain archived.</p>
+<p><strong>Setup:</strong> RTX 3080 Ti; Hyprland; 3440×1440 + rotated 2560×1080; high-resolution Earth maps; release builds; 6 s settling + 8 s sampling per fixed scene. NOAA mosaic: 2026-10-05 11:05 UTC. The first weather snapshot lacked live clouds; it is explicitly labelled NASA fallback.</p>
+<p><strong>Evidence:</strong> retained sleep handling was measured after the change; its before behavior is based on source inspection. Cloud-failure before behavior was observed in the manifest; after behavior was validated by regression tests, not matched failure screenshots. The smaller caches were tested on this desktop; larger layouts can raise the budget overrides.</p>
+<p><strong>Rebuild report:</strong> <code>python tools/report-ab ARTIFACT_ROOT docs/AB-REPORT.html</code>. Raw reports, frame metadata and captures: <code>/home/btw/test/earth-native-ab/2026-10-05/</code>.</p>
+</div></details>
+<footer>Offline, self-contained HTML · no external fonts, scripts or image requests · baseline 2c5576a / renderer 58630ca · final preference: one brief before/after HTML for future changes.</footer>
+</main><script id="data" type="application/json">__DATA__</script><script>
+const embedded=document.getElementById('data'),data=JSON.parse(embedded.textContent),$=id=>document.getElementById(id);embedded.remove();
+const imageUrls=new Map();
+function imageUrl(key){if(!imageUrls.has(key)){const bytes=Uint8Array.from(atob(data.images[key].split(',')[1]),c=>c.charCodeAt(0));imageUrls.set(key,URL.createObjectURL(new Blob([bytes],{type:'image/jpeg'})));delete data.images[key]}return imageUrls.get(key)}
+const experiment=$('experiment'), scene=$('scene'), output=$('output'), viewer=$('viewer');
+let wipeMode=false;
+for(const c of data.comparisons){const o=new Option(c.title,c.key);experiment.add(o)}
+function current(){return data.comparisons.find(c=>c.key===experiment.value)}
+function setScenes(){const old=scene.value;scene.replaceChildren();for(const s of current().scenes)scene.add(new Option(s.name[0].toUpperCase()+s.name.slice(1),s.name));if([...scene.options].some(o=>o.value===old))scene.value=old;render()}
+function render(){const c=current(),s=c.scenes.find(s=>s.name===scene.value);for(const o of output.options)o.disabled=!s.outputs[o.value];if(!s.outputs[output.value])output.value=Object.keys(s.outputs)[0];const [a,b]=s.outputs[output.value];$('before').src=imageUrl(a);$('after').src=imageUrl(b);$('before').alt=`Before ${s.name}, ${output.value}, ${c.before}`;$('after').alt=`After ${s.name}, ${output.value}, ${c.after}`;$('before-label').textContent=`Before · ${c.before}`;$('after-label').textContent=`After · ${c.after}`;$('verdict').textContent=c.verdict;const timing=c.timing?`Earth pass ${s.earth[0].toFixed(2)} → ${s.earth[1].toFixed(2)} ms`:'Speed verdict unavailable for this pair';$('readout').textContent=`${timing} · process VRAM ${s.vram[0]} → ${s.vram[1]} MiB · frame metadata matched`;applyWipe()}
+function applyWipe(){viewer.classList.toggle('wipe',wipeMode);$('slider-label').hidden=!wipeMode;viewer.lastElementChild.style.clipPath=wipeMode?`inset(0 0 0 ${100-Number($('wipe').value)}%)`:'';$('mode').textContent=wipeMode?'Side by side':'Wipe compare';$('mode').setAttribute('aria-pressed',String(wipeMode))}
+experiment.addEventListener('change',setScenes);scene.addEventListener('change',render);output.addEventListener('change',render);$('mode').addEventListener('click',()=>{wipeMode=!wipeMode;applyWipe()});$('wipe').addEventListener('input',applyWipe);
+for(const which of ['before','after'])$('enlarge-'+which).addEventListener('click',()=>{window.open($(which).src,'_blank','noopener')});
+setScenes();
+</script></body></html>'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("artifacts", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    data = build(args.artifacts.resolve())
+    rows = []
+    for s in data["comparisons"][0]["scenes"]:
+        before, after = s["earth"]
+        rows.append(f'<tr><td>{s["name"].capitalize()}</td><td>{before:.2f} → {after:.2f}</td><td>{(before-after)/before*100:.1f}%</td></tr>')
+    html = TEMPLATE.replace("__TIMINGS__", "".join(rows)).replace("__DATA__", json.dumps(data, separators=(",", ":")).replace("<", "\\u003c"))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(html)
+    print(f"{args.output}: {len(data['comparisons'])} comparisons, {len(data['images'])} embedded previews, {args.output.stat().st_size / 1024**2:.2f} MiB")
+
+
+if __name__ == "__main__":
+    main()

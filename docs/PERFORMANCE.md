@@ -1,5 +1,8 @@
 # Native visual and resource A/B — 2026-10-05
 
+Open the [compact, offline HTML before/after report](AB-REPORT.html) to inspect
+retained changes and discarded experiments across both displays.
+
 Baseline commit: `2c5576a`. The retained changes reduce texture cache allocation
 and clear-air sampling while preserving the existing rendering style. Temporary
 NOAA download failures now retain the last verified cloud observation, with its

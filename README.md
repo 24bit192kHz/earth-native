@@ -8,7 +8,7 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 
 ![Earth over Africa, rendered by earth-native](docs/previews/earth-day.jpg)
 
-[Features](#features) · [Gallery](#gallery) · [Install](#install) · [Use](#use) · [How it works](docs/PHYSICS.md) · [Data](docs/DATA.md) · [Performance A/B](docs/PERFORMANCE.md)
+[Features](#features) · [Gallery](#gallery) · [Install](#install) · [Use](#use) · [How it works](docs/PHYSICS.md) · [Data](docs/DATA.md) · [Before / after](docs/AB-REPORT.html)
 
 </div>
 
