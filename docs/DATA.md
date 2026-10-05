@@ -38,6 +38,7 @@ in the data directory). They are baked offline by `tools/earth-bake`
 | File | Format | Source |
 | --- | --- | --- |
 | `vt/earth-day-MM.earthvt` | BC7 virtual texture, 65536×32768, 256 px pages + 4 px gutters, water mask in alpha, ≈ 3 GB per month | NASA Blue Marble NG 500 m monthly "world" (2004, no baked relief), 8 tiles of 21600², water from GEBCO 2026 |
+| `vt/earth-day.earthvt` | as above, one file for every month | Sentinel-2 cloudless 2016 (EOX) land, BMNG water mask (wettest month) and ocean (darkest month), BMNG January where Sentinel-2 has no data |
 | `textures/night.bc4` | BC4 32768×16384, 13 mips | NASA Black Marble 2016 500 m grayscale |
 | `textures/clouds.bc4` | BC4 32768×16384 | NASA Blue Marble cloud composite (1 km) |
 | `textures/relief.bc5` | BC5 normals 32768×16384 | GEBCO 2026 15″ grid |
@@ -45,11 +46,16 @@ in the data directory). They are baked offline by `tools/earth-bake`
 ```sh
 cargo build --release --manifest-path tools/earth-bake/Cargo.toml
 earth-bake day-vt --bmng DIR --month 200409 --gebco DIR --out earth-day-09.earthvt
+earth-bake rgba-vt --raw earth.rgba --out earth-day.earthvt   # any 65536x32768 RGBA, alpha = water
 earth-bake gray-bc4 --tiles A1,B1,C1,D1,A2,B2,C2,D2 --grid 4x2 --width 32768 \
     --color-space srgb --name NASA/night --out night.bc4
 earth-bake relief-bc5 --gebco DIR --width 32768 --out relief.bc5
 ```
 
+
+`--gpu` (day-vt, rgba-vt) runs the same ISPC BC7 kernel as a wgpu compute
+shader (the `block_compression` crate) instead of on the CPU cores: equal
+quality, about 1.5x faster on an RTX 3080 Ti against 32 CPU threads.
 
 With these, stream the three finest levels of the night lights, cloud map
 and relief instead of keeping 1.4 GB of them resident:

@@ -34,6 +34,8 @@ use earthvt::{
 };
 use rayon::prelude::*;
 
+mod gpu_bc7;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const SOURCE_TILE: usize = 21_600;
@@ -55,6 +57,17 @@ impl Args {
     fn required(&self, name: &str) -> Result<&str> {
         self.value(name).ok_or_else(|| format!("missing {name}").into())
     }
+    fn flag(&self, name: &str) -> bool {
+        self.0.iter().any(|a| a == name)
+    }
+}
+
+fn vt_width(args: &Args) -> Result<usize> {
+    let width: usize = args.value("--width").unwrap_or("65536").parse()?;
+    if width % 256 != 0 || !(width / 256).is_power_of_two() {
+        return Err("--width must be a power of two times 256".into());
+    }
+    Ok(width)
 }
 
 fn run() -> Result<()> {
@@ -62,19 +75,15 @@ fn run() -> Result<()> {
     let command = arguments.first().cloned().unwrap_or_default();
     let args = Args(arguments);
     match command.as_str() {
-        "day-vt" => {
-            let width: usize = args.value("--width").unwrap_or("65536").parse()?;
-            if width % 256 != 0 || !(width / 256).is_power_of_two() {
-                return Err("--width must be a power of two times 256".into());
-            }
-            bake_day_vt(
-                Path::new(args.required("--bmng")?),
-                args.required("--month")?,
-                args.value("--gebco").map(Path::new),
-                Path::new(args.required("--out")?),
-                width,
-            )
-        }
+        "day-vt" => bake_day_vt(
+            Path::new(args.required("--bmng")?),
+            args.required("--month")?,
+            args.value("--gebco").map(Path::new),
+            Path::new(args.required("--out")?),
+            vt_width(&args)?,
+            args.flag("--gpu"),
+        ),
+        "rgba-vt" => bake_rgba_vt(Path::new(args.required("--raw")?), Path::new(args.required("--out")?), vt_width(&args)?, args.flag("--gpu")),
         "gray-bc4" => {
             let width: usize = args.required("--width")?.parse()?;
             let grid: Vec<usize> = args.required("--grid")?.split('x').map(str::parse).collect::<std::result::Result<_, _>>()?;
@@ -91,7 +100,7 @@ fn run() -> Result<()> {
             let exaggeration: f32 = args.value("--exaggeration").unwrap_or("1.0").parse()?;
             bake_relief_bc5(Path::new(args.required("--gebco")?), width, exaggeration, Path::new(args.required("--out")?))
         }
-        _ => Err("usage: earth-bake day-vt --bmng DIR --month YYYYMM [--gebco DIR] --out FILE [--width 65536]\n       earth-bake gray-bc4 --tiles A,B,... --grid CxR --width W --color-space srgb|linear --name NASA/x --out FILE.bc4\n       earth-bake static-vt --textures DIR [--tail-width 4096]".into()),
+        _ => Err("usage: earth-bake day-vt --bmng DIR --month YYYYMM [--gebco DIR] --out FILE [--width 65536] [--gpu]\n       earth-bake rgba-vt --raw FILE.rgba --out FILE [--width 65536] [--gpu]\n       earth-bake gray-bc4 --tiles A,B,... --grid CxR --width W --color-space srgb|linear --name NASA/x --out FILE.bc4\n       earth-bake static-vt --textures DIR [--tail-width 4096]".into()),
     }
 }
 
@@ -292,7 +301,7 @@ impl Image {
 
 // ---------------------------------------------------------------- baking
 
-fn bake_day_vt(bmng: &Path, month: &str, gebco: Option<&Path>, out: &Path, width: usize) -> Result<()> {
+fn bake_day_vt(bmng: &Path, month: &str, gebco: Option<&Path>, out: &Path, width: usize, gpu: bool) -> Result<()> {
     let started = Instant::now();
     let height = width / 2;
     let block = width / 4;
@@ -312,6 +321,26 @@ fn bake_day_vt(bmng: &Path, month: &str, gebco: Option<&Path>, out: &Path, width
             eprintln!("  tile {name}: {:.1?}", t.elapsed());
         }
     }
+    write_day_vt(base, out, started, gpu)
+}
+
+/// A day VT from an already composited `width` x `width/2` sRGB RGBA image
+/// (alpha = water fraction), stored raw and row-major.
+fn bake_rgba_vt(raw: &Path, out: &Path, width: usize, gpu: bool) -> Result<()> {
+    let started = Instant::now();
+    let height = width / 2;
+    let rgba = fs::read(raw)?;
+    if rgba.len() != width * height * 4 {
+        return Err(format!("{}: {} bytes, expected {width}x{height} RGBA", raw.display(), rgba.len()).into());
+    }
+    eprintln!("earth-bake: {width}x{height} day VT from {} ({:.1?})", raw.display(), started.elapsed());
+    write_day_vt(Image { width, height, rgba }, out, started, gpu)
+}
+
+/// Mip-map `base` in linear light, BC7-encode every page and write the
+/// one-layer (DayColor) .earthvt.
+fn write_day_vt(base: Image, out: &Path, started: Instant, gpu: bool) -> Result<()> {
+    let (width, height) = (base.width, base.height);
     let mip_count = full_mip_count(width as u32, height as u32).ok_or("bad size")?;
     let mut levels = vec![base];
     while levels.last().map_or(false, |l| l.width > 1 || l.height > 1) {
@@ -364,42 +393,66 @@ fn bake_day_vt(bmng: &Path, month: &str, gebco: Option<&Path>, out: &Path, width
 
     let padded = PADDED_TILE_SIZE as usize;
     let gutter = GUTTER_SIZE as i64;
-    let done = AtomicUsize::new(0);
-    let settings = intel_tex_2::bc7::alpha_basic_settings();
-    let hashes: Vec<u32> = keys
-        .par_iter()
-        .enumerate()
-        .map(|(ordinal, &(mip, x, y))| -> Result<u32> {
-            let image = &levels[mip as usize];
-            let (tx, ty) = layer.tile_grid(mip).unwrap();
-            let mut pixels = vec![0u8; padded * padded * 4];
-            let exact = image.width == tx as usize * 256 && image.height == ty as usize * 256;
-            for j in 0..padded {
-                for i in 0..padded {
-                    let p = if exact {
-                        image.texel(x as i64 * 256 + i as i64 - gutter, y as i64 * 256 + j as i64 - gutter)
-                    } else {
-                        // Coarse levels: the page spans the map; stretch.
-                        let u = (x as f64 + (i as f64 - gutter as f64 + 0.5) / 256.0) / tx as f64;
-                        let v = (y as f64 + (j as f64 - gutter as f64 + 0.5) / 256.0) / ty as f64;
-                        image.bilinear(u * image.width as f64 - 0.5, v * image.height as f64 - 0.5)
-                    };
-                    pixels[(j * padded + i) * 4..(j * padded + i) * 4 + 4].copy_from_slice(&p);
+    let page_pixels = |&(mip, x, y): &(u16, u32, u32)| -> Vec<u8> {
+        let image = &levels[mip as usize];
+        let (tx, ty) = layer.tile_grid(mip).unwrap();
+        let mut pixels = vec![0u8; padded * padded * 4];
+        let exact = image.width == tx as usize * 256 && image.height == ty as usize * 256;
+        for j in 0..padded {
+            for i in 0..padded {
+                let p = if exact {
+                    image.texel(x as i64 * 256 + i as i64 - gutter, y as i64 * 256 + j as i64 - gutter)
+                } else {
+                    // Coarse levels: the page spans the map; stretch.
+                    let u = (x as f64 + (i as f64 - gutter as f64 + 0.5) / 256.0) / tx as f64;
+                    let v = (y as f64 + (j as f64 - gutter as f64 + 0.5) / 256.0) / ty as f64;
+                    image.bilinear(u * image.width as f64 - 0.5, v * image.height as f64 - 0.5)
+                };
+                pixels[(j * padded + i) * 4..(j * padded + i) * 4 + 4].copy_from_slice(&p);
+            }
+        }
+        pixels
+    };
+    let write_page = |ordinal: usize, payload: &[u8]| -> Result<u32> {
+        if payload.len() as u64 != tile_bytes {
+            return Err(format!("BC7 payload {} != {tile_bytes}", payload.len()).into());
+        }
+        file.write_all_at(payload, payload_offset + ordinal as u64 * tile_bytes)?;
+        Ok(fnv1a(payload))
+    };
+    let hashes: Vec<u32> = if gpu {
+        let mut encoder = gpu_bc7::Encoder::new(padded as u32)?;
+        eprintln!("  BC7 on {} ({:.1?})", encoder.adapter_name, started.elapsed());
+        let mut hashes = Vec::with_capacity(keys.len());
+        for (batch, chunk) in keys.chunks(encoder.pages_per_batch).enumerate() {
+            let pixels: Vec<u8> = chunk.par_iter().flat_map_iter(page_pixels).collect();
+            let blocks = encoder.compress(&pixels, chunk.len())?;
+            let first = batch * encoder.pages_per_batch;
+            for (i, payload) in blocks.chunks(tile_bytes as usize).enumerate() {
+                hashes.push(write_page(first + i, payload)?);
+            }
+            if (batch + 1) % 20 == 0 {
+                eprintln!("  {}/{} pages ({:.1?})", first + chunk.len(), keys.len(), started.elapsed());
+            }
+        }
+        hashes
+    } else {
+        let done = AtomicUsize::new(0);
+        let settings = intel_tex_2::bc7::alpha_basic_settings();
+        keys.par_iter()
+            .enumerate()
+            .map(|(ordinal, key)| -> Result<u32> {
+                let pixels = page_pixels(key);
+                let surface = intel_tex_2::RgbaSurface { data: &pixels, width: padded as u32, height: padded as u32, stride: padded as u32 * 4 };
+                let hash = write_page(ordinal, &intel_tex_2::bc7::compress_blocks(&settings, &surface))?;
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 2000 == 0 {
+                    eprintln!("  {n}/{} pages ({:.1?})", keys.len(), started.elapsed());
                 }
-            }
-            let surface = intel_tex_2::RgbaSurface { data: &pixels, width: padded as u32, height: padded as u32, stride: padded as u32 * 4 };
-            let payload = intel_tex_2::bc7::compress_blocks(&settings, &surface);
-            if payload.len() as u64 != tile_bytes {
-                return Err(format!("BC7 payload {} != {tile_bytes}", payload.len()).into());
-            }
-            file.write_all_at(&payload, payload_offset + ordinal as u64 * tile_bytes)?;
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 2000 == 0 {
-                eprintln!("  {n}/{} pages ({:.1?})", keys.len(), started.elapsed());
-            }
-            Ok(fnv1a(&payload))
-        })
-        .collect::<Result<Vec<_>>>()?;
+                Ok(hash)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
     let mut header = [0u8; HEADER_BYTES];
     header[..8].copy_from_slice(&MAGIC);

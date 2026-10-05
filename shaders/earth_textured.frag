@@ -232,6 +232,11 @@ bool live_sea_ice() {
     return (uint(frame.material_state.x) & 16u) != 0u;
 }
 
+// Texture review (EARTH_NATIVE_NO_CLOUDS): no cloud layer, no cloud shadows.
+bool clouds_off() {
+    return (uint(frame.material_state.x) & 32u) != 0u;
+}
+
 // Aerosol extinction at the ground (km^-1 at 650/550/450 nm) below `unit`:
 // the analysed 550 nm optical depth over the aerosol scale height, spread
 // spectrally by the analysed 440-645 nm Angstrom exponent (dust ~0.2,
@@ -708,6 +713,7 @@ float live_cloud_opacity(vec2 map_uv, vec3 n) {
 }
 
 float sample_cloud_density(vec2 mesh_uv0, vec3 cloud_normal) {
+    if (clouds_off()) return 0.0;
     return live_clouds() ? live_cloud_opacity(mesh_uv0, cloud_normal) : nasa_cloud_opacity(mesh_uv0);
 }
 
@@ -1305,7 +1311,7 @@ void main() {
 
         // Air between the cloud tops and the ground, then the ground itself.
         float t_cloud = sphere_intersection(camera, ray, cloud_radius) * KM_PER_UNIT;
-        bool through_cloud = t_cloud > 0.0 && t_cloud < t_ground;
+        bool through_cloud = t_cloud > 0.0 && t_cloud < t_ground && !clouds_off();
         float t_split = through_cloud ? t_cloud : t_ground;
         vec3 above_radiance = vec3(0.0);
         vec3 above_transmittance = vec3(1.0);

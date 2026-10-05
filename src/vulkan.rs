@@ -369,11 +369,13 @@ impl ShaderFrame {
             ],
             // x: 0 authored, 1 NASA surface, 2 NASA surface + NASA cloud map;
             // +4 when observed live clouds are bound (binding 12), +8 when
-            // that texture also carries aerosol optical depth, +16 sea ice.
+            // that texture also carries aerosol optical depth, +16 sea ice,
+            // +32 clouds off (EARTH_NATIVE_NO_CLOUDS, texture review).
             material_state: [(u32::from(uniforms.nasa_materials) + u32::from(uniforms.nasa_clouds)
                 + 4 * u32::from(uniforms.live_clouds)
                 + 8 * u32::from(uniforms.live_clouds && uniforms.live_aerosol)
-                + 16 * u32::from(uniforms.live_clouds && uniforms.live_sea_ice)) as f32,
+                + 16 * u32::from(uniforms.live_clouds && uniforms.live_sea_ice)
+                + 32 * u32::from(std::env::var_os("EARTH_NATIVE_NO_CLOUDS").is_some())) as f32,
                 u32::from(uniforms.weather_valid_unix_utc > 0) as f32,
                 u32::from(uniforms.aurora_valid_unix_utc > 0) as f32, moon_disc_hi],
             camera_forward: [

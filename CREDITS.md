@@ -8,6 +8,7 @@ NASA does not endorse this project.
 | Data | Source | License / terms |
 | --- | --- | --- |
 | Earth surface | NASA Earth Observatory, Blue Marble Next Generation (2004 monthly composites, 500 m; 8K pack: Sept., topography + bathymetry), Reto Stöckli | NASA imagery, public domain; credit NASA Earth Observatory |
+| Earth surface (single-season VT) | EOxCloudless https://cloudless.eox.at by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2016) | CC BY 4.0 |
 | Night lights | NASA Earth Observatory / Suomi NPP VIIRS, Black Marble 2016 (grayscale) | Public domain; credit NASA Earth Observatory |
 | Clouds | NASA Blue Marble cloud composite (Visible Earth) | Public domain; credit NASA |
 | Relief | GEBCO Compilation Group (2026) GEBCO 2026 Grid; 8K pack: NASA Visible Earth, GEBCO 2008 | Public domain, free use with attribution to GEBCO |

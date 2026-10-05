@@ -684,6 +684,20 @@ impl NativeApp {
             None => (self.camera.pose(), cached.params),
         };
         let camera_distance = pose.position.length();
+        // Texture review: keep the ground under the camera in daylight, the
+        // Sun 30 degrees off the zenith so relief shades and water does not
+        // mirror it straight back.
+        let sun_direction = if std::env::var_os("EARTH_NATIVE_SUN_OVERHEAD").is_some() && camera_distance > 0.0 {
+            let up = pose.position * (1.0 / camera_distance);
+            let side = pose.right - up * pose.right.dot(up);
+            let side = side * (1.0 / side.length().max(1e-6));
+            let sun = up * 30f32.to_radians().cos() + side * 30f32.to_radians().sin();
+            // The camera is in scene space; the renderer mirrors the Earth
+            // Sun's Y into scene space, so hand it the Earth-fixed vector.
+            [sun.x, -sun.y, sun.z]
+        } else {
+            sun_direction
+        };
         let uniforms = FrameUniforms {
             unix_seconds: active_seconds,
             nasa_materials: false,
