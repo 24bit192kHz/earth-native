@@ -18,8 +18,9 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 
 - **The sky, right now.** Sun, Moon and planets come from Astronomy Engine and
   match JPL Horizons to the arc-minute; day and night, the terminator, lunar
-  phase, and even **solar eclipse shadows** are where they really are. The
-  stars and the Milky Way stay visible beside the daylit Earth and the Sun.
+  phase, and even **solar eclipse shadows** are where they really are. As
+  in ISS footage, the stars and the Milky Way come out once the ground below
+  is in night, and dim and redden as they set behind the atmosphere.
 - **NASA imagery down to 500 m.** Blue Marble Next Generation, Black Marble
   city lights, GEBCO relief, the LRO Moon, and 41 394 Hipparcos stars drawn
   one by one. The release pack is 8K (~5 km); the optional 500 m set streams

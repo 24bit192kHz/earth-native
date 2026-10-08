@@ -196,8 +196,12 @@ barycentric velocity. Checked against the 2026-08-23 Sun–Regulus
 conjunction: Regulus renders 0.55° from the Sun's centre, the true value.
 Brightness steps 1.8× per magnitude (the eye's and a photograph's
 compressive response) on a display scale that does not follow the camera
-exposure, so the stars show beside the daylit Earth and the Sun, as in a
-composited space film; the PSF widens for bright stars, and colour follows
+exposure. Over Earth a daylight gate stands in for the exposure: with the
+Sun less than 5° below the horizon at the camera's nadir the sky is black,
+as in every daylit ISS frame, and the stars are full from 20° below. Stars
+seen across the limb take the Rayleigh extinction of their grazing column
+(Chapman), so they dim and redden as they set. The PSF widens for bright
+stars, and colour follows
 B−V through blackbody chromaticities; saturation acts on luminance so hues
 survive.
 
