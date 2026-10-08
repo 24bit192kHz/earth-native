@@ -933,9 +933,11 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         // ~20 kR over ~40 km.
         float discrete = arcs * rays * pulse;
         // Arcs carry the display: the diffuse glow alone integrates to a
-        // featureless band along the limb.
+        // featureless band along the limb. The 630 nm tops sit at ~1/5 of
+        // the green: in ISS footage they glow broad crimson above the
+        // curtains, which 1/40 left invisible.
         vec3 local = vec3(0.15, 1.0, 0.25) * green * (0.02 * diffuse + 0.9 * discrete)
-            + vec3(1.0, 0.07, 0.12) * red * (0.002 * diffuse + 0.02 * discrete)
+            + vec3(1.0, 0.07, 0.12) * red * (0.02 * diffuse + 0.2 * discrete)
             + vec3(0.9, 0.25, 0.8) * fringe * 0.25 * discrete * smoothstep(0.3, 1.0, discrete);
         emission += local * visible * step_km;
     }
@@ -965,6 +967,11 @@ float airglow_column(float tangent_km, float h0, float w, float slant) {
     return slant > 0.0 ? min(0.5 * chord, slant) : chord;
 }
 
+// Display gain, as AURORA_GAIN: ISS night footage is shot at high gain,
+// where the limb airglow reads as a distinct green-yellow band; at the
+// physical scale under the night key it was all but invisible.
+const float AIRGLOW_GAIN = 15.0;
+
 vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
     vec3 tangent = camera - ray * dot(camera, ray);
     float slant = 0.0;
@@ -987,7 +994,7 @@ vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
     vec3 glow = vec3(0.35, 1.0, 0.05) * 400.0 * airglow_column(tangent_km, 97.0, w_green, slant) * sqrt(5.0 / w_green)
         + vec3(1.0, 0.62, 0.02) * 100.0 * airglow_column(tangent_km, 91.0, w_na, slant) * sqrt(4.0 / w_na)
         + vec3(1.0, 0.18, 0.03) * 40.0 * airglow_column(tangent_km, 87.0, w_na, slant) * sqrt(4.0 / w_na);
-    return glow * 4.7e-12 * dark;
+    return glow * 4.7e-12 * AIRGLOW_GAIN * dark;
 }
 
 // --- Lightning -----------------------------------------------------------
