@@ -17,8 +17,11 @@ layout(push_constant) uniform StarFrame {
     vec4 canvas_rect;
     vec4 viewport_rect;
     // x: Julian years since the catalogue epoch; y: physical pixels per canvas
-    // unit; z: brightness gain.
+    // unit; z: sky daylight gate (0 in daylight, 1 at night, see vulkan.rs).
     vec4 params;
+    // Camera position in J2000 (scene units, Earth radius 0.78) for the limb
+    // extinction of each star's line of sight.
+    vec4 observer;
 } frame;
 
 layout(location = 0) noperspective out vec2 out_offset_px;
@@ -39,9 +42,24 @@ void cull() {
     out_sigma_px = 1.0;
 }
 
+// Sea-level Rayleigh optical depths for R, G, B (lambda^-4 from 0.097 at 550 nm).
+// A line of sight that grazes the air at tangent altitude h crosses the one-sided
+// grazing column sqrt(pi R / 2H) exp(-h / H) (Chapman), so a star at the limb is
+// dimmed and reddened; clear sky from about 100 km up.
+vec3 limb_transmission(vec3 observer, vec3 direction) {
+    if (dot(observer, direction) >= 0.0) return vec3(1.0);
+    float impact = length(cross(observer, direction));
+    if (impact <= 0.78) return vec3(1.0);
+    float altitude_km = (impact - 0.78) / 0.78 * 6371.0;
+    float column = 34.3 * exp(-altitude_km / 8.5);
+    return exp(-vec3(0.050, 0.097, 0.216) * column);
+}
+
 void main() {
     int star = gl_VertexIndex / 6;
     vec2 corner = CORNERS[gl_VertexIndex % 6];
+    // Daylight: the camera shoots the sky only at a night exposure (gate 0).
+    if (frame.params.z <= 0.0) { cull(); return; }
     ivec2 base = ivec2((star % stars_per_row) * 4, star / stars_per_row);
     vec4 t0 = floor(texelFetch(star_catalog, base, 0) * 255.0 + 0.5);
     vec4 t1 = floor(texelFetch(star_catalog, base + ivec2(1, 0), 0) * 255.0 + 0.5);
@@ -70,10 +88,10 @@ void main() {
     vec2 ndc = view.xy / view.z / frame.projection_tangents.xy;
     if (any(greaterThan(abs(ndc), vec2(4.0)))) { cull(); return; }
 
-    // A display scale, 1.8x per magnitude, the same at every camera
-    // exposure and for every body (the sky of a composited space film:
-    // stars stay visible beside a daylit disc and the Sun).
+    // Brightness steps 1.8x per magnitude on a fixed sky scale; the camera
+    // exposure does not enter it, the daylight gate does (see params.z).
     float energy = frame.params.z * 0.35 * exp(0.587787 * (6.5 - vmag));
+    vec3 transmission = limb_transmission(frame.observer.xyz, direction);
     float sigma = 0.70 * pow(max(energy, 1.0), 0.2);
     float radius_px = max(4.0 * sigma, 1.5);
 
@@ -94,6 +112,6 @@ void main() {
         : mix(vec3(1.00, 0.78, 0.55), vec3(1.00, 0.66, 0.40), clamp((bv - 1.4) / 0.6, 0.0, 1.0));
     // Unit luminance, so the V magnitude sets the brightness.
     c /= dot(c, vec3(0.2126, 0.7152, 0.0722));
-    out_colour_energy = vec4(mix(vec3(1.0), c, 0.85), energy);
+    out_colour_energy = vec4(mix(vec3(1.0), c, 0.85) * transmission, energy);
     out_sigma_px = sigma;
 }

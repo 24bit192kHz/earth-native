@@ -234,19 +234,39 @@ struct StarFrame {
     canvas_rect: [f32; 4],
     viewport_rect: [f32; 4],
     params: [f32; 4],
+    observer: [f32; 4],
+}
+
+/// The sky's daylight gate, as `sky_daylight_gate` in stars_textured.frag:
+/// 1 when the Sun is at least 20 degrees below the camera's nadir horizon,
+/// 0 from 5 degrees below it. `sun` is the Earth-scene Sun (Y-mirrored, as
+/// the sky shader reads it).
+fn sky_daylight_gate(camera: [f32; 3], sun: [f32; 3]) -> f32 {
+    let dot: f32 = (0..3).map(|i| camera[i] * sun[i]).sum();
+    let length = |v: [f32; 3]| v.iter().map(|c| c * c).sum::<f32>().sqrt();
+    let cosine = dot / (length(camera) * length(sun)).max(1.0e-12);
+    let t = ((cosine + 0.0872) / -0.2548).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 impl StarFrame {
-    fn from_uniforms(uniforms: FrameUniforms, viewport: LogicalRect, physical_width: u32) -> Self {
+    fn from_uniforms(uniforms: FrameUniforms, viewport: LogicalRect, physical_width: u32, body_selector: f32) -> Self {
         // world = M * eqj, so a world-space basis vector b is M^T b in J2000.
         let m = uniforms.star_eqj_to_world;
         let to_eqj = |b: [f32; 3]| -> [f32; 3] {
             [0, 1, 2].map(|column| (0..3).map(|row| m[row][column] * b[row]).sum())
         };
         let (right, up, forward) = (to_eqj(uniforms.right), to_eqj(uniforms.up), to_eqj(uniforms.forward));
+        let observer = to_eqj(uniforms.camera_position);
         let v = uniforms.star_aberration;
         let years = (uniforms.unix_seconds as f64 - crate::star_catalog::EPOCH_UNIX_SECONDS)
             / crate::star_catalog::SECONDS_PER_JULIAN_YEAR;
+        // Earth only: the other bodies keep their sky (no atmosphere to gate).
+        let gate = if body_selector == 0.0 {
+            sky_daylight_gate(uniforms.camera_position, [uniforms.sun_direction[0], -uniforms.sun_direction[1], uniforms.sun_direction[2]])
+        } else {
+            1.0
+        };
         Self {
             view_right: [right[0], right[1], right[2], v[0]],
             view_up: [up[0], up[1], up[2], v[1]],
@@ -254,7 +274,8 @@ impl StarFrame {
             projection_tangents: [uniforms.tan_half_fov_x, uniforms.tan_half_fov_y, uniforms.focus_x, uniforms.focus_y],
             canvas_rect: [uniforms.canvas.x, uniforms.canvas.y, uniforms.canvas.width, uniforms.canvas.height],
             viewport_rect: [viewport.x, viewport.y, viewport.width, viewport.height],
-            params: [years as f32, physical_width as f32 / viewport.width.max(1.0), 1.0, 0.0],
+            params: [years as f32, physical_width as f32 / viewport.width.max(1.0), gate, 0.0],
+            observer: [observer[0], observer[1], observer[2], 0.0],
         }
     }
 }
@@ -6119,11 +6140,7 @@ impl OutputTarget {
             // Catalogue stars: one additive quad each, on top of the sky and
             // under the planet (whose opaque disc covers them).
             if let Some(texture) = device.star_texture.as_ref().filter(|texture| texture.star_count > 0) {
-                let mut star_frame = StarFrame::from_uniforms(uniforms, self.viewport, self.extent.width);
-                // The sky has its own display brightness, whatever the
-                // camera exposure: stars show next to a daylit disc and
-                // the Sun.
-                star_frame.params[2] = 1.0;
+                let star_frame = StarFrame::from_uniforms(uniforms, self.viewport, self.extent.width, body_selector);
                 let star_bytes = std::slice::from_raw_parts(
                     (&star_frame as *const StarFrame).cast::<u8>(),
                     size_of::<StarFrame>(),
@@ -6536,6 +6553,29 @@ mod tests {
         exposure.update(Some(night), None, start + Duration::from_millis(433));
         exposure.update(Some(night), None, start + Duration::from_millis(533));
         assert!(exposure.ev < 3.0, "{:.2}", exposure.ev);
+    }
+
+    #[test]
+    fn sky_gate_follows_the_sun_at_the_camera_nadir() {
+        // Baseline scene vectors (renders/shared/baseline-main, camera and Sun
+        // in scene space after the Earth's Y mirror): daylit day and clouds
+        // views close the gate, the night and aurora views keep the sky.
+        let mirror = |s: [f32; 3]| [s[0], -s[1], s[2]];
+        let day = sky_daylight_gate(
+            [0.614_438_5, -0.446_415_75, 0.338_145_76],
+            mirror([0.999_488_2, 0.031_886_2, 0.002_556_6]),
+        );
+        let night = sky_daylight_gate(
+            [0.634_437_5, -0.055_506_09, 0.534_389_8],
+            mirror([-0.957_339, -0.288_912, 0.005_716]),
+        );
+        let sunrise = sky_daylight_gate(
+            [0.390_613, -0.676_561, 0.284_343],
+            mirror([0.649_665, -0.760_212, 0.003_539]),
+        );
+        assert_eq!(day, 0.0);
+        assert_eq!(night, 1.0);
+        assert!(sunrise > 0.5 && sunrise < 1.0, "{sunrise}");
     }
 
     #[test]

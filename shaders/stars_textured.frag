@@ -60,6 +60,26 @@ vec3 stable_perpendicular(vec3 direction) {
     return normalize(cross(reference, direction));
 }
 
+// Daylight gate for the sky over Earth. Stars and the Milky Way are recorded
+// only at a night exposure: with the Sun up over the camera's nadir horizon,
+// the sunlit ground sets a short exposure and the sky is black (footage of
+// every daylit ISS view). The gate is 1 at or below 20 degrees of solar
+// depression under the nadir, 0 at or above 5 degrees (vulkan.rs mirrors it).
+float sky_daylight_gate(vec3 camera, vec3 sun) {
+    float t = clamp((dot(normalize(camera), normalize(sun)) + 0.0872) / -0.2548, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Rayleigh extinction of the sky seen across the limb (see stars_points.vert).
+vec3 limb_transmission(vec3 camera, vec3 ray) {
+    if (dot(camera, ray) >= 0.0) return vec3(1.0);
+    float impact = length(cross(camera, ray));
+    if (impact <= scene_earth_radius) return vec3(1.0);
+    float altitude_km = (impact - scene_earth_radius) / scene_earth_radius * 6371.0;
+    float column = 34.3 * exp(-altitude_km / 8.5);
+    return exp(-vec3(0.050, 0.097, 0.216) * column);
+}
+
 float celestial_disc(float cosine_angle, float angular_radius, float edge) {
     return smoothstep(
         cos(angular_radius + edge),
@@ -169,8 +189,11 @@ void main() {
     colour = vec3(dot(colour, vec3(0.2126, 0.7152, 0.0722)));
     // The Milky Way's brightest clouds are ~19 mag/arcsec^2, ~7e-8 of
     // sunlight per steradian. Shown as a night series (EV 17) records it,
-    // at every camera exposure, like the catalogue stars.
+    // gated by the daylight state and dimmed across the limb below.
     colour *= 1.0e-6 * 131072.0;
+    if (body == 0) {
+        colour *= sky_daylight_gate(camera, frame.sun_direction.xyz) * limb_transmission(camera, ray);
+    }
     // The catalogue stars themselves are drawn next, one quad per star
     // (stars_points.vert/.frag).
 
