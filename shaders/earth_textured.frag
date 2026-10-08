@@ -763,6 +763,22 @@ float city_glow_at(vec2 map_uv, float lod) {
     return nasa_lights(textureLod(night_emission, map_uv, lod).r);
 }
 
+// Share of city lights that are high-pressure sodium. Sodium still lights
+// most of Africa, the Middle East and South Asia; the Americas, Europe and
+// East Asia have converted to white LEDs, and the ISS footage of the 2020s
+// is mostly white there. Soft boxes around those regions (degrees).
+float light_band(float x, float lo, float hi) {
+    return smoothstep(lo - 3.0, lo + 3.0, x) * (1.0 - smoothstep(hi - 3.0, hi + 3.0, x));
+}
+
+float sodium_fraction(vec2 map_uv) {
+    float lat = (0.5 - map_uv.y) * 180.0;
+    float lon = (0.5 - map_uv.x) * 360.0;
+    float africa = light_band(lat, -35.0, 33.0) * light_band(lon, -18.0, 52.0);
+    float south_asia_middle_east = light_band(lat, 6.0, 38.0) * light_band(lon, 34.0, 92.0);
+    return max(africa, south_asia_middle_east);
+}
+
 // Aurora shell: emission lives between 90 and 320 km.
 const float aurora_top_radius = surface_radius * (1.0 + 320.0 / 6378.137);
 
@@ -1297,15 +1313,20 @@ void main() {
         ground += water * cox_munk_glint(normal, moon, ray) * moon_beam * night_light;
         // Lights are hidden by daylight at any exposure; skip the fetches.
         if (night > 0.0) {
-            // Black Marble lights are grayscale radiance; colour them from
-            // intensity: dim suburbs read sodium orange, dense cores warm white.
+            // Black Marble lights are grayscale radiance; colour them by lamp
+            // type and intensity: sodium suburbs read orange, LED suburbs
+            // cool white, and dense cores warm white in both.
             float lights = nasa_lights(sample_static(static_night_atlas, night_emission, map_uv, map_dx, map_dy).r);
-            vec3 city = mix(vec3(1.0, 0.42, 0.08), vec3(1.0, 0.64, 0.24), smoothstep(0.02, 0.25, lights)) * lights;
+            float bright = smoothstep(0.02, 0.25, lights);
+            vec3 sodium_lamp = mix(vec3(1.0, 0.42, 0.08), vec3(1.0, 0.64, 0.24), bright);
+            vec3 led_lamp = mix(vec3(0.80, 0.90, 1.0), vec3(1.0, 0.97, 0.90), bright);
+            vec3 city = mix(led_lamp, sodium_lamp, sodium_fraction(map_uv)) * lights;
             // Light scattered by the air over a city: a faint wide halo.
             float texture_width = float(textureSize(night_emission, 0).x);
             float narrow = city_glow_at(map_uv, max(log2(texture_width * 0.0044), 0.0));
             float wide = city_glow_at(map_uv, max(log2(texture_width * 0.0120), 0.0));
-            city += vec3(1.0, 0.55, 0.25) * (narrow * 0.06 + wide * 0.04);
+            vec3 halo_lamp = mix(vec3(0.85, 0.92, 1.0), vec3(1.0, 0.55, 0.25), sodium_fraction(map_uv));
+            city += halo_lamp * (narrow * 0.06 + wide * 0.04);
             ground += city * CITY_RADIANCE * night * night_gain(mu_sun);
         }
 
