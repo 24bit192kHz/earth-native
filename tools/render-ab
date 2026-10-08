@@ -29,6 +29,9 @@ SCENES = {
     "globe": (1710936000, [165, 5, 8]),
     "aurora": (1710975600, ["pov", 62, 15, 1500, 0, 35, 78]),
     "limb": (1710975600, ["pov", 60, 15, 420, 0, 20, 78]),
+    # Local midnight on the equator looking east: the tangent point is deep
+    # in night, so the limb shows only airglow (no twilight arc).
+    "dark-limb": (1710975600, ["pov", 0, 15, 420, 90, 20, 78]),
     # Sun over the central Pacific (22 UTC, subsolar ~0N 150W); the camera
     # looks down at the Cox-Munk specular point, about 28 deg off nadir.
     "sunglint": (1710972000, ["pov", 10, -120, 420, 256, 62, 78]),
