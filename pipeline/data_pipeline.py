@@ -814,18 +814,22 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
     vis_surface = np.where(np.isfinite(vis_clear), np.minimum(vis_clear, 0.45), 0.12)
     lat = 90.0 - (np.arange(CLOUD_SIZE[1]) + 0.5) * 180.0 / CLOUD_SIZE[1]
     ir_fallback = np.broadcast_to((65 + 60 * (np.abs(lat) / 72.0) ** 2)[:, None], albedo.shape)
-    # Clear ground is still at its night temperature at sunrise and warms
-    # through the morning: blend the night and day composites with the
-    # daylight weight. Switching at sunrise read the cold dawn ground against
-    # the warm afternoon composite as cloud, a line along the terminator.
-    day = smoothstep(0.10, 0.34, cosine)
-    ir_clear = np.where(np.isfinite(ir_day) & np.isfinite(ir_night), ir_night + day * (ir_day - ir_night),
-                        np.where(is_day, ir_day, ir_night))
-    ir_surface = np.where(np.isfinite(ir_clear), ir_clear, ir_fallback)
     # The composite cannot tell a satellite looking toward the Sun (glint,
     # haze) from one looking away: match the two at every seam of the mosaic.
-    vis_cloud = smoothstep(0.02, 0.45, balance_satellites(albedo - vis_surface))
-    ir_cloud = smoothstep(16.0, 60.0, ir - ir_surface)
+    vis_excess = balance_satellites(albedo - vis_surface)
+    vis_cloud = smoothstep(0.02, 0.45, vis_excess)
+    day = smoothstep(0.10, 0.34, cosine)
+    # Clear ground is coldest near sunrise and warmest after noon, and where
+    # it sits in that cycle varies by region (a dry plateau is still at its
+    # night temperature at 10 am). Cloud is what is colder than the night
+    # composite; colder only than the afternoon one, it counts where the
+    # visible also brightens (thin cirrus at the edge of a deck). Cool morning
+    # ground is then never cloud, and no edge follows the terminator, which
+    # switching composites at sunrise drew.
+    ir_cold = np.where(np.isfinite(ir_night), ir_night, np.where(np.isfinite(ir_day), ir_day, ir_fallback))
+    ir_warm = np.where(np.isfinite(ir_day), ir_day, ir_cold)
+    brightened = day * np.nan_to_num(smoothstep(0.0, 0.02, vis_excess))
+    ir_cloud = np.fmax(smoothstep(16.0, 60.0, ir - ir_cold), brightened * smoothstep(16.0, 60.0, ir - ir_warm))
     def upsample(field):
         return np.asarray(Image.fromarray(np.round(np.clip(field, 0, 1) * 255).astype(np.uint8))
                           .resize(CLOUD_SIZE, Image.Resampling.BICUBIC)) / 255.0
