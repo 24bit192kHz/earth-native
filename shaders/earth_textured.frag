@@ -933,11 +933,12 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         // ~20 kR over ~40 km.
         float discrete = arcs * rays * pulse;
         // Arcs carry the display: the diffuse glow alone integrates to a
-        // featureless band along the limb. The 630 nm tops sit at ~1/5 of
-        // the green: in ISS footage they glow broad crimson above the
-        // curtains, which 1/40 left invisible.
+        // featureless band along the limb. The arcs' 630 nm tops sit at
+        // ~1/5 of the green: in ISS footage they glow crimson above the
+        // curtains, which 1/40 left invisible. The diffuse glow stays
+        // green, as the ground under the oval reads in the footage.
         vec3 local = vec3(0.15, 1.0, 0.25) * green * (0.02 * diffuse + 0.9 * discrete)
-            + vec3(1.0, 0.07, 0.12) * red * (0.02 * diffuse + 0.2 * discrete)
+            + vec3(1.0, 0.07, 0.12) * red * (0.002 * diffuse + 0.2 * discrete)
             + vec3(0.9, 0.25, 0.8) * fringe * 0.25 * discrete * smoothstep(0.3, 1.0, discrete);
         emission += local * visible * step_km;
     }
