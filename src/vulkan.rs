@@ -613,14 +613,15 @@ impl ExposureController {
     /// its deficit: the footage's camera keeps near the day exposure while
     /// the ground darkens (L 0.12 -> 0.03-0.05 at dusk), where full
     /// compensation lifted a dusk view to daylight (L 0.10 with the Sun 3
-    /// degrees up at nadir). A night key still opens fully.
+    /// degrees up at nadir). A night key still opens fully, and a key
+    /// partly raised by a crescent in between (`MeterReading::sunlit`).
     const DUSK_COMPENSATION: f32 = 0.5;
 
-    fn target_for(log2_luminance: f32, sunlit: bool) -> f32 {
+    fn target_for(log2_luminance: f32, sunlit: f32) -> f32 {
         let delta = log2_luminance - Self::DAY_LUMINANCE_LOG2;
         let ev = if delta < 0.0 {
             let beyond = -Self::ADAPTATION * delta - Self::DAY_LATITUDE_STOPS;
-            let beyond = if sunlit { Self::DUSK_COMPENSATION * beyond } else { beyond };
+            let beyond = beyond * (1.0 - (1.0 - Self::DUSK_COMPENSATION) * sunlit);
             beyond.max((-Self::DAY_COMPENSATION * delta).min(Self::DAY_MAX_LIFT_STOPS))
         } else {
             -delta
@@ -668,11 +669,11 @@ impl ExposureController {
             reading
         };
         if let Some(reading) = reading {
-            let (log2_luminance, sunlit_key) = match reading.band_log2 {
-                Some(band) if sunrise_in_view => (band, false),
-                _ => (reading.log2_luminance, reading.sunlit_key),
+            let (log2_luminance, sunlit) = match reading.band_log2 {
+                Some(band) if sunrise_in_view => (band, 0.0),
+                _ => (reading.log2_luminance, reading.sunlit),
             };
-            self.target_ev = Self::target_for(log2_luminance, sunlit_key);
+            self.target_ev = Self::target_for(log2_luminance, sunlit);
         }
         // A photographer never shoots a night exposure with the Sun in the
         // frame: its glare (added after metering) would white it out.
@@ -6580,6 +6581,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dusk_compensation_fades_with_the_sunlit_weight() {
+        // A dusk key ten stops under the day key: the target moves by a
+        // small step for a small change in how sunlit the key is, never by
+        // the whole difference between half and full compensation.
+        let dusk = ExposureController::DAY_LUMINANCE_LOG2 - 10.0;
+        let half = ExposureController::target_for(dusk, 1.0);
+        let full = ExposureController::target_for(dusk, 0.0);
+        assert!(full - half > 3.0, "half {half:.2} full {full:.2}");
+        let nearly = ExposureController::target_for(dusk, 0.95);
+        assert!((nearly - half).abs() < 0.3, "sunlit 0.95: {nearly:.2} against {half:.2}");
+    }
+
+    #[test]
     fn exposure_adapts_to_light_fast_and_to_dark_slowly() {
         let start = Instant::now();
         let mut exposure = ExposureController::new();
@@ -6587,14 +6601,14 @@ mod tests {
         exposure.ev = 17.0;
         // Panning from the night sky back to the daylit Earth (no cut):
         // at most 1.5 stops over on the first frame, within 0.1 stop by 0.4 s.
-        let day = post::MeterReading { log2_luminance: ExposureController::DAY_LUMINANCE_LOG2, coverage: 1.0, sunlit_key: true, band_log2: None };
+        let day = post::MeterReading { log2_luminance: ExposureController::DAY_LUMINANCE_LOG2, coverage: 1.0, sunlit: 1.0, band_log2: None };
         exposure.update(Some(day), None, false, start);
         exposure.update(Some(day), None, false, start + Duration::from_millis(33));
         assert!(exposure.ev <= 1.5, "first frames {:.2} EV over", exposure.ev);
         exposure.update(Some(day), None, false, start + Duration::from_millis(400));
         assert!(exposure.ev < 0.1, "{:.2}", exposure.ev);
         // Back to the night: still the slow ~0.9 s easing.
-        let night = post::MeterReading { log2_luminance: -21.4, coverage: 1.0, sunlit_key: false, band_log2: None };
+        let night = post::MeterReading { log2_luminance: -21.4, coverage: 1.0, sunlit: 0.0, band_log2: None };
         exposure.update(Some(night), None, false, start + Duration::from_millis(433));
         exposure.update(Some(night), None, false, start + Duration::from_millis(533));
         assert!(exposure.ev < 3.0, "{:.2}", exposure.ev);

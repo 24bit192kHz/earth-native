@@ -291,7 +291,9 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   exposure: a low Sun or open ocean is lifted by 0.6 of its deficit, at most
   0.9 stops, and beyond 1.5 stops a sunlit key (a low Sun, dusk) opens up by
   half its deficit, as the footage's camera keeps near the day exposure
-  while the ground darkens; at night the camera opens up for moonlight, city
+  while the ground darkens (fully again over the first stop a crescent or
+  bright band raises the key: switched at once, the exposure closed ~4
+  stops in one frame at dusk); at night the camera opens up for moonlight, city
   lights and aurora and holds 1.6 stops under the meter for a night look. The Sun
   in frame does not cap the exposure, and a frame without the Earth keeps
   the exposure it had. Light

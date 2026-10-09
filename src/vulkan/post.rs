@@ -179,11 +179,14 @@ pub(super) struct MeterReading {
     pub log2_luminance: f32,
     /// Fraction of the frame the Earth and its air cover.
     pub coverage: f32,
-    /// The key is sunlit or twilit Earth at its own 85th percentile (not a
-    /// bright band, a crescent or the night side): the camera then opens up
-    /// for only part of a deficit, as a low Sun and dusk darken the ground
-    /// in the footage at one exposure.
-    pub sunlit_key: bool,
+    /// How far the key is sunlit or twilit Earth at its own 85th percentile
+    /// (1), not a bright band, a crescent or the night side (0): the camera
+    /// then opens up for only part of a deficit, as a low Sun and dusk
+    /// darken the ground in the footage at one exposure. It fades over the
+    /// first stop the highlight or crescent rule raises the key: a flag
+    /// here closed the exposure by ~4 stops in one frame at dusk, when the
+    /// last of a crescent's share left the frame.
+    pub sunlit: f32,
     /// log2 key for a thin sunlit band far over the key (the sunrise and
     /// sunset arc), which the controller uses while the Sun is near the
     /// limb in front of the camera.
@@ -703,7 +706,7 @@ impl HdrTarget {
         Some(MeterReading {
             log2_luminance: key.log2(),
             coverage,
-            sunlit_key: key_lit && key == metered,
+            sunlit: if key_lit { (1.0 - (key / metered).log2()).clamp(0.0, 1.0) } else { 0.0 },
             band_log2: (band > key).then(|| band.log2()),
         })
     }
