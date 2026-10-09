@@ -167,6 +167,32 @@ class DataPipelineTests(unittest.TestCase):
         self.assertGreater(oval[lat < 0].max(), 0.4)
         self.assertEqual(oval[np.abs(lat) < 35].max(), 0)
 
+    def test_storms_move_onto_observed_cold_tops_near_model_instability(self):
+        packed = np.zeros((720, 1440, 3), np.uint8)
+        packed[340:350, 700:710, 1] = 60          # model instability (CAPE ~940 J/kg)
+        convection = np.zeros((720, 1440), np.float32)
+        convection[344, 703] = 1.0                # an observed cold top inside it
+        convection[100, 100] = 1.0                # one where the model is stable
+        steered = pipeline.steer_storms(packed, convection)
+        self.assertGreaterEqual(steered[344, 703, 0], 0.8 * 255)
+        self.assertGreaterEqual(steered[344, 703, 2], 0.5 * 255)
+        self.assertEqual(steered[100, 100].tolist(), [0, 0, 0])
+        # A pure function of the raw model: steering twice changes nothing more.
+        np.testing.assert_array_equal(pipeline.steer_storms(packed, convection), steered)
+        np.testing.assert_array_equal(pipeline.steer_storms(packed, None), packed)
+
+    def test_deep_convection_is_the_coldest_tropical_tops(self):
+        lat = 90 - (np.arange(2048) + 0.5) * 180 / 2048
+        ir = np.full((2048, 4096), 100.0)
+        ir_cold = np.full((2048, 4096), 60.0)
+        ir[1000:1010, 2000:2010] = 220.0          # an anvil near the equator
+        ir[100:110, 2000:2010] = 220.0            # cold polar air, not a storm
+        field = pipeline.deep_convection(ir, ir_cold, lat)
+        self.assertEqual(field.shape, (720, 1440))
+        self.assertGreater(field[1005 * 720 // 2048, 2005 * 1440 // 4096], 0.5)
+        self.assertEqual(field[105 * 720 // 2048, 2005 * 1440 // 4096], 0.0)
+        self.assertEqual(field[360, 100], 0.0)
+
     def test_resize_averages_colour_in_linear_light(self):
         image = Image.fromarray(np.array([[[0, 0, 0], [255, 255, 255]]], np.uint8))
         result = pipeline.resize_rgb(image, (1, 1))

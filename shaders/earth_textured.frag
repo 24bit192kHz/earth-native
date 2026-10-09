@@ -99,10 +99,14 @@ const float R_TOP = 6478.137;
 const vec3 RAYLEIGH_SCATTERING = vec3(7.117000e-3, 1.374500e-2, 3.323300e-2);
 const float RAYLEIGH_SCALE = 8.0;
 const vec3 OZONE_ABSORPTION = vec3(2.785000e-3, 1.779000e-3, 0.000000e0);
-// Aerosol optical depth 0.18 at 550 nm, Angstrom 0.5, scale height 1.8 km.
-const vec3 AEROSOL_EXTINCTION = vec3(9.270248e-2, 1.004577e-1, 1.118034e-1);
+// Aerosol optical depth 0.18 at 550 nm, Angstrom 0.5, scale height 3.0 km:
+// boundary-layer haze plus the free troposphere's. With all of it under a
+// 1.8 km scale height, the limb's lower half above ~5 km was pure Rayleigh
+// blue (R/G 0.1-0.3 at 50-80 % of its peak, footage 0.2-0.8): ISS footage
+// shows it pale, a white haze layer under the blue.
+const vec3 AEROSOL_EXTINCTION = vec3(5.562149e-2, 6.027460e-2, 6.708204e-2);
 const float AEROSOL_ALBEDO = 0.94;
-const float AEROSOL_SCALE = 1.8;
+const float AEROSOL_SCALE = 3.0;
 const float AEROSOL_G = 0.68;
 const float SUN_ANGULAR_RADIUS = 0.004654;
 const float MOON_ANGULAR_RADIUS = 0.004516;
@@ -128,6 +132,15 @@ float night_gain() {
 // none where the Sun is up, all of it once the Sun is 14 degrees down.
 float night_gain(float mu_sun) {
     return pow(night_gain(), 1.0 - smoothstep(-0.25, -0.03, mu_sun));
+}
+
+// The stars' daylight gate (stars_textured.frag), for the limb airglow: it
+// is recorded only at a night exposure, once the Sun is more than 5 degrees
+// below the camera's nadir horizon (full from 20 degrees down). Over a
+// twilit limb seen from the sunlit ISS the footage shows none.
+float night_sky_gate(vec3 camera, vec3 sun) {
+    float t = clamp((dot(normalize(camera), sun) + 0.0872) / -0.2548, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
 }
 
 // Moonlight and starlight as the dark-adapted eye and night footage show
@@ -608,19 +621,32 @@ float cloud_noise(vec3 n, float tile_km, vec2 offset, float bias) {
 
 // The fine octave is read two mips down: cloud elements are rounded at
 // the ~0.5 km scale, and the fractal's last octaves only frayed their edges
-// into specks.
-float cloud_detail(vec3 n) {
-    return 0.68 * cloud_noise(n, 222.0, vec2(0.0), 0.0)
-        + 0.32 * cloud_noise(n, 28.0, vec2(0.37, 0.71), 2.0);
+// into specks. Broken cloud is many small cells: trade cumulus in ISS
+// footage is ~27 clouds per 10^4 pixels at ~1 km per pixel (median 2 km,
+// the largest 8 % of the cloud area), where the coarse tile carried the
+// field and cut it into a few large blobs (5.6-7 per 10^4 pixels, the
+// largest 67-90 %). With little cover (`fine` 1) the fine tile carries it;
+// the weights keep the field's mean and variance, so the cover quantiles
+// stay valid.
+float cloud_detail(vec3 n, float fine) {
+    float coarse_weight = mix(0.68, 0.32, fine);
+    float fine_weight = 1.0 - coarse_weight;
+    float mean = textureLod(tiling_noise, vec2(0.5), 16.0).r;
+    float coarse = cloud_noise(n, 222.0, vec2(0.0), 0.0) - mean;
+    float detail = cloud_noise(n, 28.0, vec2(0.37, 0.71), 2.0) - mean;
+    return mean + (coarse_weight * coarse + fine_weight * detail)
+        * sqrt(0.5648 / (coarse_weight * coarse_weight + fine_weight * fine_weight));
 }
 
 // Real cloud morphology at 1 km (cloud streets, open and closed cells,
 // fronts) from the NASA Blue Marble cloud composite, mixed into the detail
 // so observed cover is sculpted like clouds rather than noise. Where that
 // historical map was clear the fractal alone decides.
-float cloud_morphology(vec2 map_uv, vec3 n) {
+// Broken cloud (`fine` 1) leans on the fine fractal: the composite's large
+// static decks clumped it into a few big blobs.
+float cloud_morphology(vec2 map_uv, vec3 n, float fine) {
     float composite = sample_nasa_clouds(map_uv).r;
-    return mix(cloud_detail(n), composite, 0.45);
+    return mix(cloud_detail(n, fine), composite, 0.45 * (1.0 - 0.6 * fine));
 }
 
 // Cubic B-spline upsampling of the ~10 km cover in four bilinear taps.
@@ -687,14 +713,20 @@ vec3 live_cloud(vec2 map_uv, vec3 n, float slant) {
     dy.x -= round(dy.x);
     float cover = clamp(live_cloud_cover(map_uv, dx, dy), 0.0, 1.0);
     cover = 1.0 - pow(1.0 - cover, 1.0 + CLOUD_ASPECT * slant);
-    float morphology = cloud_morphology(map_uv, n);
+    float morphology = cloud_morphology(map_uv, n, 1.0 - smoothstep(0.15, 0.6, cover));
     float mean = 0.55 * textureLod(tiling_noise, vec2(0.5), 16.0).r + 0.45 * 0.244;
     float threshold = mean + morphology_quantile_offset(1.0 - cover);
-    float band = max(0.012, 0.5 * fwidth(morphology));
-    float opacity = smoothstep(threshold - band - 0.015, threshold + band + 0.015, morphology);
-    float depth = smoothstep(0.0, 0.22, morphology - threshold);
+    // A pixel or two wide: the minimum of +-0.027 in field units spread
+    // edges over several pixels where the field is flat (as soft as 0.04
+    // of the contrast per pixel against the footage's 0.21-0.29); +-0.018
+    // keeps them crisp without the hard cut-out look of a one-pixel step.
+    float band = max(0.009, 0.5 * fwidth(morphology));
+    float opacity = smoothstep(threshold - band - 0.009, threshold + band + 0.009, morphology);
+    // Thin fringes grey, cores white, reached sooner: decks read as bright
+    // lumpy cloud (footage interior L 0.58) rather than a grey mottle (0.48).
+    float depth = smoothstep(0.0, 0.14, morphology - threshold);
     float rise = max(morphology - threshold, 0.0);
-    vec3 near = vec3(opacity, mix(0.5, 0.92, depth), rise / (rise + 0.12));
+    vec3 near = vec3(opacity, mix(0.62, 0.93, depth), rise / (rise + 0.12));
     // From afar the mips average the morphology toward its mean, so the
     // quantile cut above collapses into an on/off switch at 50 % cover:
     // flat white cut-outs tracing the 10 km grid on the globe. Once a pixel
@@ -747,20 +779,31 @@ vec4 storm_random4(vec2 cell, uint phase) {
 
 // Black Marble 2016 is an 8-bit display product (sRGB-coded BC4). Mapped to
 // radiance so the brightest city cores reach ~25x a full-Moon-lit desert
-// (VIIRS DNB: ~500 vs ~20 nW cm^-2 sr^-1), in sunlight units.
+// (VIIRS DNB: ~500 vs ~20 nW cm^-2 sr^-1), in sunlight units. The product's
+// stretch is gentler than sRGB at the faint end: decoded with 2.2, the
+// lights of villages and roads fell into the camera's toe and northern
+// India showed a third of the lit ground of 2024-26 ISS footage. Cores
+// (encoded 1) are unchanged.
 const float CITY_RADIANCE = 1.5e-5;
 float nasa_lights(float encoded) {
+    return pow(encoded, 1.6);
+}
+
+// The glows (halo over a city, light diffused by cloud) sample blurred mips,
+// where the gentler decode would lift wide faint areas 4x into a grey fog:
+// they keep the 2.2 decode they were calibrated with.
+float nasa_glow(float encoded) {
     return pow(encoded, 2.2);
 }
 
 // City-light radiance at a map position (linear, from the sRGB-coded BC4).
 float city_signal_at(vec2 map_uv, vec2 offset) {
     vec2 uv = map_uv + offset;
-    return nasa_lights(sample_static(static_night_atlas, night_emission, uv, dFdx(uv), dFdy(uv)).r);
+    return nasa_glow(sample_static(static_night_atlas, night_emission, uv, dFdx(uv), dFdy(uv)).r);
 }
 
 float city_glow_at(vec2 map_uv, float lod) {
-    return nasa_lights(textureLod(night_emission, map_uv, lod).r);
+    return nasa_glow(textureLod(night_emission, map_uv, lod).r);
 }
 
 // Share of city light that is high-pressure sodium. Street lighting has
@@ -768,10 +811,18 @@ float city_glow_at(vec2 map_uv, float lod) {
 // national LED programme), and ISS night footage of the 2020s reads
 // white with a warm cast nearly everywhere. Black Marble cannot tell lamp
 // types apart, so one global share keeps that warm cast.
-const float SODIUM_SHARE = 0.25;
+const float SODIUM_SHARE = 0.15;
+// The same lamps seen diffused through air or cloud: scattering treats every
+// colour alike, so a lit cloud deck keeps the lamps' mixed colour, the
+// cream-white of 2024-26 ISS footage (R/G ~1.1, B/G ~0.8), not a sodium
+// orange.
+const vec3 DIFFUSE_LAMP = vec3(1.0, 0.90, 0.76);
 
-// Aurora shell: emission lives between 90 and 320 km.
-const float aurora_top_radius = surface_radius * (1.0 + 320.0 / 6378.137);
+// Aurora shell: emission lives between 90 and 400 km.
+const float aurora_top_radius = surface_radius * (1.0 + 400.0 / 6378.137);
+// Night glows reach 400 km (the 630 nm airglow layer): rays that pass over
+// the air but under this still shade.
+const float night_glow_top_radius = surface_radius * (1.0 + 400.0 / 6378.137);
 
 // Noise with an explicit LOD: derivatives are undefined inside the march.
 float aurora_noise(vec2 uv, vec2 tiling, float footprint_uv) {
@@ -812,7 +863,7 @@ const float KILORAYLEIGH = 4.7e-9;
 // orbital time-lapses and in the Incredible Earth reference renders.
 const float AURORA_GAIN = 150.0;
 
-// Volumetric march through the 90-320 km auroral shell. NOAA OVATION gives
+// Volumetric march through the 90-400 km auroral shell. NOAA OVATION gives
 // where the oval is and how active it is; the structure follows DMSP/VIIRS
 // night imagery and ISS photography:
 //  - a diffuse, patchy glow filling the oval (brightest equatorward);
@@ -821,9 +872,11 @@ const float AURORA_GAIN = 150.0;
 //  - field-aligned rays, constant along the (near-vertical) magnetic field:
 //    vertical striations when a curtain is seen edge-on at the limb;
 //  - altitude profiles: O(1S) 557.7 nm green with a sharp lower border near
-//    100 km and a ~30 km scale height above; O(1D) 630 nm red spread over
-//    180-320 km (the crimson top in ISS photos); N2+ 391/428 nm and N2 1PG
-//    pink-violet along the lower edge of bright arcs.
+//    100 km and a ~30 km scale height above; O(1D) 630 nm red from ~180 km,
+//    peaking near 235 km and fading slowly above (a dim, tall maroon haze
+//    over the curtains in ISS photos, crimson only in the ray tops); N2+
+//    391/428 nm and N2 1PG pink-violet along the lower edge of bright arcs,
+//    and violet ray tops where the aurora stands in sunlight.
 vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
     if (frame.material_state.z < 0.5) return vec3(0.0);
     float b = dot(camera, ray);
@@ -862,8 +915,12 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         vec3 n = p / r;
         float h = (r - surface_radius) * KM_PER_UNIT;
         if (h < 90.0) continue;
-        // Invisible against sunlit air: fade through nautical twilight.
-        float visible = 1.0 - smoothstep(-0.16, -0.02, dot(n, sun));
+        // Hidden only over sunlit ground (Sun more than ~1-5 degrees up
+        // below it): ISS footage shows the curtains bright up to the dawn
+        // terminator, beside the blue sunlit limb, where fading them through
+        // nautical twilight (-9 to -1 degrees) left no aurora near any dawn
+        // or dusk. (A fade by the ray's background cost 8 more registers.)
+        float visible = 1.0 - smoothstep(-0.02, 0.08, dot(n, sun));
         if (visible <= 0.0) continue;
         vec2 uv = sphere_uv(n);
         float probability = textureLod(weather_fields, uv, 3.0).a;
@@ -918,29 +975,35 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         float ray_noise = aurora_noise(vec2(uv.x + time * 2.5e-4, uv.y), vec2(160.0, 90.0), footprint_uv);
         float rays = mix(1.0, 0.15 + 2.2 * ray_noise * ray_noise, 0.9 * (1.0 - smoothstep(80.0, 250.0, footprint_km)));
         float pulse = 0.88 + 0.12 * sin(time * 1.1 + ray_noise * 9.0);
-        // Diffuse aurora: smooth large patches over the whole oval.
+        // Diffuse aurora: large patches over the whole oval, patchy and
+        // contrasted as ISS footage shows it from above (p95/p5 ~4).
         float patches = aurora_noise(uv + vec2(time * 1.0e-4, 0.0), vec2(26.0, 13.0), footprint_uv);
         // ~1 kR at 25 % probability, rising with the energy flux in storms.
-        float diffuse = smoothstep(0.02, 0.25, probability) * max(1.0, probability / 0.25)
-            * (1.0 - 0.5 * poleward) * (0.4 + 1.2 * patches * patches);
+        float diffuse = smoothstep(0.05, 0.25, probability) * max(1.0, probability / 0.25)
+            * (1.0 - 0.5 * poleward) * (0.15 + 2.0 * patches * patches * patches);
 
         float green = smoothstep(94.0, 104.0, h) * exp(-max(h - 108.0, 0.0) / 30.0);
         float red_x = (h - 235.0) / 65.0;
-        float red = exp(-red_x * red_x) * smoothstep(150.0, 190.0, h);
+        float red = (h < 235.0 ? exp(-red_x * red_x) : exp(-(h - 235.0) / 110.0)) * smoothstep(150.0, 190.0, h);
+        // Outside the Earth's shadow N2+ ions resonantly scatter sunlight.
+        float shadow_cos = -sqrt(max(1.0 - surface_radius * surface_radius / (r * r), 0.0));
+        float sunlit = smoothstep(shadow_cos - 0.02, shadow_cos + 0.03, dot(n, sun));
         float fringe_x = (h - 97.0) / 4.0;
         float fringe = exp(-fringe_x * fringe_x);
         // kR per km: diffuse ~1 kR overhead over ~50 km of column, arcs
         // ~20 kR over ~40 km.
         float discrete = arcs * rays * pulse;
-        // Arcs carry the display: the diffuse glow alone integrates to a
-        // featureless band along the limb. The arcs' 630 nm tops sit at
-        // ~1/5 of the green: in ISS footage they glow crimson above the
-        // curtains, which 1/40 left invisible. The diffuse glow stays
-        // green, as the ground under the oval reads in the footage.
-        vec3 local = vec3(0.15, 1.0, 0.25) * green * (0.02 * diffuse + 0.9 * discrete)
-            + vec3(1.0, 0.07, 0.12) * red * (0.002 * diffuse + 0.2 * discrete)
-            + vec3(0.9, 0.25, 0.8) * fringe * 0.25 * discrete * smoothstep(0.3, 1.0, discrete);
-        emission += local * visible * step_km;
+        // Arcs carry the display along the limb; seen from above, the
+        // diffuse glow lights the ground under the oval green (footage:
+        // 0.2-0.4 of the limb band, 6-14x what 0.02 gave). The 630 nm red
+        // is ~1/15 of the green, desaturated toward maroon: footage shows a
+        // dim tall haze (red/green 0.02-0.08) with crimson ray tops, where
+        // 1/5 drew a saturated ribbon.
+        vec3 local = vec3(0.15, 1.0, 0.25) * green * (0.08 * diffuse + 0.9 * discrete)
+            + vec3(1.0, 0.15, 0.13) * red * (0.002 * diffuse + 0.07 * discrete)
+            + vec3(0.9, 0.25, 0.8) * fringe * 0.25 * discrete * smoothstep(0.3, 1.0, discrete)
+            + vec3(0.45, 0.30, 1.0) * red * 0.06 * discrete * sunlit;
+        emission += local * (visible * step_km);
     }
     return emission * KILORAYLEIGH;
 }
@@ -953,9 +1016,14 @@ vec3 aurora_emission(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
 // exp(-x^2) sqrt(pi / (c + 2x)) above (c = 0.956 matches g(0) = 1.813). The
 // tangent (limb) path is ~80x the zenith column: the thin band ISS night
 // photographs show on the horizon.
-//   O(1S) 557.7 nm at 97 km, ~400 R near solar maximum: green
+//   O(1S) 557.7 nm at 97 km, ~400 R near solar maximum: green, which a
+//     camera sensor records as a teal green (ISS footage: B/G 0.4-0.5)
 //   Na D 589 nm at 91 km, ~100 R: yellow-orange
-//   OH Meinel (visible red tail) at 87 km
+//   OH Meinel (visible red tail) at 87 km, ~130 R: the thin amber line
+//     under the green one in moonless footage
+//   O(1D) 630 nm from the F region, peak ~250 km and ~75 km thick: ~60 R at
+//     middle latitudes, ~300 R over the equatorial anomaly near solar maximum. ISS footage
+//     shows it as a red-orange band at 235-250 km above a darker gap.
 // 1 R of 557.7 nm is 2.8e-10 W m^-2 sr^-1, 1/59 of a white Lambertian
 // surface under the Sun in the green channel per 1e-10: sunlight units.
 float airglow_column(float tangent_km, float h0, float w, float slant) {
@@ -972,8 +1040,20 @@ float airglow_column(float tangent_km, float h0, float w, float slant) {
 // where the limb airglow reads as a distinct green-yellow band; at the
 // physical scale under the night key it was all but invisible.
 const float AIRGLOW_GAIN = 15.0;
+// Like the stars and the Milky Way, the airglow is shown as a night series
+// at a fixed exposure (EV 17) records it, whatever the camera's exposure:
+// following the camera it was too bright in moonless views (EV 18) and lost
+// under moonlight (EV 16), where the footage still shows the line and the
+// red 630 nm band.
+const float AIRGLOW_DISPLAY_PREEXPOSURE = 131072.0;
 
-vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
+// Geomagnetic north pole (IGRF dipole, 80.8 N 72.6 W) in the scene's
+// mirrored frame (east longitude = -atan(y, x), see sphere_uv).
+const vec3 GEOMAGNETIC_POLE = vec3(0.0478, 0.1526, 0.9871);
+
+// `far_half` dims the second crossing of a limb ray (which misses the
+// ground) by the air below its tangent point: the march's transmittance.
+vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit, float far_half) {
     vec3 tangent = camera - ray * dot(camera, ray);
     float slant = 0.0;
     if (surface_hit > 0.0) {
@@ -983,8 +1063,9 @@ vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         slant = 1.0 / max(dot(-ray, layer_normal), 0.02);
     }
     float tangent_km = (length(tangent) - surface_radius) * KM_PER_UNIT;
-    if (tangent_km > 160.0) return vec3(0.0);
-    float dark = 1.0 - smoothstep(-0.25, -0.05, dot(normalize(tangent), sun));
+    if (tangent_km > 400.0) return vec3(0.0);
+    vec3 up = normalize(tangent);
+    float dark = 1.0 - smoothstep(-0.25, -0.05, dot(up, sun));
     if (dark <= 0.0) return vec3(0.0);
     // Beyond a pixel the layers are unresolved: widen them, keeping the
     // height-integrated brightness.
@@ -992,9 +1073,15 @@ vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
         * 2.0 * frame.projection_tangents.y / frame.canvas_rect.w;
     float w_green = sqrt(25.0 + footprint_km * footprint_km);
     float w_na = sqrt(16.0 + footprint_km * footprint_km);
-    vec3 glow = vec3(0.35, 1.0, 0.05) * 400.0 * airglow_column(tangent_km, 97.0, w_green, slant) * sqrt(5.0 / w_green)
+    float w_red = sqrt(2025.0 + footprint_km * footprint_km);
+    // 630 nm: brightest within ~18 degrees of the magnetic equator.
+    float magnetic_latitude = asin(clamp(dot(up, GEOMAGNETIC_POLE), -1.0, 1.0));
+    float red_rayleigh = 60.0 + 240.0 * exp(-magnetic_latitude * magnetic_latitude / 0.0987);
+    vec3 glow = vec3(0.20, 1.0, 0.42) * 400.0 * airglow_column(tangent_km, 97.0, w_green, slant) * sqrt(5.0 / w_green)
         + vec3(1.0, 0.62, 0.02) * 100.0 * airglow_column(tangent_km, 91.0, w_na, slant) * sqrt(4.0 / w_na)
-        + vec3(1.0, 0.18, 0.03) * 40.0 * airglow_column(tangent_km, 87.0, w_na, slant) * sqrt(4.0 / w_na);
+        + vec3(1.0, 0.30, 0.04) * 130.0 * airglow_column(tangent_km, 87.0, w_na, slant) * sqrt(4.0 / w_na)
+        + vec3(1.0, 0.10, 0.03) * red_rayleigh * airglow_column(tangent_km, 250.0, w_red, slant) * sqrt(45.0 / w_red);
+    if (slant <= 0.0) glow *= far_half;
     return glow * 4.7e-12 * AIRGLOW_GAIN * dark;
 }
 
@@ -1011,7 +1098,11 @@ vec3 night_airglow(vec3 camera, vec3 ray, vec3 sun, float surface_hit) {
 // most are small. The cells around the pixel are all asked, so a glow is
 // never cut at a cell edge.
 const float FLASH_SLOT = 0.8;
-const float FLASH_RATE = 0.48;     // flashes per second of a cell with blob 1
+// Flashes per second of a cell with blob 1. The pipeline puts storms on the
+// observed cold cloud tops (data_pipeline.py steer_storms), ~2.7x the
+// model's storm area; 0.17 keeps the global rate near the observed
+// 44-46 flashes per second.
+const float FLASH_RATE = 0.17;
 // Frames are drawn at 8-20 per second: averaging each stroke over the last
 // 90 ms, as a camera does, shows every flash in the frame it falls in.
 const float FLASH_WINDOW = 0.09;
@@ -1024,9 +1115,11 @@ const vec4 STROKE_WEIGHT = vec4(1.0, 0.62, 0.48, 0.38);
 // The night series is EV 16 (night_gain brings a flash there from a shorter
 // exposure). A camera opened further, EV 19 from the ISS at night, would burn
 // every flash out to a flat white blob: a flash keeps the display brightness
-// it has at EV 16 instead, so its structure stays.
+// it has at EV ~17.5 instead, so its structure stays while its core still
+// clips. Held at EV 16 (3 stops back) flashes peaked at 0.04-0.13 beside
+// city lights at 1.0; in ISS footage every flash core clips like a city.
 float flash_gain() {
-    return min(1.0, NIGHT_SERIES_PREEXPOSURE / preexposure());
+    return min(1.0, 2.8 * NIGHT_SERIES_PREEXPOSURE / preexposure());
 }
 
 // Mean over the window ending at `time` of a pulse that starts at `onset` and
@@ -1135,14 +1228,15 @@ vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
         float along = dot(km, axis);
         float across = dot(km, vec2(-axis.y, axis.x));
         float r2 = (along * along / stretch + across * across * stretch) / (wide * wide);
-        if (r2 > 45.0) continue;
+        // Out to ~10 widths for the halo below; the core and glow end by 6.
+        if (r2 > 100.0) continue;
         if (lumps < 0.0) lumps = flash_lumps(normal, pixel_km);
         float reach = 0.6 + 0.9 * lumps;       // thick lobes of the cloud reach further
         float strength = 0.55 + 0.9 * lumps;   // and glow brighter
         // The tail is faded out over its last 0.2 s: it is still a few
         // percent of the peak where the flash ends, and would vanish at once.
         float fade = 1.0 - smoothstep(finish - 0.2, finish, local);
-        float amplitude = (0.25 + 0.95 * flash_size) * sigma / wide * inside * fade;
+        float amplitude = (0.45 + 0.75 * flash_size) * sigma / wide * inside * fade;
 
         // The continuing glow sits on the flash; every return stroke lights
         // the cloud a little further along it, so the lit part changes
@@ -1162,19 +1256,24 @@ vec3 lightning_light(vec2 uv, vec3 normal, float pixel_km, float time) {
             float a = along - shift;
             float stroke_r2 = (a * a / stretch + across * across * stretch) / (wide * wide * reach);
             if (stroke_r2 > 18.0) continue;
-            light += (vec3(0.60, 0.72, 1.0) * exp(-0.5 * stroke_r2) + vec3(0.9, 0.87, 0.82) * exp(-3.0 * stroke_r2))
+            // Blue-violet in the deck (footage halos R/G 0.5-0.8, B/G
+            // 1.3-2.4) around a small white core that clips.
+            light += (vec3(0.55, 0.50, 1.0) * exp(-0.5 * stroke_r2) + vec3(2.2, 2.2, 2.4) * exp(-4.0 * stroke_r2))
                 * (pulse * amplitude * strength);
         }
         float glow_r2 = r2 / (1.4 * reach);
         if (glow_r2 < 18.0) {
-            light += vec3(0.60, 0.72, 1.0) * (exp(-0.5 * glow_r2) * glow * amplitude * strength);
+            light += vec3(0.55, 0.50, 1.0) * (exp(-0.5 * glow_r2) * glow * amplitude * strength);
         }
-        // The cloud deck around the flash, lit faintly through its thick
-        // parts. Kept inside the cells asked.
-        float halo_sigma = min(2.2 * wide, 0.30 * cell_km);
+        // The cloud deck around the flash, lit through its thick parts out
+        // to 5-15 core widths at ~10 % of the core, as in the footage. Kept
+        // inside the cells asked, and faded to nothing by the cut above (it
+        // is still ~15 % of its peak at 6 widths: a hard rim there).
+        float halo_sigma = min(3.5 * wide, 0.30 * cell_km);
         float halo_r2 = (along * along / sqrt(stretch) + across * across * sqrt(stretch)) / (halo_sigma * halo_sigma);
         if (halo_r2 < 18.0) {
-            light += vec3(0.45, 0.58, 1.0) * (exp(-0.5 * halo_r2) * lumps * lumps * 0.035 * amplitude * temporal);
+            light += vec3(0.45, 0.45, 1.0) * (exp(-0.5 * halo_r2) * (1.0 - smoothstep(45.0, 100.0, r2))
+                * lumps * lumps * 0.12 * amplitude * temporal);
         }
     }
     return light;
@@ -1207,8 +1306,7 @@ void main() {
     vec2 map_dy = dFdy(map_uv);
     float atmosphere_t0, atmosphere_t1;
     bool in_air = sphere_span(camera, ray, atmosphere_radius, atmosphere_t0, atmosphere_t1) && atmosphere_t1 > 0.0;
-    if (!in_air && (frame.material_state.z < 0.5 ||
-        sphere_intersection(camera, ray, aurora_top_radius) < 0.0)) {
+    if (!in_air && sphere_intersection(camera, ray, night_glow_top_radius) < 0.0) {
         discard;
     }
 
@@ -1251,9 +1349,12 @@ void main() {
         vec3 shading_normal = relief_normal(normal, map_uv, map_dx, map_dy);
         float mu_sun = dot(normal, sun);
         float mu_moon = dot(normal, moon);
-        // Sunlit or sky-lit ground; past this the night gain (eased in from
-        // -0.03 to -0.25) carries more than a quarter of its stops.
-        metered_lit = mu_sun > -0.10;
+        // Sunlit or twilit ground: until the Sun is ~9 degrees down, the
+        // sunlit air above the ground (over ~80 km) still outshines the night
+        // terms at a twilight exposure. Cut at -0.10, that air read 2^(16-EV)
+        // too dark to the meter, which then jumped to the night exposure at
+        // dusk while the twilit side of the frame blew out.
+        metered_lit = mu_sun > -0.16;
 
         // Cloud shadows: march the sun-leg from the surface into the cloud
         // shell and attenuate direct sun by the density found there.
@@ -1265,16 +1366,19 @@ void main() {
                 cloud_shadow = clamp(sample_cloud_density(sphere_uv(shadow_normal), shadow_normal), 0.0, 1.0);
             }
         }
-        // Thick decks block ~70 % of the direct beam (the rest arrives as
-        // cloud-scattered diffuse light); thin cloud forward-scatters most.
-        float sun_shadow = 1.0 - 0.7 * pow(cloud_shadow, 1.6);
+        // Thick cloud blocks ~90 % of the direct beam; thin cloud forward-
+        // scatters most of it. At 70 % the shadows of cumulus stayed ~1.6
+        // stops dark, where ISS footage shows them nearly black on the sea
+        // (sea in shadow / cloud top ~1/20).
+        float sun_shadow = 1.0 - 0.9 * pow(cloud_shadow, 1.6);
 
         vec3 albedo = mix(vec3(dot(day_material.rgb, vec3(0.2126, 0.7152, 0.0722))), day_material.rgb, surface_saturation);
         // Open ocean: Blue Marble paints water a flat, too-dark fill. Use
-        // Case-1 water-leaving reflectance (Rrs 443/555/670 ~ 8e-3, 1.5e-3,
-        // 2e-4 sr^-1, times pi) and keep the map where it is brighter
-        // (shallow banks, turbid coasts).
-        const vec3 deep_water = vec3(0.0006, 0.0047, 0.025);
+        // Case-1 water-leaving reflectance averaged over the sRGB colour
+        // bands (single wavelengths, Rrs 443/555/670 x pi, made it 1.7x too
+        // dark and navy against the footage's deep water) and keep the map
+        // where it is brighter (shallow banks, turbid coasts).
+        const vec3 deep_water = vec3(0.0006, 0.0075, 0.033);
         albedo = mix(albedo, max(day_material.rgb, deep_water), water);
         // Blue Marble oceans are open all year; lay today's pack ice over
         // them. Snow-covered first-year ice is a little greyer and bluer
@@ -1297,12 +1401,31 @@ void main() {
         sky = max(sky + horizontal_beam * (1.0 - beam_change) * AEROSOL_ALBEDO * 0.8, vec3(0.0));
         sun_beam *= beam_change;
         float lambert = max(dot(shading_normal, sun), 0.0);
-        vec3 ground = albedo * (sun_beam * lambert * sun_shadow + sky * (1.0 - 0.45 * cloud_shadow));
+        vec3 ground = albedo * (sun_beam * lambert * sun_shadow + sky * (1.0 - 0.6 * cloud_shadow));
         // Ocean surface: Cox-Munk sunglint plus the Fresnel reflection of
-        // the sky (~2 % near nadir, rising toward grazing views).
+        // the sky (~2 % near nadir, rising toward grazing views, where the
+        // mirrored ray sees the bright sky near the horizon rather than the
+        // sky's average).
         float view_cos = max(dot(normal, -ray), 0.0);
         float fresnel = 0.02037 + 0.97963 * pow(1.0 - view_cos, 5.0);
-        ground += water * (cox_munk_glint(normal, sun, ray) * sun_beam * sun_shadow + fresnel * sky);
+        // Calm streaks and slicks (a few km to a few hundred) glint
+        // brighter, rough water dimmer: the texture inside ISS sunglint,
+        // where one 7 m/s everywhere drew a smooth even glow. The clouds'
+        // 1/f^2 fractal stretched 4:1 along the mostly zonal winds (tiles
+        // ~500 by 125 km, read ~4 km fine); isotropic it read as haze.
+        // (Varying the Cox-Munk slope variance itself cost 8 more registers.)
+        float calm = 1.0;
+        if (water > 0.0) {
+            calm = clamp(1.0 + 1.5 * (textureLod(tiling_noise, map_uv * vec2(80.0, 160.0), 2.0).r
+                - textureLod(tiling_noise, vec2(0.5), 16.0).r), 0.55, 1.45);
+        }
+        // Light scattered through a cloud makes no glint: the cloud's shadow
+        // takes it all, a dark hole in the glint as in the footage. The
+        // camera's saturation tinted a white glint peach; footage shows it
+        // silver under a high Sun.
+        vec3 glint = cox_munk_glint(normal, sun, ray) * sun_beam * ((1.0 - cloud_shadow) * calm);
+        glint = mix(vec3(dot(glint, vec3(0.2126, 0.7152, 0.0722))), glint, 0.75);
+        ground += water * (glint + fresnel * sky * (1.0 + 1.5 * (1.0 - view_cos)));
 
         // Night: moonlight, starlight/airglow and city lights.
         vec3 moon_beam = light_transmittance(r_ground, mu_moon, MOON_ANGULAR_RADIUS) * moon_irradiance;
@@ -1324,8 +1447,7 @@ void main() {
             float texture_width = float(textureSize(night_emission, 0).x);
             float narrow = city_glow_at(map_uv, max(log2(texture_width * 0.0044), 0.0));
             float wide = city_glow_at(map_uv, max(log2(texture_width * 0.0120), 0.0));
-            vec3 halo_lamp = mix(vec3(0.85, 0.92, 1.0), vec3(1.0, 0.55, 0.25), SODIUM_SHARE);
-            city += halo_lamp * (narrow * 0.06 + wide * 0.04);
+            city += DIFFUSE_LAMP * (narrow * 0.06 + wide * 0.04);
             ground += city * CITY_RADIANCE * night * night_gain(mu_sun);
         }
 
@@ -1412,12 +1534,12 @@ void main() {
                         * (cloud_night * scatter * thick * FLASH_RADIANCE * night_gain(cloud_mu) * flash_gain());
                 }
                 // City lights glow upward into low night cloud.
-                // The cloud diffuses them: a wide golden glow over a city.
+                // The cloud diffuses them: a wide glow in the lamps' colour.
                 float city_signal_cloud = city_signal_at(cloud_uv, vec2(0.0));
                 float glow_width = float(textureSize(night_emission, 0).x);
                 float city_diffuse = city_glow_at(cloud_uv, max(log2(glow_width * 0.0012), 0.0))
                     + city_glow_at(cloud_uv, max(log2(glow_width * 0.0044), 0.0));
-                cloud_colour += vec3(1.0, 0.48, 0.12) * (0.35 * pow(city_signal_cloud, 1.4) + 0.35 * city_diffuse)
+                cloud_colour += DIFFUSE_LAMP * (0.35 * pow(city_signal_cloud, 1.4) + 0.35 * city_diffuse)
                     * cloud_night * CITY_RADIANCE * night_gain(cloud_mu);
             }
             under = mix(under, cloud_colour, cloud_opacity);
@@ -1434,15 +1556,19 @@ void main() {
         // Sunlit air: the ray's closest approach lies outside the Earth's
         // shadow, eased over the lowest 60 km, where the higher air along
         // the ray still catches the Sun. Otherwise only the airglow and the
-        // aurora light it, at the night gain.
+        // aurora light it, at the night gain. (A deeper cut made the twilit
+        // limb of a night view read as a daylit crescent, and the meter
+        // exposed for it: aurora and lights went dim.)
         vec3 tangent = origin_km + ray * clamp(t_closest, t_entry, t_exit);
         float r_tangent = length(tangent);
         float mu_tangent = dot(tangent, sun) / r_tangent;
         float shadow_axis = r_tangent * sqrt(max(1.0 - mu_tangent * mu_tangent, 0.0));
         metered_lit = mu_tangent >= 0.0 || shadow_axis > R_GROUND - 30.0;
     }
-    radiance += (AURORA_GAIN * aurora_emission(camera, ray, sun, earth_distance)
-        + night_airglow(camera, ray, sun, earth_distance)) * night_gain();
+    float far_half = 0.5 + 0.5 * dot(transmittance, vec3(0.2126, 0.7152, 0.0722));
+    radiance += AURORA_GAIN * aurora_emission(camera, ray, sun, earth_distance) * night_gain()
+        + night_airglow(camera, ray, sun, earth_distance, far_half)
+        * (night_sky_gate(camera, sun) * AIRGLOW_DISPLAY_PREEXPOSURE / exposure);
     // The coverage's sign is the meter's flag (see metered_lit); the blend
     // passes it through (stars leave alpha 0) and nothing else reads it.
     out_color = vec4(min(radiance * exposure, vec3(30000.0)), metered_lit ? coverage : -coverage);

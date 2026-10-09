@@ -609,12 +609,19 @@ impl ExposureController {
     const DAY_LATITUDE_STOPS: f32 = 1.5;
     const DAY_COMPENSATION: f32 = 0.6;
     const DAY_MAX_LIFT_STOPS: f32 = 0.9;
+    /// Beyond that latitude a sunlit key (a low Sun, dusk) opens up by half
+    /// its deficit: the footage's camera keeps near the day exposure while
+    /// the ground darkens (L 0.12 -> 0.03-0.05 at dusk), where full
+    /// compensation lifted a dusk view to daylight (L 0.10 with the Sun 3
+    /// degrees up at nadir). A night key still opens fully.
+    const DUSK_COMPENSATION: f32 = 0.5;
 
-    fn target_for(log2_luminance: f32) -> f32 {
+    fn target_for(log2_luminance: f32, sunlit: bool) -> f32 {
         let delta = log2_luminance - Self::DAY_LUMINANCE_LOG2;
         let ev = if delta < 0.0 {
-            (-Self::ADAPTATION * delta - Self::DAY_LATITUDE_STOPS)
-                .max((-Self::DAY_COMPENSATION * delta).min(Self::DAY_MAX_LIFT_STOPS))
+            let beyond = -Self::ADAPTATION * delta - Self::DAY_LATITUDE_STOPS;
+            let beyond = if sunlit { Self::DUSK_COMPENSATION * beyond } else { beyond };
+            beyond.max((-Self::DAY_COMPENSATION * delta).min(Self::DAY_MAX_LIFT_STOPS))
         } else {
             -delta
         };
@@ -625,10 +632,13 @@ impl ExposureController {
     }
 
     /// Log-space contrast of the photographic grade: the processed night
-    /// frames are much harder than the day ones.
+    /// frames are harder than the day ones. At 1.55 the faint lights of
+    /// villages and roads fell into the toe (9.8 % of northern India's
+    /// ground lit against ~35 % in 2024-26 ISS footage), and the Milky Way
+    /// and the 630 nm airglow band with them.
     fn contrast(&self) -> f32 {
         let night = ((self.ev - 4.0) / 8.0).clamp(0.0, 1.0);
-        1.22 + 0.33 * night * night * (3.0 - 2.0 * night)
+        1.22 + 0.13 * night * night * (3.0 - 2.0 * night)
     }
 
     /// Light adaptation (toward a lower exposure) is fast, as for the eye
@@ -650,7 +660,7 @@ impl ExposureController {
         self.target_ev = 0.0;
     }
 
-    fn update(&mut self, reading: Option<post::MeterReading>, sun_cap: Option<f32>, now: Instant) {
+    fn update(&mut self, reading: Option<post::MeterReading>, sun_cap: Option<f32>, sunrise_in_view: bool, now: Instant) {
         let reading = if self.stale_frames > 0 {
             self.stale_frames -= 1;
             None
@@ -658,7 +668,11 @@ impl ExposureController {
             reading
         };
         if let Some(reading) = reading {
-            self.target_ev = Self::target_for(reading.log2_luminance);
+            let (log2_luminance, sunlit_key) = match reading.band_log2 {
+                Some(band) if sunrise_in_view => (band, false),
+                _ => (reading.log2_luminance, reading.sunlit_key),
+            };
+            self.target_ev = Self::target_for(log2_luminance, sunlit_key);
         }
         // A photographer never shoots a night exposure with the Sun in the
         // frame: its glare (added after metering) would white it out.
@@ -684,6 +698,29 @@ impl ExposureController {
     fn converging(&self) -> bool {
         self.snap_frames > 0 || (self.target_ev - self.ev).abs() > 0.03
     }
+}
+
+/// The Sun on or up to 10 degrees above the Earth's limb (half set counts),
+/// in or near the frame: the sunrise and sunset arc, which the meter then
+/// exposes for (post.rs `band_log2`). Before sunrise the footage keeps the
+/// night exposure, aurora and lights bright beside the blue limb. The uniforms' Sun has the opposite Y
+/// sign to the camera vectors (the shader frame mirrors it).
+fn sunrise_in_view(uniforms: &FrameUniforms) -> bool {
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let p = uniforms.camera_position.map(f64::from);
+    let f = uniforms.forward.map(f64::from);
+    let s = [uniforms.sun_direction[0], -uniforms.sun_direction[1], uniforms.sun_direction[2]].map(f64::from);
+    let (pn, fn_, sn) = (dot(p, p).sqrt(), dot(f, f).sqrt(), dot(s, s).sqrt());
+    let radius = f64::from(SCENE_EARTH_RADIUS);
+    if pn <= radius || fn_ == 0.0 || sn == 0.0 {
+        return false;
+    }
+    let elevation = (dot(p, s) / (pn * sn)).clamp(-1.0, 1.0).asin();
+    let dip = (radius / pn).clamp(-1.0, 1.0).acos();
+    let over_limb = (elevation + dip).to_degrees();
+    let off_axis = (dot(f, s) / (fn_ * sn)).clamp(-1.0, 1.0).acos();
+    let reach = f64::from(uniforms.tan_half_fov_x).atan() + 0.17;
+    (-1.0..10.0).contains(&over_limb) && off_axis < reach
 }
 
 /// Fraction of a luminous disc's light reaching the camera per channel:
@@ -2356,7 +2393,8 @@ impl Renderer {
         let earth = self.current_body == crate::body::Body::Earth;
         // No exposure cap for a Sun in frame: its glare is display-relative
         // (camera_settings), so the night side and its lights stay visible.
-        self.exposure.update(reading, None, Instant::now());
+        let sunrise = earth && sunrise_in_view(&uniforms);
+        self.exposure.update(reading, None, sunrise, Instant::now());
         needs_redraw |= self.exposure.converging();
         let camera = camera_settings(uniforms, body_selector, &self.exposure, earth);
         for (id, target) in &mut self.outputs {
@@ -2920,9 +2958,14 @@ fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &Expos
     };
     let km_per_unit = crate::sky::GROUND_KM / f64::from(SCENE_EARTH_RADIUS);
     let camera_km = uniforms.camera_position.map(|v| f64::from(v) * km_per_unit);
-    let source = |view: [f32; 4], irradiance: f64| {
+    let source = |view: [f32; 4], irradiance: f64, glow_through_air: bool| {
         let direction = [0, 1, 2].map(|c| f64::from(view[c]));
         let visible = disc_visibility(camera_km, direction, f64::from(view[3]), earth);
+        // Behind the limb the Sun's glare keeps its reddened hue but most of
+        // its strength: dimmed with the disc (to 2-30 %), the rising and
+        // setting Sun lost its glow, where ISS footage shows it as the
+        // brightest thing in the frame.
+        let visible = if glow_through_air { visible.map(|v| v.max(0.0).powf(0.3)) } else { visible };
         let scale = f64::from(preexposure) * std::f64::consts::PI * irradiance;
         [visible[0] * scale, visible[1] * scale, visible[2] * scale, 1.0].map(|v| v as f32)
     };
@@ -2949,12 +2992,12 @@ fn camera_settings(uniforms: FrameUniforms, body_selector: f32, exposure: &Expos
             // the disc saturates (stars_textured.frag) and its glare carries
             // a fixed display-relative energy, a soft glow at any exposure.
             sun_light: source(frame.celestial_sun_view,
-                sun_irradiance * (SUN_GLARE / (f64::from(preexposure) * sun_irradiance)).min(1.0)),
+                sun_irradiance * (SUN_GLARE / (f64::from(preexposure) * sun_irradiance)).min(1.0), true),
             moon: to_camera(frame.celestial_moon_view),
             // The Moon disc is compressed toward display white like the
             // eye's local adaptation (stars_textured.frag); so is its glare.
             moon_light: source(frame.celestial_moon_view,
-                moon_irradiance * (0.35 / (0.12 * f64::from(preexposure) * sun_irradiance)).min(1.0)),
+                moon_irradiance * (0.35 / (0.12 * f64::from(preexposure) * sun_irradiance)).min(1.0), false),
             ..PostFrame::default()
         },
     }
@@ -6446,8 +6489,10 @@ impl OutputTarget {
         // ring isn't cut off at a square box around the planet.
         let scissor_radius = if (body_selector - 4.0).abs() < 0.01 {
             REFERENCE_RING_RADIUS
-        } else if body_selector < 0.5 && uniforms.aurora_valid_unix_utc > 0 {
-            SCENE_EARTH_RADIUS * (1.0 + 320.0 / 6378.137)
+        } else if body_selector < 0.5 {
+            // The Earth's night glows reach 400 km: the aurora and, with or
+            // without aurora data, the 630 nm airglow layer.
+            SCENE_EARTH_RADIUS * (1.0 + 400.0 / 6378.137)
         } else {
             REFERENCE_GLOW_RADIUS
         };
@@ -6542,16 +6587,16 @@ mod tests {
         exposure.ev = 17.0;
         // Panning from the night sky back to the daylit Earth (no cut):
         // at most 1.5 stops over on the first frame, within 0.1 stop by 0.4 s.
-        let day = post::MeterReading { log2_luminance: ExposureController::DAY_LUMINANCE_LOG2, coverage: 1.0 };
-        exposure.update(Some(day), None, start);
-        exposure.update(Some(day), None, start + Duration::from_millis(33));
+        let day = post::MeterReading { log2_luminance: ExposureController::DAY_LUMINANCE_LOG2, coverage: 1.0, sunlit_key: true, band_log2: None };
+        exposure.update(Some(day), None, false, start);
+        exposure.update(Some(day), None, false, start + Duration::from_millis(33));
         assert!(exposure.ev <= 1.5, "first frames {:.2} EV over", exposure.ev);
-        exposure.update(Some(day), None, start + Duration::from_millis(400));
+        exposure.update(Some(day), None, false, start + Duration::from_millis(400));
         assert!(exposure.ev < 0.1, "{:.2}", exposure.ev);
         // Back to the night: still the slow ~0.9 s easing.
-        let night = post::MeterReading { log2_luminance: -21.4, coverage: 1.0 };
-        exposure.update(Some(night), None, start + Duration::from_millis(433));
-        exposure.update(Some(night), None, start + Duration::from_millis(533));
+        let night = post::MeterReading { log2_luminance: -21.4, coverage: 1.0, sunlit_key: false, band_log2: None };
+        exposure.update(Some(night), None, false, start + Duration::from_millis(433));
+        exposure.update(Some(night), None, false, start + Duration::from_millis(533));
         assert!(exposure.ev < 3.0, "{:.2}", exposure.ev);
     }
 
@@ -6745,7 +6790,7 @@ mod tests {
         assert!(earth_width < earth_discard, "earth fwidth must precede the atmosphere discard");
         let textured = include_str!("../shaders/earth_textured.frag");
         let map_dx = textured.find("vec2 map_dx = dFdx(map_uv)").unwrap();
-        let tex_discard = textured.find("if (!in_air && (frame.material_state.z < 0.5 ||").unwrap();
+        let tex_discard = textured.find("if (!in_air && sphere_intersection(camera, ray, night_glow_top_radius) < 0.0)").unwrap();
         assert!(map_dx < tex_discard, "earth_textured map gradients must precede discard");
     }
 
@@ -6825,7 +6870,8 @@ mod tests {
         let definition = format!("const float NIGHT_SERIES_PREEXPOSURE = {:.1};", post::NIGHT_SERIES_PREEXPOSURE);
         assert!(shader.contains(&definition), "the shader's night series is not the meter's: {definition}");
         assert!(shader.contains("max(1.0, NIGHT_SERIES_PREEXPOSURE / preexposure())"));
-        assert!(shader.contains("min(1.0, NIGHT_SERIES_PREEXPOSURE / preexposure())"));
+        // Flashes are held 1.5 stops back from the camera at EV 19 (flash_gain).
+        assert!(shader.contains("min(1.0, 2.8 * NIGHT_SERIES_PREEXPOSURE / preexposure())"));
         assert!(!shader.contains("65536.0 /"), "the night series' exposure must not be written out again");
         // The flag is the alpha's sign alone: a smooth ramp left the meter a
         // coverage that was not one across the twilight band.

@@ -179,6 +179,15 @@ pub(super) struct MeterReading {
     pub log2_luminance: f32,
     /// Fraction of the frame the Earth and its air cover.
     pub coverage: f32,
+    /// The key is sunlit or twilit Earth at its own 85th percentile (not a
+    /// bright band, a crescent or the night side): the camera then opens up
+    /// for only part of a deficit, as a low Sun and dusk darken the ground
+    /// in the footage at one exposure.
+    pub sunlit_key: bool,
+    /// log2 key for a thin sunlit band far over the key (the sunrise and
+    /// sunset arc), which the controller uses while the Sun is near the
+    /// limb in front of the camera.
+    pub band_log2: Option<f32>,
 }
 
 /// One meter texel of the Earth: its scene luminance, its weight (coverage,
@@ -625,6 +634,10 @@ impl HdrTarget {
         // The band keeps its colours (orange, white, blue) at ~1.5 stops
         // over the key; at 3 stops over it was a featureless white arc.
         let highlight = if p97 > 2.0e-3 { p97 / 3.0 } else { 0.0 };
+        let p995 = whole_frame
+            .get(((whole_frame.len() as f32 * 0.995) as usize).min(whole_frame.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0.0);
         let total: f32 = samples.iter().map(|s| s.weight).sum();
         if total < 0.02 * (width * height) as f32 {
             // No Earth in frame: the sky has a fixed brightness, so keep
@@ -659,20 +672,40 @@ impl HdrTarget {
         let blend = ((lit_share - 0.015) / 0.025).clamp(0.0, 1.0);
         let mut accumulated = 0.0;
         let mut key = samples.last().map_or(1.0, |s| s.luminance);
+        let mut key_lit = samples.last().is_none_or(|s| s.lit);
         for sample in &samples {
             accumulated += sample.weight;
             if accumulated >= 0.85 * total {
                 key = sample.luminance;
+                key_lit = sample.lit;
                 break;
             }
         }
+        // A thin sunlit band ten stops and more over the key: the twilight
+        // arc at sunrise and sunset in a frame metered for the night side.
+        // Exposed only once it filled 3 % of the frame, the arc sat 2^5-2^7
+        // over white, a thick white band that swallowed the Sun. The meter's
+        // texels each average ~30x30 pixels, so a band a few pixels thick
+        // reads several times dimmer than it is: its brightest half percent
+        // is held at the key, which leaves the arc's core a few stops over
+        // white and its outer layers coloured, a thin line as in ISS
+        // footage. The controller applies it only with the Sun near the
+        // limb in view: a twilit limb in a night view stays overexposed, as
+        // the footage's night exposure keeps the aurora and lights bright.
+        let band = if p995 > 1024.0 * key { p995 } else { 0.0 };
         if std::env::var_os("EARTH_NATIVE_METER_DEBUG").is_some() {
-            eprintln!("meter: pre={preexposure:.3e} key={key:.3e} p97={p97:.3e} highlight={highlight:.3e} lit_share={lit_share:.3} crescent={crescent:.3e} blend={blend:.2} earth_weight={total:.1} texels={}", width * height);
+            eprintln!("meter: pre={preexposure:.3e} key={key:.3e} lit={key_lit} p97={p97:.3e} highlight={highlight:.3e} p995={p995:.3e} band={band:.3e} lit_share={lit_share:.3} crescent={crescent:.3e} blend={blend:.2} earth_weight={total:.1} texels={}", width * height);
         }
+        let metered = key;
         // Log-space blend: a partial share closes down by part of the stops.
         let key = key.max(highlight);
         let key = if crescent > key { key * (crescent / key).powf(blend) } else { key };
-        Some(MeterReading { log2_luminance: key.log2(), coverage })
+        Some(MeterReading {
+            log2_luminance: key.log2(),
+            coverage,
+            sunlit_key: key_lit && key == metered,
+            band_log2: (band > key).then(|| band.log2()),
+        })
     }
 }
 

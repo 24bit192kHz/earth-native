@@ -19,7 +19,7 @@
 //!   sections at 223 K), a 25 km-peaked layer (tent, 15 km half width) of
 //!   ~300 DU column;
 //! - aerosol: optical depth 0.18 at 550 nm, Angstrom exponent 0.5, scale
-//!   height 1.8 km, single-scattering albedo 0.94, Cornette-Shanks g = 0.68:
+//!   height 3.0 km, single-scattering albedo 0.94, Cornette-Shanks g = 0.68:
 //!   a dust/marine mix calibrated so haze brightens toward the horizon as in
 //!   ISS Earth-observation footage (the MODIS global mean is 0.12-0.15; the
 //!   subtropical dust belts under the orbit are 0.3-0.6).
@@ -36,7 +36,7 @@ pub const OZONE_PEAK_KM: f64 = 25.0;
 pub const OZONE_HALF_WIDTH_KM: f64 = 15.0;
 pub const AEROSOL_OPTICAL_DEPTH_550: f64 = 0.18;
 pub const AEROSOL_ANGSTROM: f64 = 0.5;
-pub const AEROSOL_SCALE_KM: f64 = 1.8;
+pub const AEROSOL_SCALE_KM: f64 = 3.0;
 pub const AEROSOL_ALBEDO: f64 = 0.94;
 pub const AEROSOL_G: f64 = 0.68;
 /// Mean reflectance of what lies under the air (ocean ~0.06, land ~0.2,

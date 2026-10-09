@@ -34,7 +34,8 @@ driven by NASA imagery, live NOAA data and exact ephemerides.
 - **Live Earth.** Today's clouds from NOAA's geostationary mosaic, today's
   dust and smoke haze from NOAA GEFS-Aerosols, today's sea ice from EUMETSAT
   OSI SAF, a volumetric **aurora** placed by NOAA's OVATION forecast, and
-  lightning where NOAA GFS reports thunderstorms.
+  lightning on the thunderstorms the satellites see (the coldest cloud tops
+  where NOAA GFS has instability).
 - **The view from the ISS.** A camera riding the real ISS orbit with a
   window-camera look: auto exposure, a glowing Sun, bloom,
   vignetting and grain.

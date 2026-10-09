@@ -183,14 +183,19 @@ void main() {
             textureGrad(star_panorama, panorama_uv + erosion * vec2(-1.0, 1.0), panorama_dx, panorama_dy).rgb),
         min(textureGrad(star_panorama, panorama_uv + erosion * vec2(1.0, -1.0), panorama_dx, panorama_dy).rgb,
             textureGrad(star_panorama, panorama_uv + erosion * vec2(-1.0, -1.0), panorama_dx, panorama_dy).rgb));
-    vec3 colour = pow(max(source_colour, vec3(0.0)), vec3(1.7)) * 0.75;
-    // The eye sees the Milky Way with rods only, so colourless; the map's
-    // photographic H-alpha red (a brown haze on screen) is not visible.
-    colour = vec3(dot(colour, vec3(0.2126, 0.7152, 0.0722)));
+    vec3 colour = pow(max(source_colour, vec3(0.0)), vec3(1.3)) * 0.75;
+    // ISS night frames record the Milky Way in colour (a camera, not the
+    // rod-only eye), but the map's H-alpha red is a photographic stretch:
+    // keep a third of the map's colour.
+    colour = mix(vec3(dot(colour, vec3(0.2126, 0.7152, 0.0722))), colour, 0.35);
     // The Milky Way's brightest clouds are ~19 mag/arcsec^2, ~7e-8 of
-    // sunlight per steradian. Shown as a night series (EV 17) records it,
-    // gated by the daylight state and dimmed across the limb below.
-    colour *= 1.0e-6 * 131072.0;
+    // sunlight per steradian. Shown as a long night exposure records it
+    // (ISS footage: star clouds at L ~0.003-0.006 with dark lanes, empty
+    // sky black), gated by the daylight state and dimmed across the limb
+    // below. The map's star clouds are only ~0.04 linear: at a night
+    // series' EV 17 with a 1.7 power the grade took them to exactly zero
+    // between the stars; the gentler 1.3 power keeps empty sky black.
+    colour *= 18.0 * 1.0e-6 * 131072.0;
     if (body == 0) {
         colour *= sky_daylight_gate(camera, frame.sun_direction.xyz) * limb_transmission(camera, ray);
     }
@@ -215,10 +220,18 @@ void main() {
         float mu_disc = sqrt(max(1.0 - radial_sun * radial_sun, 0.0));
         float limb = (1.0 - 0.6 * (1.0 - mu_disc)) / 0.8;
         float disc = celestial_disc(sun_cosine, sun_angular_radius, sun_angular_radius * 0.04);
-        // Stored at most 3000: the lens model (post.frag) carries the rest
-        // of the Sun's energy analytically; this keeps the disc saturated
-        // without the box pyramid spreading 46000x radiance into a halo.
-        colour += vec3(disc * limb * min(mean_radiance * exposure, 40.0));
+        // Stored at most 40x white: the lens model (post.frag) carries the
+        // rest of the Sun's energy analytically; this keeps the disc
+        // saturated without the box pyramid spreading 46000x radiance into a
+        // halo. Behind the limb the Earth pass then multiplies it by the
+        // air's transmittance (~0.02-0.3), which left the reddened Sun dimmer
+        // than the twilight arc beside it: in ISS footage it is the brightest
+        // thing in the frame. The cap is raised by the two-way Rayleigh
+        // column (the luminance of limb_transmission squared), so the disc
+        // reaches the camera still saturated and keeps the air's reddening.
+        vec3 across = limb_transmission(camera, ray);
+        float behind_air = max(dot(across * across, vec3(0.2126, 0.7152, 0.0722)), 0.004);
+        colour += vec3(disc * limb * min(mean_radiance * exposure, 40.0 / behind_air));
     }
     if (body == 0 && moon_alpha > 0.0) {
         vec3 albedo = textureGrad(moon_albedo, moon_uv, moon_dx, moon_dy).rgb;

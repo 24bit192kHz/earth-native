@@ -51,8 +51,11 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   13.6e-3 km⁻¹ at 550 nm, 8 km scale height). Ozone: Chappuis absorption
   (Serdyuchenko/Gorshelev 2013 cross sections at 223 K) in a 25 km layer of
   ~300 DU. Aerosol: Cornette–Shanks g = 0.68, single-scattering albedo 0.94,
-  1.8 km scale height. Units: a white Lambertian surface under a zenith Sun at
-  1 AU is 1.
+  3.0 km scale height: boundary-layer haze and the free troposphere's. With a
+  1.8 km scale height the lower half of the daylit limb was pure Rayleigh
+  blue, where ISS footage shows a pale haze layer under the blue (limb R/G at
+  half its peak brightness 0.20-0.58 in three videos). Units: a white
+  Lambertian surface under a zenith Sun at 1 AU is 1.
 - **Colour bands, not wavelengths:** every coefficient is its spectrum
   averaged over one sRGB colour-matching function (CIE 1931 via the
   Wyman–Sloan–Shirley fit and the sRGB matrix) under a 5778 K Sun, which is
@@ -78,7 +81,16 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   (256 px pages, GPU feedback). Relief is shaded from GEBCO 2026 15″ normals
   (BC5, 32768×16384) and exaggerated with distance (2.5 × 1.3^mip), as the
   eye reads it from orbit. The open ocean uses Case-1 water-leaving
-  reflectance plus Cox–Munk sunglint and Fresnel sky reflection. Blue Marble
+  reflectance averaged over the sRGB colour bands (single wavelengths made
+  deep water 1.7x too dark and navy against the footage) plus Cox–Munk
+  sunglint and the Fresnel reflection of the sky, brighter toward grazing
+  views where the mirrored ray meets the bright sky near the horizon. Calm
+  streaks and slicks, from a few km to a few hundred (the clouds' fractal
+  stretched 4:1 along the mostly zonal winds, read ~4 km fine), glint up to
+  1.45x brighter and rough water down to 0.55x: the texture of ISS sunglint,
+  where one 7 m/s everywhere drew a smooth even glow. Light scattered through a cloud makes no glint, so a
+  cloud's shadow takes all of it, and the glint is a quarter desaturated (the
+  camera's saturation boost tinted it peach). Blue Marble
   has no sea ice, so the daily EUMETSAT OSI SAF concentration (10 km, both
   poles) lays pack ice over open water (albedo 0.70/0.75/0.80, no glint).
 - **Clouds, live:** hourly NOAA GMGSI geostationary mosaics (visible by day,
@@ -98,14 +110,22 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   triplanar from the sphere (isotropic, no lat/lon shear) mixed with the 1 km
   texture of the NASA cloud composite: that field is cut at its
   (1 − cover) quantile, measured over the textures, so the cloudy area keeps
-  the observed fraction. Edges are sharp at ISS scale, one pixel's footprint
-  wide at most (antialiased), and how far the field rises above the cut
-  stands in for optical depth: thin fringes are grey (albedo 0.5), cores
-  white (0.92). Once a pixel spans more than ~1.5-8 km (the globe view, the
+  the observed fraction. Broken cloud is many small cells (trade cumulus in
+  ISS footage, median 2 km), where an overcast deck is organised at large
+  scales: below ~60 % cover the fractal's fine tile carries the field (with
+  its mean and variance kept, so the cover quantiles stay valid) and the
+  composite, whose large static decks clumped broken cloud into a few big
+  blobs, weighs less. Edges are sharp at ISS scale, a pixel or two wide
+  (antialiased), and how far the field rises above the cut stands in for
+  optical depth: thin fringes are grey (albedo 0.62), cores white (0.93),
+  reached sooner so decks read bright and lumpy rather than as a grey mottle.
+  Once a pixel spans more than ~1.5-8 km (the globe view, the
   horizon), the mips have averaged the field toward its mean and the cut
   would switch at 50 % cover, so the observed cover is shown as the
   fraction it is instead, textured by the low-passed field, thin cover
-  greyer. The shell is at 5.5 km with Sun-traced shadows. Two things a
+  greyer. The shell is at 5.5 km with Sun-traced shadows; thick cloud blocks
+  ~90 % of the direct beam (the footage's cumulus shadows on the sea are
+  nearly black). Two things a
   flat shell lacks are restored without extra texture fetches: cloud tops
   are shaded as a height field (~1.5 km from edge to core, its slope from
   screen-space derivatives, with wrapped lighting since light diffuses
@@ -116,10 +136,23 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   read two mips down (rounded ~0.5 km elements instead of specks). Without
   the feed, the NASA composite is shown as it is.
 - **Night:** VIIRS Black Marble 2016 lights at 500 m (stored 32768×16384),
-  coloured from intensity (sodium to white), city glow under low cloud,
-  moonlight from Allen's lunar phase law and distance, and O(¹S) airglow
-  integrated as limb columns at 95 km.
-- **Aurora:** a volumetric march from 90 to 320 km (~25 km steps, 10-40).
+  decoded with a gentler curve than sRGB at the faint end (exponent 1.6, the
+  brightest cores unchanged), so villages and roads form the carpet of
+  2024-26 ISS footage (lit share of northern India's ground 8 % → 17 %,
+  footage ~32-36 %). Lamps are mostly white LED with a 15 % sodium share;
+  light diffused by air or cloud (the halo over a city, low cloud lit from
+  below) keeps the lamps' cream-white mix, never a sodium orange. Moonlight
+  from Allen's lunar phase law and distance. Airglow is integrated as limb
+  columns of four layers: O(¹S) 557.7 nm at 97 km (which a camera records
+  teal green), Na D at 91 km, the OH Meinel red at 87 km (the thin amber line
+  under the green one) and O(¹D) 630 nm at 250 km, ~60 R at middle latitudes
+  and ~300 R within ~18° of the magnetic equator (the red-orange band ISS
+  footage shows above the line). A limb ray's far crossing is dimmed by the
+  air below its tangent point, so the band fades into the ground as in the
+  footage instead of ending in a hard step. Like the stars it is gated by
+  the daylight at the camera's nadir and shown as a night series at EV 17
+  records it, whatever the camera's exposure.
+- **Aurora:** a volumetric march from 90 to 400 km (~25 km steps, 10-40).
   NOAA OVATION probabilities place the oval and set its activity. As in
   DMSP/VIIRS and ISS imagery, a patchy diffuse glow fills the equatorward
   half, and discrete arcs sit on the poleward flank at fixed probability
@@ -131,11 +164,25 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   (IBC II) to ~130 kR (IBC III-IV) in storms, which seen along the limb
   outshine moonlit cloud, as in storm-time ISS footage. Each
   arc folds, breaks into segments and fades on its own, so they are not
-  closed rings. Green 557.7 nm (peak ~110 km), red 630 nm (~240 km) and N₂⁺
-  violet profiles; field-aligned rays make curtains at the limb. Emission
-  fades out through nautical twilight at the emission point.
+  closed rings. Green 557.7 nm (peak ~110 km); red 630 nm peaking near
+  235 km and fading slowly above, at ~1/15 of the green and desaturated
+  toward maroon (footage shows a dim, tall haze, red/green 0.02-0.08, crimson
+  only in the ray tops); N₂⁺ violet along the lower edge of bright arcs and
+  in ray tops that stand in sunlight above the Earth's shadow; field-aligned
+  rays make curtains at the limb. Seen from above, the diffuse glow lights
+  the ground under the oval in contrasted green patches. Emission fades only
+  over sunlit ground (the Sun ~1-5° up below it): the footage shows the
+  curtains bright up to the dawn terminator.
 - **Lightning:** flashes belong to the 1° cells where NOAA GFS reports
-  convective energy, precipitation and cloud water, at a rate that follows
+  convective energy, precipitation and cloud water, moved onto the storms
+  the satellites see: on every hourly update the coldest 1 % of infrared
+  cloud tops between 50° S and 50° N become storms where the model has
+  instability within ~1°, and model storms with no observed cold top within
+  ~2° keep a quarter of their rain (with the GFS field alone, 40 % of the
+  coldest tops had a storm and a fifth of the flash rate fell on clear sky;
+  steered, 88 % and 7 %). The rate (0.17 flashes per second per full cell
+  over ~2.7x the model's storm area) keeps the global rate near the observed
+  44-46 per second. It follows
   the storm and waxes and wanes over ~9 s. Every cell keeps its own clock
   and draws a new flash in each 0.8 s slot (a place near its storm core, a
   size, a length, a stroke pattern), so nothing repeats and no two cells
@@ -143,18 +190,21 @@ lunar shadow falls over Mexico and Texas as in the DSCOVR/EPIC image of that day
   glow 5-17 km across (the odd one lights a cloud shield 1.6 times wider,
   where the cell is wide enough to carry it) that spreads over its first
   100 ms and lasts 0.1-0.4 s, with 2-4 return strokes decaying in 20-50 ms
-  and a dimmer continuing glow behind them.
+  and a dimmer continuing glow behind them, blue-violet in the deck around
+  a small white core that clips (footage halos R/G 0.5-0.8, B/G 1.3-2.4).
   Most are small and dim, a few large and bright. It lights the cloud from
   inside, so it follows the lumps of the cloud top (the tiling fractal read
-  at towers a few km across) and its opacity, with a faint wider halo
-  through the thick parts; each return stroke lights the cloud a little
-  further along the flash, so the lit part changes from stroke to stroke.
+  at towers a few km across) and its opacity, with a wider halo through
+  the thick parts (~10 % of the core out to several core widths, faded
+  out by ~10); each return stroke lights the cloud a little further along
+  the flash, so the lit part changes from stroke to stroke.
   Strokes are averaged over the last 90 ms, as a camera does, so every
   flash shows in the 8-20 fps frames it falls in; under a pixel the glow
   widens to the pixel and gives up part of its peak. A flash keeps the
-  display brightness it has at the night series' EV 16 when the camera
-  opens further (EV 19 from the ISS at night), where it would burn out to a
-  flat white blob, and it fades out smoothly at the edge of the cells asked
+  display brightness it has at EV ~17.5 when the camera opens further (EV 19
+  from the ISS at night), where it would burn out to a flat white blob; at
+  EV 16 (3 stops back) flashes peaked at 0.04-0.13 beside city lights at 1,
+  where every flash core in the footage clips. It fades out smoothly at the edge of the cells asked
   about it, so no glow is ever cut by a straight edge. A flash is on for its
   whole length or not at all: the cell's chance is read once, at the start
   of its slot (read at the current time, the rate drifted and, in the most
@@ -207,9 +257,11 @@ survive.
 
 NASA SVS Deep Star Maps 2020 (16K HDR, BC1) supplies only the unresolved
 background: a 4-tap minimum filter removes its point stars, and it is shown
-colourless (the eye sees the Milky Way with rods; the map's photographic
-H-alpha red is not visible), as a night series (EV 17) records it at every
-camera exposure. It is rotated by sidereal time plus precession
+as a long night exposure records it at every camera exposure: star clouds at
+L ~0.003-0.006 with dark lanes and empty sky black, as in ISS footage (with
+a 1.7 power at EV 17, the grade took it to exactly zero between the stars).
+A camera records it in colour; the map's H-alpha red is a photographic
+stretch, so a third of the map's colour is kept. It is rotated by sidereal time plus precession
 in right ascension, within ~0.1° of the catalogue stars.
 
 ## Camera
@@ -227,11 +279,20 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   Earth's night side, which has its own exposure, is read at that
   exposure and kept as a subject, so a thin twilight arc over it blooms
   at the night exposure instead of holding the camera down), or a highlight rule when bright sunlit sky covers more than 3 %
-  of the frame (the sunrise band seen from the ISS, held ~1.5 stops over
-  the key so it keeps its colours). Daylight stays near a "sunny 16"
-  exposure: a low Sun or open ocean is lifted by 0.6 of its deficit, at
-  most 0.9 stops, as the footage's auto exposure does; at night the camera opens up for moonlight, city lights
-  and aurora and holds 1.6 stops under the meter for a night look. The Sun
+  of the frame (held ~1.5 stops over the key so it keeps its colours). With
+  the Sun on or up to 10° above the limb in view (the sunrise and sunset
+  arc), the frame's brightest half percent is held at the key: the meter's
+  texels average ~30×30 pixels, so this leaves the arc's core a few stops
+  over white and its layers coloured, a thin line beside a visible Sun, as
+  in the footage. Ground counts as sunlit (scaled by the camera's exposure)
+  until the Sun is ~9° below it: cut at -6°, the twilit side of a dusk view
+  read far too dark to the meter, which then jumped to the night exposure in
+  ~2 s while a tenth of the frame blew out. Daylight stays near a "sunny 16"
+  exposure: a low Sun or open ocean is lifted by 0.6 of its deficit, at most
+  0.9 stops, and beyond 1.5 stops a sunlit key (a low Sun, dusk) opens up by
+  half its deficit, as the footage's camera keeps near the day exposure
+  while the ground darkens; at night the camera opens up for moonlight, city
+  lights and aurora and holds 1.6 stops under the meter for a night look. The Sun
   in frame does not cap the exposure, and a frame without the Earth keeps
   the exposure it had. Light
   adaptation is fast (0.12 s, at most 1.5 stops over on the first frames),
@@ -251,7 +312,11 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   golden.
 - **The Sun in the sky:** like the Moon, a saturated disc with a soft glow
   of fixed display strength (12 % of its daylight-exposure glare), no
-  diffraction rays or ghosts.
+  diffraction rays or ghosts. Behind the limb the disc's stored cap is
+  raised by the two-way Rayleigh column, so it reaches the camera still
+  saturated and reddened, the brightest thing in the frame as in the
+  footage (it had been dimmer than the arc beside it), and its glare keeps
+  the reddened hue with most of its strength (visibility^0.3).
 - **The Moon in the sky:** Lunar-Lambert photometry (bright to the limb at
   full Moon), the SVS map (stretched to a mean albedo of ~0.5) scaled to the
   real normal albedo of 0.12, and local adaptation: a single night exposure
@@ -270,7 +335,9 @@ a full-frame camera behind an ISS window (`shaders/post.frag`):
   (rows sum to one, greys stay grey). Against the reference video the open
   ocean's blue/green went from 2.3 to 1.7 (video 1.4-2.0) and red/green
   from 0.51 to 0.40 (0.26-0.36); land moves by less than 0.05.
-- **Development:** log-space contrast around mid-grey, a ×1.3 saturation
+- **Development:** log-space contrast around mid-grey (1.22 by day, 1.35
+  at night: at 1.55 the faint lights, the Milky Way and the 630 nm band fell
+  into the toe), a ×1.3 saturation
   (the "vivid" picture style of processed Earth-observation frames) that
   fades to none between 1 and 6× white, so clipped highlights run to white
   as a sensor's do, a filmic curve with a long shoulder, gain-dependent sensor grain and dithered 8-bit

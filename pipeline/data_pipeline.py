@@ -775,8 +775,9 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
     model's cloud where warm low cloud is invisible to infrared; beyond the
     mosaic (the poles) GFS. Returns RGBA uint8 (R cover; G sea-ice
     concentration when `sea_ice` is given, else cloud-top coldness; B and A
-    the aerosol when `aerosol` is given, else observed fraction and 1) and
-    the observation time.
+    the aerosol when `aerosol` is given, else observed fraction and 1), the
+    observation time and the observed deep convection on the 0.25 degree
+    weather grid (`steer_storms`).
     """
     vis_url, vis_hour = gmgsi_latest("VIS", now)
     ir_url, ir_hour = gmgsi_latest("LW", now)
@@ -857,7 +858,50 @@ def live_clouds(now, gfs_cloud, gfs_low, aerosol=None, sea_ice=None):
         aod, angstrom = aerosol
         extra = [upsample((angstrom + 0.5) / 3.0), upsample(np.sqrt(aod / 4.0))]
     rgba = np.stack([cover, height if sea_ice is None else sea_ice, *extra], axis=-1)
-    return np.round(np.clip(rgba, 0, 1) * 255).astype(np.uint8), int(observed.timestamp())
+    return np.round(np.clip(rgba, 0, 1) * 255).astype(np.uint8), int(observed.timestamp()), \
+        deep_convection(ir, ir_cold, lat)
+
+
+def deep_convection(ir, ir_cold, lat):
+    """Observed thunderstorm tops on the 1440x720 weather grid, 0-1: the
+    coldest 1 % of infrared counts between 50 S and 50 N (where thunderstorms
+    live) that are also well colder than the clear-sky composite. Relative
+    to the day's own distribution, so it needs no count calibration."""
+    tropics = (np.abs(lat) < 50.0)[:, None]
+    band = np.isfinite(ir) & tropics
+    if not band.any():
+        return np.zeros((720, 1440), np.float32)
+    # Never warmer than mid-level cloud (clear tropical ground is ~65 counts,
+    # the coldest tops ~215), so a quiet day has no storms to steer to.
+    threshold = max(np.percentile(ir[band], 99.0), 175.0)
+    cold = smoothstep(threshold - 8.0, threshold + 4.0, np.nan_to_num(ir)) * tropics \
+        * np.nan_to_num(smoothstep(30.0, 60.0, ir - ir_cold))
+    image = Image.fromarray(np.round(np.clip(cold, 0, 1) * 255).astype(np.uint8))
+    return np.asarray(image.resize((1440, 720), Image.Resampling.BOX), dtype=np.float32) / 255.0
+
+
+def steer_storms(packed, convection):
+    """Put the model's thunderstorms where the satellites see them. GFS
+    places convection only roughly: on 2026-10-08 one in ten of the coldest
+    observed tops had a model storm, and a fifth of the flash rate fell on
+    clear sky, where the renderer hides it. Where the model has instability
+    within ~1 degree, an observed cold top becomes a storm: cloud, CAPE and
+    rain (all three drive the renderer's lightning) are raised there. Model
+    storms with no observed cold top within ~2 degrees keep a quarter of
+    their rain, so storms move rather than multiply (the model's global
+    flash rate is already above climatology). Nothing accumulates: the
+    input is the raw model."""
+    if convection is None:
+        return packed
+    nearby_cape = np.asarray(Image.fromarray(packed[:, :, 1]).filter(ImageFilter.MaxFilter(9)), dtype=np.float32)
+    storm = np.clip(convection * smoothstep(5.0, 25.0, nearby_cape), 0, 1)
+    nearby_cold = np.asarray(Image.fromarray(np.round(convection * 255).astype(np.uint8))
+                             .filter(ImageFilter.MaxFilter(17)), dtype=np.float32) / 255.0
+    out = packed.astype(np.float32)
+    out[:, :, 2] *= 0.25 + 0.75 * smoothstep(0.05, 0.3, nearby_cold)
+    for channel, level in ((0, 0.85), (1, 0.40), (2, 0.55)):
+        out[:, :, channel] = np.maximum(out[:, :, channel], storm * level * 255)
+    return np.round(out).astype(np.uint8)
 
 
 def retained_cloud_metadata(existing, now):
@@ -895,11 +939,21 @@ def weather():
         try:
             index = download(base + ".idx", limit=200_000).decode()
             ranges = select_ranges(index)
+            raw_fields = DATA / "weather" / "gfs-fields.npy"
             if existing.get("valid_unix_utc") == int(candidate.timestamp()) and existing.get("packing_version") == 4 and (DATA / "weather" / "gfs-low-cloud.npy").exists():
-                old = Path(existing["texture"]).read_bytes()
-                if hashlib.sha256(old).hexdigest() != existing["sha256"]:
-                    raise ValueError("cached weather checksum mismatch")
-                packed = np.frombuffer(old, np.uint8).reshape(720, 1440, 4)[:, :, 2::-1].copy()
+                if raw_fields.exists():
+                    # The model fields as decoded: the texture holds storms
+                    # steered onto the last observation, which must not compound.
+                    packed = np.load(raw_fields)
+                    if packed.shape != (720, 1440, 3) or packed.dtype != np.uint8:
+                        raise ValueError("cached weather fields malformed")
+                else:
+                    # Written before storms were steered: the raw model.
+                    old = Path(existing["texture"]).read_bytes()
+                    if hashlib.sha256(old).hexdigest() != existing["sha256"]:
+                        raise ValueError("cached weather checksum mismatch")
+                    packed = np.frombuffer(old, np.uint8).reshape(720, 1440, 4)[:, :, 2::-1].copy()
+                    atomic_bytes(raw_fields, _npy(packed))
             else:
                 fields = {name: decode_grib(download(base, limit=10_000_000, byte_range=span), candidate) for name, span in ranges.items()}
                 # Extinction for a mixed ice/liquid column; do not render thin
@@ -911,6 +965,7 @@ def weather():
                 cape = np.clip(fields["cape"] / 4000, 0, 1)
                 rain = np.clip(np.log1p(np.maximum(fields["rain"], 0) * 3600) / math.log(51), 0, 1)
                 packed = np.round(np.stack((cloud, cape, rain), axis=-1) * 255).astype(np.uint8)
+                atomic_bytes(raw_fields, _npy(packed))
                 low_cloud = np.clip(fields["low"] / 100, 0, 1)
                 atomic_bytes(DATA / "weather" / "gfs-low-cloud.npy", _npy(low_cloud.astype(np.float16)))
             try:
@@ -919,8 +974,8 @@ def weather():
                 print(f"OVATION unavailable, aurora disabled: {error}", file=sys.stderr, flush=True)
                 aurora, aurora_utc = np.zeros((720, 1440), dtype=np.uint8), 0
             generation = DATA / "weather" / f"{candidate:%Y%m%dT%H}-{int(now.timestamp())}"
-            asset = preview(generation, "fields", packed, alpha=aurora)
             clouds_meta = retained_cloud_metadata(existing, now)
+            convection = None
             try:
                 try:
                     low_cloud = np.load(DATA / "weather" / "gfs-low-cloud.npy").astype(np.float32)
@@ -937,7 +992,7 @@ def weather():
                 except (HTTPError, OSError, ValueError, KeyError) as error:
                     print(f"OSI SAF sea ice unavailable, oceans stay open: {error}", file=sys.stderr, flush=True)
                     sea_ice, sea_ice_utc = None, 0
-                clouds, clouds_utc = live_clouds(now, packed[:, :, 0] / 255.0, low_cloud, aerosol, sea_ice)
+                clouds, clouds_utc, convection = live_clouds(now, packed[:, :, 0] / 255.0, low_cloud, aerosol, sea_ice)
                 clouds_asset = preview(generation, "clouds", clouds[:, :, :3], alpha=clouds[:, :, 3])
                 clouds_meta = {"clouds_texture": str(generation / clouds_asset["file"]), "clouds_sha256": clouds_asset["sha256"],
                                "clouds_unix_utc": clouds_utc, "clouds_source": "NOAA-NESDIS-GMGSI-VIS-LW+GFS",
@@ -951,6 +1006,7 @@ def weather():
             except (HTTPError, OSError, ValueError, KeyError, ImportError) as error:
                 fallback = "retaining last valid observation" if clouds_meta else "static clouds stay"
                 print(f"GMGSI clouds unavailable, {fallback}: {error}", file=sys.stderr, flush=True)
+            asset = preview(generation, "fields", steer_storms(packed, convection), alpha=aurora)
             metadata = {"schema_version": 1, "packing_version": 4, "source": "NOAA-GFS", "kind": "model-analysis", "url": base,
                         "valid_unix_utc": int(candidate.timestamp()), "downloaded_unix_utc": int(now.timestamp()),
                         "aurora_unix_utc": aurora_utc, "aurora_source": "NOAA-SWPC-OVATION-forecast",
